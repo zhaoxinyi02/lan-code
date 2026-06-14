@@ -6,6 +6,15 @@ pub type SessionId = Uuid;
 pub type TurnId = Uuid;
 pub type EventId = Uuid;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientInfo {
@@ -104,6 +113,13 @@ pub enum CoreEvent {
         turn_id: TurnId,
         text: String,
     },
+    UsageRecorded {
+        event_id: EventId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        model: String,
+        usage: TokenUsage,
+    },
     ApprovalRequested {
         event_id: EventId,
         session_id: SessionId,
@@ -183,6 +199,7 @@ pub struct TurnResult {
     pub turn_id: TurnId,
     pub text: String,
     pub provider_rounds: u32,
+    pub usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -3,17 +3,20 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
+    time::Instant,
 };
 
 use lan_core::{
     AgentCore, ModelMessage, ModelProvider, ModelRequest, OpenAiCompatibleProvider, SqliteStore,
 };
 use lan_protocol::{
-    ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, Session, SessionId, TurnResult,
+    ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, RiskLevel, Session, SessionId,
+    ToolDescriptor, TurnResult,
 };
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, State};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -22,6 +25,19 @@ use uuid::Uuid;
 struct DesktopProject {
     name: String,
     path: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderProfile {
+    id: String,
+    name: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+    input_price_per_million: f64,
+    output_price_per_million: f64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -35,7 +51,10 @@ struct DesktopSettings {
     data_dir: String,
     approval_mode: ApprovalMode,
     max_provider_rounds: usize,
+    input_price_per_million: f64,
+    output_price_per_million: f64,
     projects: Vec<DesktopProject>,
+    provider_profiles: Vec<ProviderProfile>,
 }
 
 impl Default for DesktopSettings {
@@ -52,7 +71,10 @@ impl Default for DesktopSettings {
             data_dir: default_data_dir().display().to_string(),
             approval_mode: ApprovalMode::ReadOnly,
             max_provider_rounds: 48,
+            input_price_per_million: 0.0,
+            output_price_per_million: 0.0,
             projects: Vec::new(),
+            provider_profiles: Vec::new(),
         }
     }
 }
@@ -61,6 +83,43 @@ struct AppState {
     core: RwLock<Arc<AgentCore>>,
     settings: RwLock<DesktopSettings>,
     data_dir: RwLock<PathBuf>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestResult {
+    model: String,
+    latency_ms: u128,
+    text_response: String,
+    tool_call_supported: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    current_version: String,
+    latest_version: String,
+    available: bool,
+    release_url: String,
+    installer_url: Option<String>,
+    installer_name: Option<String>,
+    published_at: Option<String>,
+    notes: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+    published_at: Option<String>,
+    body: Option<String>,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 fn user_home() -> PathBuf {
@@ -208,7 +267,7 @@ async fn save_settings(
 }
 
 #[tauri::command]
-async fn test_provider(settings: DesktopSettings) -> Result<String, String> {
+async fn test_provider(settings: DesktopSettings) -> Result<ProviderTestResult, String> {
     if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
         return Err("请先填写 API Key".into());
     }
@@ -219,17 +278,122 @@ async fn test_provider(settings: DesktopSettings) -> Result<String, String> {
     };
     let provider = OpenAiCompatibleProvider::new(settings.base_url, api_key, settings.model)
         .map_err(|error| error.to_string())?;
+    let started = Instant::now();
     let response = provider
         .complete(ModelRequest {
             messages: vec![ModelMessage::text(
                 lan_core::ModelRole::User,
-                "Reply with exactly: connected",
+                "请简短回复连接成功，然后调用 capability_probe 工具。",
             )],
-            tools: Vec::new(),
+            tools: vec![ToolDescriptor {
+                name: "capability_probe".into(),
+                description: "用于检测模型是否支持工具调用".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"ok": {"type": "boolean"}},
+                    "required": ["ok"]
+                }),
+                risk: RiskLevel::ReadOnly,
+            }],
         })
         .await
         .map_err(|error| error.to_string())?;
-    Ok(response.text)
+    Ok(ProviderTestResult {
+        model: provider.model_name().to_string(),
+        latency_ms: started.elapsed().as_millis(),
+        text_response: response.text,
+        tool_call_supported: response
+            .tool_calls
+            .iter()
+            .any(|call| call.name == "capability_probe"),
+    })
+}
+
+#[tauri::command]
+async fn check_for_updates() -> Result<UpdateInfo, String> {
+    let release = reqwest::Client::new()
+        .get("https://api.github.com/repos/zhaoxinyi02/lan-code/releases/latest")
+        .header("User-Agent", "Lan-Code-Desktop")
+        .send()
+        .await
+        .map_err(|error| format!("检查更新失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("GitHub 返回错误：{error}"))?
+        .json::<GithubRelease>()
+        .await
+        .map_err(|error| format!("解析更新信息失败：{error}"))?;
+    let latest_text = release.tag_name.trim_start_matches('v');
+    let current = semver::Version::parse(env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+    let latest = semver::Version::parse(latest_text).map_err(|e| e.to_string())?;
+    let installer = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.to_ascii_lowercase().ends_with("-setup.exe"));
+    Ok(UpdateInfo {
+        current_version: current.to_string(),
+        latest_version: latest.to_string(),
+        available: latest > current,
+        release_url: release.html_url,
+        installer_url: installer.map(|asset| asset.browser_download_url.clone()),
+        installer_name: installer.map(|asset| asset.name.clone()),
+        published_at: release.published_at,
+        notes: release.body,
+    })
+}
+
+#[tauri::command]
+async fn download_update(
+    installer_url: String,
+    installer_name: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if !installer_url.starts_with("https://github.com/zhaoxinyi02/lan-code/releases/download/")
+        || !installer_name.to_ascii_lowercase().ends_with("-setup.exe")
+        || installer_name.contains(['/', '\\'])
+    {
+        return Err("拒绝下载未经验证的更新地址".into());
+    }
+    let bytes = reqwest::Client::new()
+        .get(installer_url)
+        .header("User-Agent", "Lan-Code-Desktop")
+        .send()
+        .await
+        .map_err(|error| format!("下载更新失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("下载更新失败：{error}"))?
+        .bytes()
+        .await
+        .map_err(|error| format!("读取更新包失败：{error}"))?;
+    let updates_dir = state.data_dir.read().await.join("updates");
+    fs::create_dir_all(&updates_dir).map_err(|error| error.to_string())?;
+    let path = updates_dir.join(installer_name);
+    fs::write(&path, bytes).map_err(|error| format!("保存更新包失败：{error}"))?;
+    Ok(path.display().to_string())
+}
+
+#[tauri::command]
+async fn install_downloaded_update(
+    path: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let update = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("更新包不存在：{error}"))?;
+    let updates_dir = state.data_dir.read().await.join("updates");
+    let updates_dir = updates_dir
+        .canonicalize()
+        .map_err(|error| format!("更新目录不存在：{error}"))?;
+    if !update.starts_with(&updates_dir)
+        || update.extension().and_then(|value| value.to_str()) != Some("exe")
+    {
+        return Err("拒绝运行数据目录之外的安装包".into());
+    }
+    Command::new(update)
+        .spawn()
+        .map_err(|error| format!("启动安装程序失败：{error}"))?;
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -266,6 +430,19 @@ async fn delete_session(session_id: SessionId, state: State<'_, AppState>) -> Re
     core(&state)
         .await
         .delete_session(session_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn rename_session(
+    session_id: SessionId,
+    title: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    core(&state)
+        .await
+        .rename_session(session_id, title)
         .await
         .map_err(|error| error.to_string())
 }
@@ -346,11 +523,15 @@ fn main() {
             get_settings,
             save_settings,
             test_provider,
+            check_for_updates,
+            download_update,
+            install_downloaded_update,
             pick_workspace,
             pick_data_dir,
             list_sessions,
             create_session,
             delete_session,
+            rename_session,
             session_messages,
             session_events,
             pending_approvals,

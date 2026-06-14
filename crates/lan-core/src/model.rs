@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use lan_protocol::{ToolCall, ToolDescriptor};
+use lan_protocol::{TokenUsage, ToolCall, ToolDescriptor};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -64,6 +64,7 @@ pub struct ModelResponse {
     pub message: ModelMessage,
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub usage: TokenUsage,
 }
 
 #[async_trait]
@@ -120,6 +121,26 @@ struct ChatFunction<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: ChatUsage,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: ChatPromptTokenDetails,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatPromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +187,16 @@ impl ModelProvider for OpenAiCompatibleProvider {
         }
         let response: ChatResponse =
             serde_json::from_str(&body).context("invalid model response JSON")?;
+        let usage = TokenUsage {
+            input_tokens: response.usage.prompt_tokens,
+            output_tokens: response.usage.completion_tokens,
+            total_tokens: if response.usage.total_tokens == 0 {
+                response.usage.prompt_tokens + response.usage.completion_tokens
+            } else {
+                response.usage.total_tokens
+            },
+            cached_input_tokens: response.usage.prompt_tokens_details.cached_tokens,
+        };
         let message = response
             .choices
             .into_iter()
@@ -191,6 +222,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             message,
             text,
             tool_calls,
+            usage,
         })
     }
 }

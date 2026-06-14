@@ -109,11 +109,14 @@ article p { margin: 6px 0 0; }
 .progress-item.done svg { color: #7a9684; }
 .progress-item.failed { color: #a84646; }
 .empty-small { color: #a0a29e; font-size: 11px; line-height: 1.5; }
+.usage-grid { display: grid; gap: 8px; }
+.usage-grid span { display: flex; justify-content: space-between; color: #777; font-size: 11px; }
+.usage-grid strong { color: #333; font-weight: 600; }
 .pulse { width: 9px; height: 9px; border-radius: 50%; background: #4389f5; box-shadow: 0 0 0 4px #4389f51c; }
 
 .modal-backdrop { position: fixed; inset: 0; display: grid; place-items: center; background: #0004; }
 .modal { width: 430px; background: #fff; border: 1px solid #ddd; border-radius: 16px; box-shadow: 0 24px 60px #0003; padding: 22px; }
-.settings-modal { width: min(620px, calc(100vw - 40px)); }
+.settings-modal { width: min(680px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow: auto; }
 .modal-title { display: flex; justify-content: space-between; align-items: flex-start; }
 .modal-title p { margin: 4px 0 0; color: #888; font-size: 12px; }
 .modal h2 { margin: 0 0 20px; font-size: 18px; }
@@ -129,6 +132,19 @@ article p { margin: 6px 0 0; }
 .settings-status { margin-top: 9px; padding: 9px 10px; border-radius: 8px; color: #267146; background: #edf8f0; font-size: 12px; }
 .settings-status.failed { color: #a33f3f; background: #fff0f0; }
 .settings-note { margin-top: 10px; padding: 9px 10px; border-radius: 8px; color: #805f23; background: #fff8e8; font-size: 11px; line-height: 1.5; }
+.update-card { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding: 11px; border: 1px solid #e2e4df; border-radius: 10px; background: #fafbf9; }
+.update-card > div:first-child { display: grid; gap: 4px; min-width: 0; }
+.update-card strong, .update-card > div:last-child, .update-card button { display: flex; align-items: center; gap: 6px; }
+.update-card span { color: #777; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.update-card > div:last-child { flex-shrink: 0; }
+.update-card button { border: 1px solid #d8d9d5; background: #fff; border-radius: 8px; padding: 7px 9px; font-size: 11px; }
+.profile-section { margin-top: 12px; padding: 11px; border: 1px solid #e2e4df; border-radius: 10px; }
+.profile-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; font-size: 12px; }
+.profile-heading button, .profile-row button { border: 1px solid #ddd; background: #fff; border-radius: 7px; padding: 7px 9px; }
+.profile-section > span { color: #888; font-size: 11px; }
+.profile-row { display: grid; grid-template-columns: 1fr auto; gap: 6px; margin-top: 6px; }
+.profile-row > button:first-child { display: flex; justify-content: space-between; text-align: left; }
+.profile-row span { color: #888; font-size: 11px; }
 .approval-bar { position: fixed; z-index: 5; left: 50%; bottom: 130px; transform: translateX(-50%); width: min(700px, calc(100vw - 48px)); display: flex; align-items: center; gap: 8px; padding: 12px; border: 1px solid #d9d4c8; border-radius: 12px; background: #fffdf7; box-shadow: 0 15px 40px #0002; }
 .approval-bar div { display: grid; gap: 3px; margin-right: auto; }
 .approval-bar span { color: #777; font-size: 11px; }

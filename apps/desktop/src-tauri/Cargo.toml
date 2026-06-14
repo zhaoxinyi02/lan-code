@@ -18,3 +18,5 @@ tokio.workspace = true
 uuid.workspace = true
 rfd = "0.15"
 keyring = { version = "3", features = ["windows-native"] }
+reqwest.workspace = true
+semver = "1"

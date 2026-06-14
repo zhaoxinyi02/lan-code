@@ -4,21 +4,33 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   Bot, CheckCircle2, ChevronDown, CircleStop, Code2, FileDiff, FolderGit2,
   FolderPlus, GitBranch, History, KeyRound, PanelLeftClose, PanelLeftOpen, Plus,
-  Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2, XCircle,
+  Download, RefreshCw, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
+  XCircle, Zap,
 } from "lucide-react";
 import "./styles.css";
 
 type Mode = "readOnly" | "ask" | "workspace" | "fullAccess";
 type Session = { id: string; cwd: string; title?: string; status: string };
 type Project = { name: string; path: string };
+type ProviderProfile = {
+  id: string; name: string; provider: string; baseUrl: string; model: string; apiKey: string;
+  inputPricePerMillion: number; outputPricePerMillion: number;
+};
 type SettingsData = {
   provider: string; baseUrl: string; model: string; apiKey: string; workspace: string;
   dataDir: string; approvalMode: Mode; maxProviderRounds: number; projects: Project[];
+  inputPricePerMillion: number; outputPricePerMillion: number;
+  providerProfiles: ProviderProfile[];
 };
 type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
-type CoreEvent = { type: string; toolName?: string; error?: string; text?: string };
+type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
+type CoreEvent = { type: string; toolName?: string; error?: string; text?: string; usage?: TokenUsage; model?: string };
 type Approval = { id: string; toolName: string; reason: string; arguments: unknown };
 type ChatMessage = { role: "user" | "assistant"; text: string };
+type UpdateInfo = {
+  currentVersion: string; latestVersion: string; available: boolean; releaseUrl: string;
+  installerUrl?: string; installerName?: string; publishedAt?: string; notes?: string;
+};
 
 const DEFAULT_SETTINGS: SettingsData = {
   provider: "deepseek",
@@ -29,7 +41,10 @@ const DEFAULT_SETTINGS: SettingsData = {
   dataDir: "",
   approvalMode: "readOnly",
   maxProviderRounds: 48,
+  inputPricePerMillion: 0,
+  outputPricePerMillion: 0,
   projects: [],
+  providerProfiles: [],
 };
 
 const PROVIDERS = [
@@ -58,6 +73,9 @@ function App() {
   const [query, setQuery] = React.useState("");
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
   const [fatal, setFatal] = React.useState("");
+  const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo>();
+  const [updateStatus, setUpdateStatus] = React.useState("");
+  const [downloadedUpdate, setDownloadedUpdate] = React.useState("");
 
   const refreshSessions = React.useCallback(async () => {
     const rows = await invoke<Session[]>("list_sessions");
@@ -152,6 +170,38 @@ function App() {
     await refreshSessions();
   }
 
+  async function renameSession(session: Session) {
+    const title = window.prompt("输入新的对话名称", session.title || "未命名对话")?.trim();
+    if (!title) return;
+    await invoke("rename_session", { sessionId: session.id, title });
+    await refreshSessions();
+  }
+
+  function saveProviderProfile() {
+    const name = window.prompt("为当前 Provider 配置命名", `${draft.provider} / ${draft.model}`)?.trim();
+    if (!name) return;
+    const profile: ProviderProfile = {
+      id: crypto.randomUUID(), name, provider: draft.provider, baseUrl: draft.baseUrl, model: draft.model,
+      apiKey: draft.apiKey, inputPricePerMillion: draft.inputPricePerMillion,
+      outputPricePerMillion: draft.outputPricePerMillion,
+    };
+    setDraft({ ...draft, providerProfiles: [...draft.providerProfiles, profile] });
+    setSettingsStatus(`已加入配置档案“${name}”，点击保存并启用后持久化。`);
+  }
+
+  function applyProviderProfile(profile: ProviderProfile) {
+    setDraft({
+      ...draft, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model,
+      apiKey: profile.apiKey, inputPricePerMillion: profile.inputPricePerMillion,
+      outputPricePerMillion: profile.outputPricePerMillion,
+    });
+    setSettingsStatus(`已载入配置档案“${profile.name}”。`);
+  }
+
+  function removeProviderProfile(profile: ProviderProfile) {
+    setDraft({ ...draft, providerProfiles: draft.providerProfiles.filter((item) => item.id !== profile.id) });
+  }
+
   async function saveSettings() {
     setSettingsStatus("正在保存...");
     try {
@@ -168,13 +218,43 @@ function App() {
   }
 
   async function testProvider() {
-    setSettingsStatus("正在测试 API...");
+    setSettingsStatus("正在测试文本响应和工具调用能力...");
     try {
-      const result = await invoke<string>("test_provider", { settings: draft });
-      setSettingsStatus(`连接成功：${result || "模型已响应"}`);
+      const result = await invoke<{ model: string; latencyMs: number; textResponse: string; toolCallSupported: boolean }>("test_provider", { settings: draft });
+      setSettingsStatus(`连接成功，延迟 ${result.latencyMs}ms，工具调用${result.toolCallSupported ? "可用" : "未通过"}：${result.textResponse || result.model}`);
     } catch (error) {
       setSettingsStatus(`连接失败：${String(error)}`);
     }
+  }
+
+  async function checkUpdates() {
+    setUpdateStatus("正在检查 GitHub Release...");
+    try {
+      const info = await invoke<UpdateInfo>("check_for_updates");
+      setUpdateInfo(info);
+      setUpdateStatus(info.available ? `发现新版本 v${info.latestVersion}` : `当前已是最新版本 v${info.currentVersion}`);
+    } catch (error) {
+      setUpdateStatus(`检查失败：${String(error)}`);
+    }
+  }
+
+  async function downloadUpdate() {
+    if (!updateInfo?.installerUrl || !updateInfo.installerName) return;
+    setUpdateStatus("正在下载最新安装包，请稍候...");
+    try {
+      const path = await invoke<string>("download_update", {
+        installerUrl: updateInfo.installerUrl, installerName: updateInfo.installerName,
+      });
+      setDownloadedUpdate(path);
+      setUpdateStatus("更新包已下载，点击“退出并安装”完成更新。");
+    } catch (error) {
+      setUpdateStatus(`下载失败：${String(error)}`);
+    }
+  }
+
+  async function installUpdate() {
+    if (!downloadedUpdate || !window.confirm("Lan Code 将退出并启动安装程序，是否继续？")) return;
+    await invoke("install_downloaded_update", { path: downloadedUpdate });
   }
 
   async function newSession(title = "新对话") {
@@ -226,6 +306,15 @@ function App() {
     !query || `${row.title || ""} ${row.cwd}`.toLowerCase().includes(query.toLowerCase()));
   const recentTools = events.filter((event) =>
     ["toolStarted", "toolCompleted", "toolFailed"].includes(event.type)).slice(-8).reverse();
+  const usage = events.filter((event) => event.type === "usageRecorded" && event.usage)
+    .reduce((total, event) => ({
+      inputTokens: total.inputTokens + event.usage!.inputTokens,
+      outputTokens: total.outputTokens + event.usage!.outputTokens,
+      totalTokens: total.totalTokens + event.usage!.totalTokens,
+      cachedInputTokens: total.cachedInputTokens + event.usage!.cachedInputTokens,
+    }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 });
+  const estimatedCost = usage.inputTokens / 1_000_000 * settings.inputPricePerMillion
+    + usage.outputTokens / 1_000_000 * settings.outputPricePerMillion;
 
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
@@ -252,7 +341,7 @@ function App() {
         <div className="section-label">最近对话</div>
         <div className="sessions">{filtered.map((session) => (
           <div className="session-row" key={session.id}>
-            <button className={session.id === activeId ? "active" : ""} onClick={() => setActiveId(session.id)}>
+            <button title="双击可重命名" className={session.id === activeId ? "active" : ""} onClick={() => setActiveId(session.id)} onDoubleClick={() => void renameSession(session)}>
               <Code2 size={15} /><span>{session.title || "未命名对话"}</span><i className={`status ${session.status}`} />
             </button>
             <button title="删除对话" className="row-action" onClick={() => void removeSession(session.id)}><Trash2 size={14} /></button>
@@ -302,6 +391,8 @@ function App() {
         <button className="info-row clickable" onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><FolderGit2 size={16} /><span>工作区</span><strong>{settings.workspace ? "已选择" : "未配置"}</strong></button>
         <button className="info-row clickable" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><KeyRound size={16} /><span>模型</span><strong>{settings.apiKey ? settings.model : "未配置"}</strong></button>
         <button className="info-row clickable" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><ShieldCheck size={16} /><span>权限</span><strong>{settings.approvalMode}</strong></button>
+        <div className="divider" /><h3>当前对话用量</h3>
+        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
         <div className="divider" /><h3>工具进度</h3>
         {recentTools.length === 0 ? <div className="empty-small">发送任务后在这里查看工具执行过程</div> : recentTools.map((event, index) => (
           <div className={`progress-item ${event.type === "toolCompleted" ? "done" : event.type === "toolFailed" ? "failed" : ""}`} key={index}>
@@ -325,8 +416,24 @@ function App() {
           <label className="span-2">工作区<div className="input-action"><input value={draft.workspace} onChange={(e) => setDraft({ ...draft, workspace: e.target.value })} /><button onClick={chooseWorkspace}>选择文件夹</button></div></label>
           <label className="span-2">数据保存目录<div className="input-action"><input value={draft.dataDir} onChange={(e) => setDraft({ ...draft, dataDir: e.target.value })} /><button onClick={chooseDataDir}>选择目录</button></div></label>
           <label>权限模式<select value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as Mode })}><option value="readOnly">只读</option><option value="ask">每次询问</option><option value="workspace">工作区写入</option><option value="fullAccess">完全访问</option></select></label>
+          <label>输入价格（美元/百万 Token）<input type="number" min="0" step="0.01" value={draft.inputPricePerMillion} onChange={(e) => setDraft({ ...draft, inputPricePerMillion: Number(e.target.value) })} /></label>
+          <label>输出价格（美元/百万 Token）<input type="number" min="0" step="0.01" value={draft.outputPricePerMillion} onChange={(e) => setDraft({ ...draft, outputPricePerMillion: Number(e.target.value) })} /></label>
+        </div>
+        <div className="profile-section">
+          <div className="profile-heading"><strong>Provider 配置档案</strong><button onClick={saveProviderProfile}>保存当前配置</button></div>
+          {draft.providerProfiles.length === 0 ? <span>可保存多套模型地址、Key 和计费参数，切换时无需重复填写。</span> : draft.providerProfiles.map((profile) => (
+            <div className="profile-row" key={profile.id}><button onClick={() => applyProviderProfile(profile)}><strong>{profile.name}</strong><span>{profile.model}</span></button><button onClick={() => removeProviderProfile(profile)}><Trash2 size={14} /></button></div>
+          ))}
         </div>
         <div className="settings-note">API Key 会明文保存在所选数据目录的 settings.json 中，请不要把该文件提交到 Git 或分享给他人。</div>
+        <div className="update-card">
+          <div><strong><Zap size={15} /> 软件更新</strong><span>{updateStatus || "仅从 Lan Code 官方 GitHub Release 检查和下载更新。"}</span></div>
+          <div>
+            <button onClick={checkUpdates}><RefreshCw size={14} /> 检查更新</button>
+            {updateInfo?.available && !downloadedUpdate && <button onClick={downloadUpdate}><Download size={14} /> 下载 v{updateInfo.latestVersion}</button>}
+            {downloadedUpdate && <button className="primary-inline" onClick={installUpdate}>退出并安装</button>}
+          </div>
+        </div>
         {settingsStatus && <div className={settingsStatus.includes("失败") ? "settings-status failed" : "settings-status"}>{settingsStatus}</div>}
         <div className="modal-actions"><button onClick={testProvider}>测试 API</button><button className="primary-inline" onClick={saveSettings}>保存并启用</button></div>
       </div></div>}

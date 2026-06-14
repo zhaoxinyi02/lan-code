@@ -9,7 +9,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, Result, bail};
 use lan_protocol::{
     ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, PolicyDecision, Session, SessionId,
-    SessionStatus, ToolCall, ToolDescriptor, TurnResult,
+    SessionStatus, TokenUsage, ToolCall, ToolDescriptor, TurnResult,
 };
 use serde_json::Value;
 use tokio::sync::{RwLock, broadcast, oneshot};
@@ -172,6 +172,22 @@ impl AgentCore {
         if let Some(store) = &self.store {
             store.delete_session(session_id)?;
         }
+        Ok(())
+    }
+
+    pub async fn rename_session(&self, session_id: SessionId, title: String) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            bail!("session title cannot be empty");
+        }
+        self.sessions
+            .write()
+            .await
+            .get_mut(&session_id)
+            .context("session not found")?
+            .session
+            .title = Some(title.chars().take(80).collect());
+        self.persist_session(session_id).await;
         Ok(())
     }
 
@@ -463,6 +479,7 @@ impl AgentCore {
         );
 
         let mut repeated_calls = HashMap::<String, usize>::new();
+        let mut usage = TokenUsage::default();
         for round in 1..=self.max_provider_rounds {
             let messages = self
                 .sessions
@@ -479,6 +496,7 @@ impl AgentCore {
                     tools: self.list_tools(),
                 }) => response?,
             };
+            accumulate_usage(&mut usage, response.usage);
             {
                 let mut sessions = self.sessions.write().await;
                 sessions
@@ -501,6 +519,16 @@ impl AgentCore {
                 );
                 self.emit(
                     session_id,
+                    CoreEvent::UsageRecorded {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        turn_id,
+                        model: provider.model_name().to_string(),
+                        usage,
+                    },
+                );
+                self.emit(
+                    session_id,
                     CoreEvent::TurnCompleted {
                         event_id: Uuid::new_v4(),
                         session_id,
@@ -512,6 +540,7 @@ impl AgentCore {
                     turn_id,
                     text,
                     provider_rounds: round as u32,
+                    usage,
                 });
             }
             for call in response.tool_calls {
@@ -588,6 +617,7 @@ impl AgentCore {
                 tools: Vec::new(),
             }) => response?,
         };
+        accumulate_usage(&mut usage, response.usage);
         let text = if response.text.trim().is_empty() {
             format!(
                 "任务已达到 {} 轮执行预算。已经完成的文件修改会保留，请检查 Git diff 后继续任务。",
@@ -615,6 +645,16 @@ impl AgentCore {
         );
         self.emit(
             session_id,
+            CoreEvent::UsageRecorded {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                model: provider.model_name().to_string(),
+                usage,
+            },
+        );
+        self.emit(
+            session_id,
             CoreEvent::TurnCompleted {
                 event_id: Uuid::new_v4(),
                 session_id,
@@ -626,8 +666,16 @@ impl AgentCore {
             turn_id,
             text,
             provider_rounds: (self.max_provider_rounds + 1) as u32,
+            usage,
         })
     }
+}
+
+fn accumulate_usage(total: &mut TokenUsage, value: TokenUsage) {
+    total.input_tokens += value.input_tokens;
+    total.output_tokens += value.output_tokens;
+    total.total_tokens += value.total_tokens;
+    total.cached_input_tokens += value.cached_input_tokens;
 }
 
 impl Default for AgentCore {
@@ -646,7 +694,9 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use lan_protocol::{ApprovalDecision, ApprovalMode, CoreEvent, SessionStatus, ToolCall};
+    use lan_protocol::{
+        ApprovalDecision, ApprovalMode, CoreEvent, SessionStatus, TokenUsage, ToolCall,
+    };
     use serde_json::json;
 
     use super::{
@@ -733,11 +783,13 @@ mod tests {
                         name: "echo".into(),
                         arguments: json!({"text": "observed"}),
                     }],
+                    usage: TokenUsage::default(),
                 },
                 ModelResponse {
                     message: ModelMessage::text(ModelRole::Assistant, "done"),
                     text: "done".into(),
                     tool_calls: Vec::new(),
+                    usage: TokenUsage::default(),
                 },
             ])),
         };
@@ -749,6 +801,41 @@ mod tests {
             .unwrap();
         assert_eq!(result.text, "done");
         assert_eq!(result.provider_rounds, 2);
+    }
+
+    #[tokio::test]
+    async fn turn_aggregates_and_persists_token_usage() {
+        let root = std::env::temp_dir().join(format!("lan-usage-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([ModelResponse {
+                message: ModelMessage::text(ModelRole::Assistant, "done"),
+                text: "done".into(),
+                tool_calls: Vec::new(),
+                usage: TokenUsage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    total_tokens: 150,
+                    cached_input_tokens: 20,
+                },
+            }])),
+        };
+        let core = AgentCore::with_provider_and_store(
+            Arc::new(provider),
+            SqliteStore::open(root.join("lan.sqlite")).unwrap(),
+        )
+        .unwrap();
+        let session = core.create_session(root.display().to_string(), None).await;
+        let result = core
+            .start_turn(session.id, "test usage".into(), ApprovalMode::ReadOnly)
+            .await
+            .unwrap();
+        assert_eq!(result.usage.total_tokens, 150);
+        assert!(core.events_for_session(session.id).unwrap().iter().any(
+            |event| matches!(event, CoreEvent::UsageRecorded { usage, .. } if usage.total_tokens == 150)
+        ));
+        drop(core);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -765,6 +852,7 @@ mod tests {
             message: ModelMessage::text(ModelRole::Assistant, "已完成四个步骤，剩余工作可继续。"),
             text: "已完成四个步骤，剩余工作可继续。".into(),
             tool_calls: Vec::new(),
+            usage: TokenUsage::default(),
         });
         let core = AgentCore::with_provider(Arc::new(ScriptedProvider {
             responses: Mutex::new(responses),
@@ -804,6 +892,7 @@ mod tests {
                 name: name.into(),
                 arguments: serde_json::from_str(&arguments).unwrap(),
             }],
+            usage: TokenUsage::default(),
         }
     }
 
@@ -839,6 +928,7 @@ mod tests {
                     message: ModelMessage::text(ModelRole::Assistant, "implemented and reviewed"),
                     text: "implemented and reviewed".into(),
                     tool_calls: Vec::new(),
+                    usage: TokenUsage::default(),
                 },
             ])),
         };
@@ -881,6 +971,7 @@ mod tests {
                     message: ModelMessage::text(ModelRole::Assistant, "created"),
                     text: "created".into(),
                     tool_calls: Vec::new(),
+                    usage: TokenUsage::default(),
                 },
             ])),
         };
@@ -938,6 +1029,32 @@ mod tests {
             assert!(core.list_sessions().await.is_empty());
             assert!(core.events_for_session(session_id).unwrap().is_empty());
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renaming_a_session_is_persisted() {
+        let root = std::env::temp_dir().join(format!("lan-rename-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("lan.sqlite");
+        let session_id;
+        {
+            let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
+            let session = core.create_session(root.display().to_string(), None).await;
+            session_id = session.id;
+            core.rename_session(session.id, "新的名称".into())
+                .await
+                .unwrap();
+        }
+        let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
+        let session = core
+            .list_sessions()
+            .await
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        assert_eq!(session.title.as_deref(), Some("新的名称"));
+        drop(core);
         fs::remove_dir_all(root).unwrap();
     }
 
