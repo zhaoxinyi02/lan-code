@@ -3,7 +3,12 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $repo = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $repo "dist"
-$packageName = "lan-code-0.2.0-windows-x64"
+$versionMatch = Select-String -Path (Join-Path $repo "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+if (-not $versionMatch) {
+    throw "Unable to read workspace version from Cargo.toml"
+}
+$version = $versionMatch.Matches[0].Groups[1].Value
+$packageName = "lan-code-$version-windows-x64"
 $package = Join-Path $dist $packageName
 $zip = Join-Path $dist "$packageName.zip"
 
