@@ -35,6 +35,7 @@ type SettingsData = {
 type WorkspaceEntry = { path: string; name: string; isDir: boolean; depth: number };
 type WorkspaceSearchMatch = { path: string; line: number; text: string };
 type GitChange = { status: string; path: string };
+type TerminalOutput = { success: boolean; exitCode?: number; stdout: string; stderr: string };
 type OpenFile = { path: string; content: string; savedContent: string };
 type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
 type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
@@ -106,6 +107,10 @@ function App() {
   const [diffText, setDiffText] = React.useState("");
   const [gitChanges, setGitChanges] = React.useState<GitChange[]>([]);
   const [selectedGitPath, setSelectedGitPath] = React.useState("");
+  const [terminalOpen, setTerminalOpen] = React.useState(false);
+  const [terminalCommand, setTerminalCommand] = React.useState("");
+  const [terminalOutput, setTerminalOutput] = React.useState("");
+  const [terminalBusy, setTerminalBusy] = React.useState(false);
   const editorRef = React.useRef<Parameters<OnMount>[0] | null>(null);
   const completionTimer = React.useRef<number | undefined>(undefined);
   const activeDocument = openFiles.find((file) => file.path === activeFile);
@@ -375,6 +380,24 @@ function App() {
       setCodeStatus(`已撤销 ${change.path} 的未暂存改动`);
     } catch (error) {
       setCodeStatus(`撤销失败：${String(error)}`);
+    }
+  }
+
+  async function runTerminalCommand() {
+    const command = terminalCommand.trim();
+    if (!command || terminalBusy) return;
+    if (!window.confirm(`将在当前工作区以 fullAccess 执行：\n\n${command}\n\n是否继续？`)) return;
+    setTerminalBusy(true);
+    setTerminalOutput((value) => `${value}\n> ${command}\n`);
+    try {
+      const output = await invoke<TerminalOutput>("run_workspace_terminal", { command });
+      setTerminalOutput((value) => `${value}${output.stdout}${output.stderr}${output.success ? "" : `\n[退出码 ${output.exitCode ?? "未知"}]`}\n`);
+      setTerminalCommand("");
+      await Promise.all([refreshWorkspaceFiles(), refreshGitChanges()]);
+    } catch (error) {
+      setTerminalOutput((value) => `${value}[执行失败] ${String(error)}\n`);
+    } finally {
+      setTerminalBusy(false);
     }
   }
 
@@ -655,7 +678,7 @@ function App() {
       </main> : <main className="code-main">
         <header>
           <div className="title-row">{!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}<div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{activeDocument && activeDocument.content !== activeDocument.savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
-          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => void refreshGitChanges()}><FileDiff size={15} /> 查看改动</button></div>
+          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => void refreshGitChanges()}><FileDiff size={15} /> 查看改动</button><button className="pill" onClick={() => setTerminalOpen(!terminalOpen)}><TerminalSquare size={15} /> 终端</button></div>
         </header>
         {codeStatus && <div className="code-status">{codeStatus}</div>}
         <div className="editor-tabs">{openFiles.length ? openFiles.map((file) => <button key={file.path} className={file.path === activeFile ? "active" : ""} onClick={() => setActiveFile(file.path)}><File size={13} /><span>{file.path.split(/[\\/]/).at(-1)}</span>{file.content !== file.savedContent && <i />}<b title="关闭" onClick={(event) => { event.stopPropagation(); closeWorkspaceFile(file.path); }}>×</b></button>) : <span>从左侧项目树打开文件</span>}</div>
@@ -689,6 +712,7 @@ function App() {
           theme="vs"
           options={{ automaticLayout: true, minimap: { enabled: true }, fontSize: 13, tabSize: 2, wordWrap: "off", inlineSuggest: { enabled: true } }}
         /> : <div className="code-welcome"><Code2 size={46} /><h2>Lan Code 工作台</h2><p>浏览项目、编辑代码、查看改动，并让同一个 Agent 理解当前仓库。</p></div>}</div>
+        {terminalOpen && <section className="terminal-panel"><div className="terminal-title"><strong>PowerShell · {settings.workspace}</strong><button onClick={() => setTerminalOutput("")}>清空</button><button onClick={() => setTerminalOpen(false)}>×</button></div><pre>{terminalOutput || "集成终端要求 fullAccess；每条命令执行前都会要求确认。"}</pre><div className="terminal-input"><span>›</span><input value={terminalCommand} onChange={(event) => setTerminalCommand(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void runTerminalCommand(); }} placeholder="输入 PowerShell 命令" disabled={terminalBusy} /><button onClick={() => void runTerminalCommand()} disabled={terminalBusy || !terminalCommand.trim()}>{terminalBusy ? "执行中" : "运行"}</button></div></section>}
       </main>}
 
       <aside className={`inspector ${workbench === "code" ? "code-inspector" : ""}`}>

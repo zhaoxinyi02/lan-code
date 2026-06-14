@@ -19,7 +19,7 @@ use lan_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
-use tokio::sync::RwLock;
+use tokio::{process::Command as TokioCommand, sync::RwLock};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -171,6 +171,15 @@ struct WorkspaceSearchMatch {
 struct GitChange {
     status: String,
     path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalOutput {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Serialize)]
@@ -777,6 +786,46 @@ async fn discard_workspace_changes(path: String, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
+async fn run_workspace_terminal(
+    command: String,
+    state: State<'_, AppState>,
+) -> Result<TerminalOutput, String> {
+    if command.trim().is_empty() {
+        return Err("命令不能为空".into());
+    }
+    let settings = state.settings.read().await;
+    if settings.approval_mode != ApprovalMode::FullAccess {
+        return Err("集成终端要求权限模式为 fullAccess".into());
+    }
+    let mut process = TokioCommand::new("powershell");
+    process
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &command,
+        ])
+        .current_dir(&settings.workspace)
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    process.creation_flags(0x08000000);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(120), process.output())
+        .await
+        .map_err(|_| "命令执行超过 120 秒，已终止".to_string())?
+        .map_err(|error| error.to_string())?;
+    fn bounded(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(&bytes[..bytes.len().min(128 * 1024)]).into_owned()
+    }
+    Ok(TerminalOutput {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: bounded(&output.stdout),
+        stderr: bounded(&output.stderr),
+    })
+}
+
+#[tauri::command]
 async fn inline_completion(
     path: String,
     prefix: String,
@@ -1131,6 +1180,7 @@ fn main() {
             workspace_git_changes,
             workspace_file_diff,
             discard_workspace_changes,
+            run_workspace_terminal,
             inline_completion,
             check_for_updates,
             download_update,

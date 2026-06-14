@@ -88,6 +88,16 @@ main { display: flex; flex-direction: column; min-width: 0; background: #fff; }
 .editor-tabs button b { display: grid; place-items: center; width: 17px; height: 17px; border-radius: 4px; color: #888; font-size: 15px; font-weight: 400; }
 .editor-tabs button b:hover { background: #e0e0de; color: #222; }
 .editor-host { flex: 1; min-height: 0; }
+.terminal-panel { display: flex; flex: 0 0 210px; min-height: 130px; flex-direction: column; border-top: 1px solid #d9dad6; background: #17191c; color: #d9dce1; }
+.terminal-title { display: flex; align-items: center; gap: 4px; padding: 6px 9px; border-bottom: 1px solid #2b2e33; background: #202328; font-size: 10px; }
+.terminal-title strong { margin-right: auto; overflow: hidden; color: #b9c0ca; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-title button { border: 0; border-radius: 4px; padding: 3px 6px; background: transparent; color: #9299a3; }
+.terminal-title button:hover { background: #33373d; color: #fff; }
+.terminal-panel pre { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 8px 10px; font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; }
+.terminal-input { display: flex; align-items: center; gap: 6px; padding: 6px 9px; border-top: 1px solid #2b2e33; }
+.terminal-input span { color: #5ea0ef; }
+.terminal-input input { flex: 1; border: 0; outline: 0; background: transparent; color: #fff; font: 11px Consolas, monospace; }
+.terminal-input button { border: 1px solid #454b54; border-radius: 5px; padding: 4px 8px; background: #2b3037; color: #d9dce1; font-size: 10px; }
 .code-welcome { height: 100%; display: grid; place-content: center; justify-items: center; color: #999; text-align: center; }
 .code-welcome h2 { color: #333; margin: 16px 0 3px; }
 .code-welcome p { margin: 0; font-size: 12px; }
