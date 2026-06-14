@@ -23,6 +23,7 @@ dependencies and no source has been copied into Lan Code.
 | `trae-agent` | `bytedance/trae-agent` | `e839e559ac61bdd0e057c375dd1dee391fee797d` |
 | `void` | `voideditor/void` | `b3166e7ef2aefbdfeb139445fdf248a561b85d4d` |
 | `kun` | `KunAgent/Kun` | `a4c91b31d4f7b777769f1dd3e1ea8d13a2c17941` |
+| `vscode` | `microsoft/vscode` | research shallow checkout |
 
 `anthropics/claude-code` is the official public repository, but it does not
 contain the full proprietary Claude Code core. Unauthorized leak mirrors are

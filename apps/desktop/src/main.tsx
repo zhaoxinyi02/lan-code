@@ -1,10 +1,12 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import Editor, { type OnMount } from "@monaco-editor/react";
+import * as monaco from "monaco-editor";
 import {
-  Bot, CheckCircle2, ChevronDown, CircleStop, Code2, FileDiff, FolderGit2,
+  Bot, CheckCircle2, ChevronDown, CircleStop, Code2, File, FileDiff, Folder, FolderGit2, Image,
   FolderPlus, GitBranch, History, KeyRound, PanelLeftClose, PanelLeftOpen, Plus,
-  Download, RefreshCw, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
+  Download, MessageSquare, RefreshCw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
   XCircle, Zap,
 } from "lucide-react";
 import "./styles.css";
@@ -16,12 +18,21 @@ type ProviderProfile = {
   id: string; name: string; provider: string; baseUrl: string; model: string; apiKey: string;
   inputPricePerMillion: number; outputPricePerMillion: number;
 };
+type ModelCapabilities = {
+  imageInput: boolean; imageOutput: boolean; audioInput: boolean; audioOutput: boolean; toolCalling: boolean;
+};
+type CapabilityRoute = {
+  enabled: boolean; inheritMainModel: boolean; provider: string; baseUrl: string; model: string; apiKey: string;
+};
 type SettingsData = {
   provider: string; baseUrl: string; model: string; apiKey: string; workspace: string;
   dataDir: string; approvalMode: Mode; maxProviderRounds: number; projects: Project[];
   inputPricePerMillion: number; outputPricePerMillion: number;
   providerProfiles: ProviderProfile[];
+  modelCapabilities: ModelCapabilities; visionRoute: CapabilityRoute; imageGenerationRoute: CapabilityRoute;
+  speechToTextRoute: CapabilityRoute; textToSpeechRoute: CapabilityRoute;
 };
+type WorkspaceEntry = { path: string; name: string; isDir: boolean; depth: number };
 type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
 type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
 type CoreEvent = { type: string; toolName?: string; error?: string; text?: string; usage?: TokenUsage; model?: string };
@@ -45,6 +56,11 @@ const DEFAULT_SETTINGS: SettingsData = {
   outputPricePerMillion: 0,
   projects: [],
   providerProfiles: [],
+  modelCapabilities: { imageInput: false, imageOutput: false, audioInput: false, audioOutput: false, toolCalling: false },
+  visionRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
+  imageGenerationRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
+  speechToTextRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
+  textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
 const PROVIDERS = [
@@ -76,6 +92,15 @@ function App() {
   const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo>();
   const [updateStatus, setUpdateStatus] = React.useState("");
   const [downloadedUpdate, setDownloadedUpdate] = React.useState("");
+  const [workbench, setWorkbench] = React.useState<"agent" | "code">("agent");
+  const [workspaceFiles, setWorkspaceFiles] = React.useState<WorkspaceEntry[]>([]);
+  const [activeFile, setActiveFile] = React.useState("");
+  const [fileContent, setFileContent] = React.useState("");
+  const [savedContent, setSavedContent] = React.useState("");
+  const [codeStatus, setCodeStatus] = React.useState("");
+  const [diffText, setDiffText] = React.useState("");
+  const editorRef = React.useRef<Parameters<OnMount>[0] | null>(null);
+  const completionTimer = React.useRef<number | undefined>(undefined);
 
   const refreshSessions = React.useCallback(async () => {
     const rows = await invoke<Session[]>("list_sessions");
@@ -92,6 +117,11 @@ function App() {
       })
       .catch((error) => setFatal(String(error)));
   }, []);
+
+  React.useEffect(() => {
+    if (workbench !== "code" || !settings.workspace) return;
+    invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles).catch((error) => setCodeStatus(String(error)));
+  }, [workbench, settings.workspace]);
 
   React.useEffect(() => {
     if (!activeId) return;
@@ -220,10 +250,50 @@ function App() {
   async function testProvider() {
     setSettingsStatus("正在测试文本响应和工具调用能力...");
     try {
-      const result = await invoke<{ model: string; latencyMs: number; textResponse: string; toolCallSupported: boolean }>("test_provider", { settings: draft });
+      const result = await invoke<{ model: string; latencyMs: number; textResponse: string; toolCallSupported: boolean; capabilities: ModelCapabilities }>("test_provider", { settings: draft });
+      setDraft((value) => ({ ...value, modelCapabilities: result.capabilities }));
       setSettingsStatus(`连接成功，延迟 ${result.latencyMs}ms，工具调用${result.toolCallSupported ? "可用" : "未通过"}：${result.textResponse || result.model}`);
     } catch (error) {
       setSettingsStatus(`连接失败：${String(error)}`);
+    }
+  }
+
+  async function openWorkspaceFile(path: string) {
+    try {
+      const file = await invoke<{ path: string; content: string }>("read_workspace_file", { path });
+      setActiveFile(file.path);
+      setFileContent(file.content);
+      setSavedContent(file.content);
+      setCodeStatus("");
+    } catch (error) {
+      setCodeStatus(`打开失败：${String(error)}`);
+    }
+  }
+
+  async function saveWorkspaceFile() {
+    if (!activeFile) return;
+    await invoke("write_workspace_file", { path: activeFile, content: fileContent });
+    setSavedContent(fileContent);
+    setCodeStatus(`已保存 ${activeFile}`);
+    setDiffText(await invoke<string>("workspace_git_diff"));
+  }
+
+  async function requestCompletion() {
+    const editor = editorRef.current;
+    if (!editor || !activeFile) return;
+    const model = editor.getModel();
+    const position = editor.getPosition();
+    if (!model || !position) return;
+    setCodeStatus("正在生成代码补全...");
+    try {
+      const offset = model.getOffsetAt(position);
+      const completion = await invoke<string>("inline_completion", {
+        path: activeFile, prefix: fileContent.slice(0, offset), suffix: fileContent.slice(offset),
+      });
+      editor.executeEdits("lan-code-completion", [{ range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column), text: completion }]);
+      setCodeStatus("已插入 AI 补全");
+    } catch (error) {
+      setCodeStatus(`补全失败：${String(error)}`);
     }
   }
 
@@ -255,6 +325,34 @@ function App() {
   async function installUpdate() {
     if (!downloadedUpdate || !window.confirm("Lan Code 将退出并启动安装程序，是否继续？")) return;
     await invoke("install_downloaded_update", { path: downloadedUpdate });
+  }
+
+  async function understandImage() {
+    const question = window.prompt("选择图片后，希望模型分析什么？", "请描述图片内容，并指出其中值得注意的信息。");
+    if (question === null) return;
+    setBusy(true);
+    try {
+      const result = await invoke<string>("analyze_image", { prompt: question });
+      setMessages((items) => [...items, { role: "user", text: `分析图片：${question}` }, { role: "assistant", text: result }]);
+    } catch (error) {
+      setMessages((items) => [...items, { role: "assistant", text: `图片理解失败：${String(error)}` }]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createImage() {
+    const description = window.prompt("描述要生成的图片");
+    if (!description?.trim()) return;
+    setBusy(true);
+    try {
+      const path = await invoke<string>("generate_image", { prompt: description });
+      setMessages((items) => [...items, { role: "user", text: `生成图片：${description}` }, { role: "assistant", text: `图片已生成并保存到：${path}` }]);
+    } catch (error) {
+      setMessages((items) => [...items, { role: "assistant", text: `图片生成失败：${String(error)}` }]);
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function newSession(title = "新对话") {
@@ -322,6 +420,12 @@ function App() {
         <div className="brand"><img src="/lan-code-logo.png" alt="Lan Code" /><strong>Lan Code</strong>
           <button title="收起侧栏" className="icon-button" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={17} /></button>
         </div>
+        <div className="mode-switch"><button className={workbench === "agent" ? "active" : ""} onClick={() => setWorkbench("agent")}><MessageSquare size={14} /> Agent</button><button className={workbench === "code" ? "active" : ""} onClick={() => setWorkbench("code")}><Code2 size={14} /> Code</button></div>
+        {workbench === "code" ? <>
+          <div className="section-label code-label">项目文件 <button title="刷新" onClick={() => invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles)}><RefreshCw size={13} /></button></div>
+          <div className="file-tree">{workspaceFiles.map((entry) => <button key={entry.path} title={entry.path} style={{ paddingLeft: `${8 + entry.depth * 13}px` }} className={activeFile === entry.path ? "active" : ""} disabled={entry.isDir} onClick={() => void openWorkspaceFile(entry.path)}>{entry.isDir ? <Folder size={14} /> : <File size={14} />}<span>{entry.name}</span></button>)}</div>
+          <button className="settings-button" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+        </> : <>
         <button className="new-chat" onClick={() => void newSession()}><Plus size={16} /> 新对话</button>
         <nav>
           <button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen(!searchOpen)}><Search size={16} /> 搜索</button>
@@ -348,9 +452,10 @@ function App() {
           </div>
         ))}</div>
         <button className="settings-button" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+        </>}
       </aside>}
 
-      <main>
+      {workbench === "agent" ? <main>
         <header>
           <div className="title-row">
             {!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}
@@ -371,6 +476,8 @@ function App() {
               <button onClick={() => setPrompt("阅读当前项目并解释架构")}><Bot size={18} /> 理解项目</button>
               <button onClick={() => setPrompt("检查当前 Git diff 并指出风险")}><FileDiff size={18} /> 审阅改动</button>
               <button onClick={() => setPrompt("运行测试并修复失败项")}><CheckCircle2 size={18} /> 修复测试</button>
+              <button onClick={() => void understandImage()}><Image size={18} /> 图片理解</button>
+              <button onClick={() => void createImage()}><Sparkles size={18} /> 生成图片</button>
             </div>
           </div> : <div className="messages">
             {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div><p>{message.text}</p></article>)}
@@ -384,9 +491,52 @@ function App() {
             <button className="mini" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><TerminalSquare size={15} /> {settings.model}</button>
           </div>{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!settings.apiKey} onClick={send}><Send size={17} /></button>}</div>
         </div></div>
-      </main>
+      </main> : <main className="code-main">
+        <header>
+          <div className="title-row">{!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}<div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{fileContent !== savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
+          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeFile || fileContent === savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => invoke<string>("workspace_git_diff").then(setDiffText)}><FileDiff size={15} /> 查看改动</button></div>
+        </header>
+        {codeStatus && <div className="code-status">{codeStatus}</div>}
+        <div className="editor-tabs">{activeFile ? <button className="active"><File size={13} />{activeFile}</button> : <span>从左侧项目树打开文件</span>}</div>
+        <div className="editor-host">{activeFile ? <Editor
+          path={activeFile}
+          value={fileContent}
+          onChange={(value) => setFileContent(value || "")}
+          onMount={(editor) => {
+            editorRef.current = editor;
+            editor.focus();
+            monaco.languages.registerInlineCompletionsProvider("*", {
+              provideInlineCompletions: async (model, position) => {
+                window.clearTimeout(completionTimer.current);
+                await new Promise<void>((resolve) => {
+                  completionTimer.current = window.setTimeout(resolve, 700);
+                });
+                const offset = model.getOffsetAt(position);
+                const value = model.getValue();
+                try {
+                  const completion = await invoke<string>("inline_completion", {
+                    path: activeFile, prefix: value.slice(0, offset), suffix: value.slice(offset),
+                  });
+                  return { items: [{ insertText: completion, range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column) }] };
+                } catch {
+                  return { items: [] };
+                }
+              },
+              disposeInlineCompletions: () => {},
+            });
+          }}
+          theme="vs"
+          options={{ automaticLayout: true, minimap: { enabled: true }, fontSize: 13, tabSize: 2, wordWrap: "off", inlineSuggest: { enabled: true } }}
+        /> : <div className="code-welcome"><Code2 size={46} /><h2>Lan Code 工作台</h2><p>浏览项目、编辑代码、查看改动，并让同一个 Agent 理解当前仓库。</p></div>}</div>
+      </main>}
 
-      <aside className="inspector">
+      <aside className={`inspector ${workbench === "code" ? "code-inspector" : ""}`}>
+        {workbench === "code" ? <>
+          <h3>AI 助手</h3>
+          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">针对当前项目提问，Agent 会使用同一套工具、权限和会话。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div><p>{message.text}</p></article>)}</div>
+          <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="询问代码或要求修改项目" /><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={15} /></button></div>
+          <div className="divider" /><h3>Git 改动</h3><pre className="diff-preview">{diffText || "点击顶部“查看改动”加载 Git diff。"}</pre>
+        </> : <>
         <h3>环境信息</h3>
         <button className="info-row clickable" onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><FolderGit2 size={16} /><span>工作区</span><strong>{settings.workspace ? "已选择" : "未配置"}</strong></button>
         <button className="info-row clickable" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><KeyRound size={16} /><span>模型</span><strong>{settings.apiKey ? settings.model : "未配置"}</strong></button>
@@ -399,6 +549,7 @@ function App() {
             {event.type === "toolFailed" ? <XCircle size={15} /> : <CheckCircle2 size={15} />} {event.toolName}
           </div>
         ))}
+        </>}
       </aside>
 
       {approvals.length > 0 && <div className="approval-bar"><div><strong>需要你的批准</strong><span>{approvals[0].toolName}：{approvals[0].reason}</span></div><button onClick={() => decide(approvals[0].id, "deny")}>拒绝</button><button className="primary-inline" onClick={() => decide(approvals[0].id, "allowOnce")}>允许一次</button></div>}
@@ -424,6 +575,30 @@ function App() {
           {draft.providerProfiles.length === 0 ? <span>可保存多套模型地址、Key 和计费参数，切换时无需重复填写。</span> : draft.providerProfiles.map((profile) => (
             <div className="profile-row" key={profile.id}><button onClick={() => applyProviderProfile(profile)}><strong>{profile.name}</strong><span>{profile.model}</span></button><button onClick={() => removeProviderProfile(profile)}><Trash2 size={14} /></button></div>
           ))}
+        </div>
+        <div className="capability-section">
+          <div className="profile-heading"><strong>模型能力路由</strong><span>测试 API 后会自动识别</span></div>
+          <div className="capability-badges">
+            <i className={draft.modelCapabilities.toolCalling ? "on" : ""}>工具调用</i>
+            <i className={draft.modelCapabilities.imageInput ? "on" : ""}>图片理解</i>
+            <i className={draft.modelCapabilities.imageOutput ? "on" : ""}>图片生成</i>
+            <i className={draft.modelCapabilities.audioInput ? "on" : ""}>语音识别</i>
+            <i className={draft.modelCapabilities.audioOutput ? "on" : ""}>语音输出</i>
+          </div>
+          <p>主模型支持某项能力时自动复用；不支持时，才使用下面的专用模型。</p>
+          {([
+            ["visionRoute", "图片理解", draft.modelCapabilities.imageInput],
+            ["imageGenerationRoute", "图片生成", draft.modelCapabilities.imageOutput],
+            ["speechToTextRoute", "语音识别", draft.modelCapabilities.audioInput],
+            ["textToSpeechRoute", "语音输出", draft.modelCapabilities.audioOutput],
+          ] as const).map(([key, label, inherited]) => {
+            const route = draft[key];
+            return <div className="route-row" key={key}>
+              <label><input type="checkbox" checked={route.enabled} onChange={(event) => setDraft({ ...draft, [key]: { ...route, enabled: event.target.checked } })} /> {label}</label>
+              <span>{inherited && route.inheritMainModel ? "自动使用主模型" : route.enabled ? "使用专用模型" : "未启用"}</span>
+              {!inherited && route.enabled && <div className="route-fields"><input placeholder="API 地址，留空继承主模型" value={route.baseUrl} onChange={(event) => setDraft({ ...draft, [key]: { ...route, inheritMainModel: false, baseUrl: event.target.value } })} /><input placeholder="API Key，留空继承主模型" type="password" value={route.apiKey} onChange={(event) => setDraft({ ...draft, [key]: { ...route, inheritMainModel: false, apiKey: event.target.value } })} /><input placeholder="专用模型名称" value={route.model} onChange={(event) => setDraft({ ...draft, [key]: { ...route, inheritMainModel: false, model: event.target.value } })} /></div>}
+            </div>;
+          })}
         </div>
         <div className="settings-note">API Key 会明文保存在所选数据目录的 settings.json 中，请不要把该文件提交到 Git 或分享给他人。</div>
         <div className="update-card">

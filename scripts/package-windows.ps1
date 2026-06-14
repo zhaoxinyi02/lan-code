@@ -3,7 +3,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $repo = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $repo "dist"
-$packageName = "lan-code-0.1.3-windows-x64"
+$packageName = "lan-code-0.2.0-windows-x64"
 $package = Join-Path $dist $packageName
 $zip = Join-Path $dist "$packageName.zip"
 

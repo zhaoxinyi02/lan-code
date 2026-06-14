@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "lan-cli"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "lan-core",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "lan-core"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "lan-daemon"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "lan-core",
  "lan-protocol",
@@ -2023,9 +2023,10 @@ dependencies = [
 
 [[package]]
 name = "lan-desktop"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "keyring",
  "lan-core",
  "lan-protocol",
@@ -2038,11 +2039,12 @@ dependencies = [
  "tauri-build",
  "tokio",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
 name = "lan-protocol"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",

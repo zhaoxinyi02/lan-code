@@ -9,6 +9,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 lan-core = { path = "../../../crates/lan-core" }
 lan-protocol = { path = "../../../crates/lan-protocol" }
 serde.workspace = true
@@ -20,3 +21,4 @@ rfd = "0.15"
 keyring = { version = "3", features = ["windows-native"] }
 reqwest.workspace = true
 semver = "1"
+walkdir.workspace = true

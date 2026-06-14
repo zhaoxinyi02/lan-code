@@ -8,6 +8,7 @@ use std::{
     time::Instant,
 };
 
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lan_core::{
     AgentCore, ModelMessage, ModelProvider, ModelRequest, OpenAiCompatibleProvider, SqliteStore,
 };
@@ -19,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 use tokio::sync::RwLock;
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +42,40 @@ struct ProviderProfile {
     output_price_per_million: f64,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct ModelCapabilities {
+    image_input: bool,
+    image_output: bool,
+    audio_input: bool,
+    audio_output: bool,
+    tool_calling: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CapabilityRoute {
+    enabled: bool,
+    inherit_main_model: bool,
+    provider: String,
+    base_url: String,
+    model: String,
+    api_key: String,
+}
+
+impl Default for CapabilityRoute {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            inherit_main_model: true,
+            provider: "custom".into(),
+            base_url: String::new(),
+            model: String::new(),
+            api_key: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct DesktopSettings {
@@ -55,6 +91,11 @@ struct DesktopSettings {
     output_price_per_million: f64,
     projects: Vec<DesktopProject>,
     provider_profiles: Vec<ProviderProfile>,
+    model_capabilities: ModelCapabilities,
+    vision_route: CapabilityRoute,
+    image_generation_route: CapabilityRoute,
+    speech_to_text_route: CapabilityRoute,
+    text_to_speech_route: CapabilityRoute,
 }
 
 impl Default for DesktopSettings {
@@ -75,6 +116,11 @@ impl Default for DesktopSettings {
             output_price_per_million: 0.0,
             projects: Vec::new(),
             provider_profiles: Vec::new(),
+            model_capabilities: ModelCapabilities::default(),
+            vision_route: CapabilityRoute::default(),
+            image_generation_route: CapabilityRoute::default(),
+            speech_to_text_route: CapabilityRoute::default(),
+            text_to_speech_route: CapabilityRoute::default(),
         }
     }
 }
@@ -92,6 +138,23 @@ struct ProviderTestResult {
     latency_ms: u128,
     text_response: String,
     tool_call_supported: bool,
+    capabilities: ModelCapabilities,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceEntry {
+    path: String,
+    name: String,
+    is_dir: bool,
+    depth: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFile {
+    path: String,
+    content: String,
 }
 
 #[derive(Serialize)]
@@ -120,6 +183,17 @@ struct GithubRelease {
 struct GithubAsset {
     name: String,
     browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct ImageGenerationResponse {
+    data: Vec<GeneratedImage>,
+}
+
+#[derive(Deserialize)]
+struct GeneratedImage {
+    b64_json: Option<String>,
+    url: Option<String>,
 }
 
 fn user_home() -> PathBuf {
@@ -198,6 +272,99 @@ fn persist_bootstrap_settings(data_dir: &Path, settings: &DesktopSettings) {
     let _ = fs::create_dir_all(data_dir);
     if let Ok(bytes) = serde_json::to_vec_pretty(settings) {
         let _ = fs::write(data_dir.join("settings.json"), bytes);
+    }
+}
+
+fn infer_model_capabilities(model: &str, tool_calling: bool) -> ModelCapabilities {
+    let model = model.to_ascii_lowercase();
+    let image_input = [
+        "vision", "gpt-4o", "gpt-4.1", "gemini", "claude-3", "claude-4", "qwen-vl", "qvq",
+        "pixtral", "llava",
+    ]
+    .iter()
+    .any(|hint| model.contains(hint));
+    let image_output = ["gpt-image", "dall-e", "imagen", "flux", "sdxl", "seedream"]
+        .iter()
+        .any(|hint| model.contains(hint));
+    let audio_input = ["audio", "whisper", "transcribe"]
+        .iter()
+        .any(|hint| model.contains(hint));
+    let audio_output = ["audio", "tts", "speech"]
+        .iter()
+        .any(|hint| model.contains(hint));
+    ModelCapabilities {
+        image_input,
+        image_output,
+        audio_input,
+        audio_output,
+        tool_calling,
+    }
+}
+
+fn workspace_path(settings: &DesktopSettings, relative: &str) -> Result<PathBuf, String> {
+    let root = PathBuf::from(&settings.workspace)
+        .canonicalize()
+        .map_err(|error| format!("工作区不可用：{error}"))?;
+    let candidate = root.join(relative);
+    let resolved = if candidate.exists() {
+        candidate
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+    } else {
+        let parent = candidate.parent().ok_or("文件路径无效")?;
+        parent
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .join(candidate.file_name().ok_or("文件路径无效")?)
+    };
+    if !resolved.starts_with(&root) {
+        return Err("拒绝访问工作区之外的路径".into());
+    }
+    Ok(resolved)
+}
+
+fn resolved_route(
+    settings: &DesktopSettings,
+    route: &CapabilityRoute,
+    main_supported: bool,
+) -> Result<(String, String, String), String> {
+    if route.inherit_main_model && main_supported {
+        return Ok((
+            settings.base_url.clone(),
+            settings.api_key.clone(),
+            settings.model.clone(),
+        ));
+    }
+    if !route.enabled || route.model.trim().is_empty() {
+        return Err("当前主模型不支持该能力，请在设置中配置专用模型".into());
+    }
+    Ok((
+        if route.base_url.trim().is_empty() {
+            settings.base_url.clone()
+        } else {
+            route.base_url.clone()
+        },
+        if route.api_key.trim().is_empty() {
+            settings.api_key.clone()
+        } else {
+            route.api_key.clone()
+        },
+        route.model.clone(),
+    ))
+}
+
+fn image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "image/png",
     }
 }
 
@@ -306,7 +473,126 @@ async fn test_provider(settings: DesktopSettings) -> Result<ProviderTestResult, 
             .tool_calls
             .iter()
             .any(|call| call.name == "capability_probe"),
+        capabilities: infer_model_capabilities(
+            provider.model_name(),
+            response
+                .tool_calls
+                .iter()
+                .any(|call| call.name == "capability_probe"),
+        ),
     })
+}
+
+#[tauri::command]
+async fn list_workspace_files(state: State<'_, AppState>) -> Result<Vec<WorkspaceEntry>, String> {
+    let settings = state.settings.read().await;
+    let root = PathBuf::from(&settings.workspace);
+    let ignored = [".git", "node_modules", "target", "dist", ".idea", ".vscode"];
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(8)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !ignored.contains(&entry.file_name().to_string_lossy().as_ref())
+        })
+        .filter_map(Result::ok)
+        .skip(1)
+        .take(4000)
+    {
+        let relative = entry
+            .path()
+            .strip_prefix(&root)
+            .map_err(|error| error.to_string())?
+            .display()
+            .to_string();
+        entries.push(WorkspaceEntry {
+            path: relative,
+            name: entry.file_name().to_string_lossy().to_string(),
+            is_dir: entry.file_type().is_dir(),
+            depth: entry.depth() - 1,
+        });
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+async fn read_workspace_file(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<WorkspaceFile, String> {
+    let settings = state.settings.read().await;
+    let resolved = workspace_path(&settings, &path)?;
+    let metadata = fs::metadata(&resolved).map_err(|error| error.to_string())?;
+    if metadata.len() > 2 * 1024 * 1024 {
+        return Err("文件超过 2MB，暂不在内置编辑器中打开".into());
+    }
+    Ok(WorkspaceFile {
+        path,
+        content: fs::read_to_string(resolved).map_err(|_| "该文件不是可编辑文本文件")?,
+    })
+}
+
+#[tauri::command]
+async fn write_workspace_file(
+    path: String,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = state.settings.read().await;
+    let resolved = workspace_path(&settings, &path)?;
+    fs::write(resolved, content).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn workspace_git_diff(state: State<'_, AppState>) -> Result<String, String> {
+    let settings = state.settings.read().await;
+    let output = Command::new("git")
+        .args(["diff", "--", "."])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[tauri::command]
+async fn inline_completion(
+    path: String,
+    prefix: String,
+    suffix: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let settings = state.settings.read().await.clone();
+    if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
+        return Err("请先配置 API Key".into());
+    }
+    let provider = OpenAiCompatibleProvider::new(
+        settings.base_url,
+        if settings.api_key.trim().is_empty() {
+            "ollama".into()
+        } else {
+            settings.api_key
+        },
+        settings.model,
+    )
+    .map_err(|error| error.to_string())?;
+    let response = provider
+        .complete(ModelRequest {
+            messages: vec![ModelMessage::text(
+                lan_core::ModelRole::User,
+                format!(
+                    "你是代码补全引擎。只输出应插入光标处的代码，不要解释，不要 Markdown。\n文件：{path}\n<PREFIX>\n{}\n</PREFIX>\n<SUFFIX>\n{}\n</SUFFIX>",
+                    prefix.chars().rev().take(8000).collect::<String>().chars().rev().collect::<String>(),
+                    suffix.chars().take(4000).collect::<String>()
+                ),
+            )],
+            tools: Vec::new(),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(response.text.trim_matches('`').trim().to_string())
 }
 
 #[tauri::command]
@@ -406,6 +692,98 @@ async fn pick_workspace() -> Result<Option<String>, String> {
 #[tauri::command]
 async fn pick_data_dir() -> Result<Option<String>, String> {
     pick_workspace().await
+}
+
+#[tauri::command]
+async fn analyze_image(prompt: String, state: State<'_, AppState>) -> Result<String, String> {
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("图片", &["png", "jpg", "jpeg", "webp", "gif"])
+        .pick_file()
+    else {
+        return Err("未选择图片".into());
+    };
+    let settings = state.settings.read().await.clone();
+    let (base_url, api_key, model) = resolved_route(
+        &settings,
+        &settings.vision_route,
+        settings.model_capabilities.image_input,
+    )?;
+    let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+    if bytes.len() > 20 * 1024 * 1024 {
+        return Err("图片超过 20MB".into());
+    }
+    let data_url = format!("data:{};base64,{}", image_mime(&path), BASE64.encode(bytes));
+    let response = reqwest::Client::new()
+        .post(format!("{}/chat/completions", base_url.trim_end_matches('/')))
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": if prompt.trim().is_empty() { "请详细描述这张图片。" } else { &prompt }},
+                {"type": "image_url", "image_url": {"url": data_url}}
+            ]}]
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("图片理解请求失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("图片理解服务返回错误：{error}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| error.to_string())?;
+    response["choices"][0]["message"]["content"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "模型没有返回图片理解文本".into())
+}
+
+#[tauri::command]
+async fn generate_image(prompt: String, state: State<'_, AppState>) -> Result<String, String> {
+    if prompt.trim().is_empty() {
+        return Err("图片描述不能为空".into());
+    }
+    let settings = state.settings.read().await.clone();
+    let (base_url, api_key, model) = resolved_route(
+        &settings,
+        &settings.image_generation_route,
+        settings.model_capabilities.image_output,
+    )?;
+    let endpoint = if base_url.ends_with("/images/generations") {
+        base_url
+    } else {
+        format!("{}/images/generations", base_url.trim_end_matches('/'))
+    };
+    let response = reqwest::Client::new()
+        .post(endpoint)
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({"model": model, "prompt": prompt, "size": "1024x1024"}))
+        .send()
+        .await
+        .map_err(|error| format!("图片生成请求失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("图片生成服务返回错误：{error}"))?
+        .json::<ImageGenerationResponse>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let image = response.data.into_iter().next().ok_or("服务没有返回图片")?;
+    let bytes = if let Some(data) = image.b64_json {
+        BASE64.decode(data).map_err(|error| error.to_string())?
+    } else if let Some(url) = image.url {
+        reqwest::get(url)
+            .await
+            .map_err(|error| error.to_string())?
+            .bytes()
+            .await
+            .map_err(|error| error.to_string())?
+            .to_vec()
+    } else {
+        return Err("图片响应没有数据".into());
+    };
+    let output_dir = state.data_dir.read().await.join("generated");
+    fs::create_dir_all(&output_dir).map_err(|error| error.to_string())?;
+    let path = output_dir.join(format!("{}.png", Uuid::new_v4()));
+    fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    Ok(path.display().to_string())
 }
 
 #[tauri::command]
@@ -523,11 +901,18 @@ fn main() {
             get_settings,
             save_settings,
             test_provider,
+            list_workspace_files,
+            read_workspace_file,
+            write_workspace_file,
+            workspace_git_diff,
+            inline_completion,
             check_for_updates,
             download_update,
             install_downloaded_update,
             pick_workspace,
             pick_data_dir,
+            analyze_image,
+            generate_image,
             list_sessions,
             create_session,
             delete_session,
@@ -541,4 +926,20 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("run Lan Code desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_model_capabilities;
+
+    #[test]
+    fn infers_common_multimodal_model_capabilities() {
+        let vision = infer_model_capabilities("gpt-4o", true);
+        assert!(vision.image_input);
+        assert!(vision.tool_calling);
+        assert!(!vision.image_output);
+
+        let image = infer_model_capabilities("gpt-image-1", false);
+        assert!(image.image_output);
+    }
 }
