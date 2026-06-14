@@ -24,8 +24,9 @@ pub use model::{
 pub use policy::PermissionPolicy;
 pub use store::SqliteStore;
 pub use tools::{
-    ApplyEditsTool, CreateFileTool, EchoTool, GitDiffTool, GitStatusTool, ListFilesTool,
-    ReadFileTool, ReplaceTextTool, RunCommandTool, SearchTextTool, Tool, ToolContext, ToolRegistry,
+    ApplyEditsTool, CreateFileTool, EchoTool, GitDiffTool, GitStatusTool, ImageGenerationTool,
+    ListFilesTool, ReadFileTool, ReplaceTextTool, RunCommandTool, SearchTextTool, Tool,
+    ToolContext, ToolRegistry, VisionTool,
 };
 
 const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
@@ -202,6 +203,10 @@ impl AgentCore {
 
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
         self.tools.list()
+    }
+
+    pub fn register_tool(&self, tool: Arc<dyn Tool>) {
+        self.tools.register(tool);
     }
 
     pub fn events_for_session(&self, session_id: SessionId) -> Result<Vec<CoreEvent>> {

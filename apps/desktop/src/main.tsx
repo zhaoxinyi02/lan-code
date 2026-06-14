@@ -6,7 +6,7 @@ import * as monaco from "monaco-editor";
 import {
   Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, Code2, File, FileDiff, FilePlus, Folder, FolderGit2, Image,
   FolderOpen, FolderPlus, GitBranch, History, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
-  Download, MessageSquare, RefreshCw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
+  Download, MessageSquare, RefreshCw, RotateCcw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
   XCircle, Zap,
 } from "lucide-react";
 import "./styles.css";
@@ -34,6 +34,7 @@ type SettingsData = {
 };
 type WorkspaceEntry = { path: string; name: string; isDir: boolean; depth: number };
 type WorkspaceSearchMatch = { path: string; line: number; text: string };
+type GitChange = { status: string; path: string };
 type OpenFile = { path: string; content: string; savedContent: string };
 type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
 type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
@@ -103,6 +104,8 @@ function App() {
   const [collapsedDirs, setCollapsedDirs] = React.useState<Set<string>>(new Set());
   const [codeStatus, setCodeStatus] = React.useState("");
   const [diffText, setDiffText] = React.useState("");
+  const [gitChanges, setGitChanges] = React.useState<GitChange[]>([]);
+  const [selectedGitPath, setSelectedGitPath] = React.useState("");
   const editorRef = React.useRef<Parameters<OnMount>[0] | null>(null);
   const completionTimer = React.useRef<number | undefined>(undefined);
   const activeDocument = openFiles.find((file) => file.path === activeFile);
@@ -126,6 +129,7 @@ function App() {
   React.useEffect(() => {
     if (workbench !== "code" || !settings.workspace) return;
     invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles).catch((error) => setCodeStatus(String(error)));
+    invoke<GitChange[]>("workspace_git_changes").then(setGitChanges).catch(() => {});
   }, [workbench, settings.workspace]);
 
   React.useEffect(() => {
@@ -309,7 +313,7 @@ function App() {
     await invoke("write_workspace_file", { path: activeFile, content: activeDocument.content });
     setOpenFiles((items) => items.map((file) => file.path === activeFile ? { ...file, savedContent: file.content } : file));
     setCodeStatus(`已保存 ${activeFile}`);
-    setDiffText(await invoke<string>("workspace_git_diff"));
+    await refreshGitChanges();
   }
 
   function closeWorkspaceFile(path: string) {
@@ -336,6 +340,41 @@ function App() {
       setCodeStatus(`找到 ${matches.length} 条结果${matches.length === 200 ? "，已达到显示上限" : ""}`);
     } catch (error) {
       setCodeStatus(`搜索失败：${String(error)}`);
+    }
+  }
+
+  async function refreshGitChanges() {
+    const changes = await invoke<GitChange[]>("workspace_git_changes");
+    setGitChanges(changes);
+    if (selectedGitPath && !changes.some((change) => change.path === selectedGitPath)) {
+      setSelectedGitPath("");
+      setDiffText("");
+    }
+  }
+
+  async function openGitChange(path: string) {
+    setSelectedGitPath(path);
+    try {
+      const diff = await invoke<string>("workspace_file_diff", { path });
+      setDiffText(diff || "该文件没有未暂存 diff，可能是未跟踪文件或只有暂存区改动。");
+    } catch (error) {
+      setDiffText(`加载 diff 失败：${String(error)}`);
+    }
+  }
+
+  async function discardGitChange(change: GitChange) {
+    if (!window.confirm(`确定撤销 ${change.path} 的全部未暂存改动吗？此操作不可撤销。`)) return;
+    try {
+      await invoke("discard_workspace_changes", { path: change.path });
+      const open = openFiles.find((file) => file.path === change.path);
+      if (open) {
+        const current = await invoke<{ path: string; content: string }>("read_workspace_file", { path: change.path });
+        setOpenFiles((items) => items.map((file) => file.path === change.path ? { ...file, content: current.content, savedContent: current.content } : file));
+      }
+      await refreshGitChanges();
+      setCodeStatus(`已撤销 ${change.path} 的未暂存改动`);
+    } catch (error) {
+      setCodeStatus(`撤销失败：${String(error)}`);
     }
   }
 
@@ -616,7 +655,7 @@ function App() {
       </main> : <main className="code-main">
         <header>
           <div className="title-row">{!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}<div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{activeDocument && activeDocument.content !== activeDocument.savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
-          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => invoke<string>("workspace_git_diff").then(setDiffText)}><FileDiff size={15} /> 查看改动</button></div>
+          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => void refreshGitChanges()}><FileDiff size={15} /> 查看改动</button></div>
         </header>
         {codeStatus && <div className="code-status">{codeStatus}</div>}
         <div className="editor-tabs">{openFiles.length ? openFiles.map((file) => <button key={file.path} className={file.path === activeFile ? "active" : ""} onClick={() => setActiveFile(file.path)}><File size={13} /><span>{file.path.split(/[\\/]/).at(-1)}</span>{file.content !== file.savedContent && <i />}<b title="关闭" onClick={(event) => { event.stopPropagation(); closeWorkspaceFile(file.path); }}>×</b></button>) : <span>从左侧项目树打开文件</span>}</div>
@@ -657,7 +696,9 @@ function App() {
           <h3>AI 助手</h3>
           <div className="code-chat">{messages.length === 0 ? <div className="empty-small">针对当前项目提问，Agent 会使用同一套工具、权限和会话。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div><p>{message.text}</p></article>)}</div>
           <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="询问代码或要求修改项目" /><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={15} /></button></div>
-          <div className="divider" /><h3>Git 改动</h3><pre className="diff-preview">{diffText || "点击顶部“查看改动”加载 Git diff。"}</pre>
+          <div className="divider" /><div className="git-heading"><h3>Git 改动</h3><button title="刷新" onClick={() => void refreshGitChanges()}><RefreshCw size={13} /></button></div>
+          <div className="git-changes">{gitChanges.length === 0 ? <div className="empty-small">点击顶部“查看改动”加载逐文件变更。</div> : gitChanges.map((change) => <div className={selectedGitPath === change.path ? "active" : ""} key={`${change.status}:${change.path}`}><button title={change.path} onClick={() => void openGitChange(change.path)}><i>{change.status}</i><span>{change.path}</span></button><button title="撤销未暂存改动" disabled={change.status === "??"} onClick={() => void discardGitChange(change)}><RotateCcw size={12} /></button></div>)}</div>
+          <pre className="diff-preview">{diffText || "选择一个变更文件查看 diff。"}</pre>
         </> : <>
         <h3>环境信息</h3>
         <button className="info-row clickable" onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><FolderGit2 size={16} /><span>工作区</span><strong>{settings.workspace ? "已选择" : "未配置"}</strong></button>

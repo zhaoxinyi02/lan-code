@@ -10,7 +10,8 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lan_core::{
-    AgentCore, ModelMessage, ModelProvider, ModelRequest, OpenAiCompatibleProvider, SqliteStore,
+    AgentCore, ImageGenerationTool, ModelMessage, ModelProvider, ModelRequest,
+    OpenAiCompatibleProvider, SqliteStore, VisionTool,
 };
 use lan_protocol::{
     ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, RiskLevel, Session, SessionId,
@@ -163,6 +164,13 @@ struct WorkspaceSearchMatch {
     path: String,
     line: usize,
     text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitChange {
+    status: String,
+    path: String,
 }
 
 #[derive(Serialize)]
@@ -391,22 +399,46 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
     fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
     let store =
         SqliteStore::open(data_dir.join("lan-code.sqlite")).map_err(|error| error.to_string())?;
-    if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
-        return AgentCore::with_store(store)
+    let core = if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
+        AgentCore::with_store(store)
             .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
-            .map_err(|error| error.to_string());
-    }
-    let api_key = if settings.api_key.trim().is_empty() {
-        "ollama".into()
+            .map_err(|error| error.to_string())?
     } else {
-        settings.api_key.clone()
+        let api_key = if settings.api_key.trim().is_empty() {
+            "ollama".into()
+        } else {
+            settings.api_key.clone()
+        };
+        let provider = OpenAiCompatibleProvider::new(
+            settings.base_url.clone(),
+            api_key,
+            settings.model.clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        AgentCore::with_provider_and_store(Arc::new(provider), store)
+            .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
+            .map_err(|error| error.to_string())?
     };
-    let provider =
-        OpenAiCompatibleProvider::new(settings.base_url.clone(), api_key, settings.model.clone())
-            .map_err(|error| error.to_string())?;
-    AgentCore::with_provider_and_store(Arc::new(provider), store)
-        .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
-        .map_err(|error| error.to_string())
+    if let Ok((base_url, api_key, model)) = resolved_route(
+        settings,
+        &settings.vision_route,
+        settings.model_capabilities.image_input,
+    ) {
+        core.register_tool(Arc::new(
+            VisionTool::new(base_url, api_key, model).map_err(|error| error.to_string())?,
+        ));
+    }
+    if let Ok((base_url, api_key, model)) = resolved_route(
+        settings,
+        &settings.image_generation_route,
+        settings.model_capabilities.image_output,
+    ) {
+        core.register_tool(Arc::new(
+            ImageGenerationTool::new(base_url, api_key, model)
+                .map_err(|error| error.to_string())?,
+        ));
+    }
+    Ok(core)
 }
 
 async fn core(state: &State<'_, AppState>) -> Arc<AgentCore> {
@@ -677,6 +709,71 @@ async fn workspace_git_diff(state: State<'_, AppState>) -> Result<String, String
         return Err(String::from_utf8_lossy(&output.stderr).to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[tauri::command]
+async fn workspace_git_changes(state: State<'_, AppState>) -> Result<Vec<GitChange>, String> {
+    let settings = state.settings.read().await;
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.len() >= 4)
+        .map(|line| GitChange {
+            status: line[..2].to_string(),
+            path: line[3..]
+                .rsplit_once(" -> ")
+                .map(|(_, target)| target)
+                .unwrap_or(&line[3..])
+                .trim_matches('"')
+                .to_string(),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn workspace_file_diff(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    let settings = state.settings.read().await;
+    workspace_path(&settings, &path)?;
+    let output = Command::new("git")
+        .args(["diff", "--no-ext-diff", "HEAD", "--", &path])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[tauri::command]
+async fn discard_workspace_changes(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.read().await;
+    mutable_workspace_path(&settings, &path)?;
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--", &path])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let summary = String::from_utf8_lossy(&status.stdout);
+    if summary.starts_with("??") {
+        return Err("未跟踪文件不会被自动删除，请在文件树中手动确认删除".into());
+    }
+    let output = Command::new("git")
+        .args(["restore", "--worktree", "--", &path])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1031,6 +1128,9 @@ fn main() {
             rename_workspace_entry,
             delete_workspace_entry,
             workspace_git_diff,
+            workspace_git_changes,
+            workspace_file_diff,
+            discard_workspace_changes,
             inline_completion,
             check_for_updates,
             download_update,
@@ -1056,7 +1156,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_model_capabilities;
+    use super::{DesktopSettings, build_core, infer_model_capabilities};
 
     #[test]
     fn infers_common_multimodal_model_capabilities() {
@@ -1067,5 +1167,23 @@ mod tests {
 
         let image = infer_model_capabilities("gpt-image-1", false);
         assert!(image.image_output);
+    }
+
+    #[test]
+    fn desktop_routes_register_multimodal_core_tools() {
+        let mut settings = DesktopSettings::default();
+        settings.model_capabilities.image_input = true;
+        settings.model_capabilities.image_output = true;
+        let data_dir =
+            std::env::temp_dir().join(format!("lan-desktop-tools-{}", uuid::Uuid::new_v4()));
+        let core = build_core(&settings, &data_dir).unwrap();
+        let tools = core
+            .list_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(tools.contains(&"analyze_image".to_string()));
+        assert!(tools.contains(&"generate_image".to_string()));
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }

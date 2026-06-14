@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lan_protocol::{RiskLevel, SessionId, ToolDescriptor};
+use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::{process::Command, time::Duration};
 use walkdir::WalkDir;
@@ -117,6 +120,211 @@ fn string_arg<'a>(arguments: &'a Value, name: &str) -> Result<&'a str> {
         .get(name)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("{name} must be a string"))
+}
+
+fn image_mime(path: &Path) -> Result<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Ok("image/png"),
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "webp" => Ok("image/webp"),
+        "gif" => Ok("image/gif"),
+        _ => bail!("unsupported image type; use PNG, JPEG, WebP, or GIF"),
+    }
+}
+
+#[derive(Clone)]
+pub struct VisionTool {
+    client: Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+impl VisionTool {
+    pub fn new(base_url: String, api_key: String, model: String) -> Result<Self> {
+        if base_url.trim().is_empty() || model.trim().is_empty() {
+            bail!("vision route requires base URL and model");
+        }
+        Ok(Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(120))
+                .build()?,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+            model,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for VisionTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "analyze_image".into(),
+            description: "Analyze an image inside the workspace using the configured vision model. The image is sent to an external model provider.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative image path"},
+                    "prompt": {"type": "string", "description": "Question or analysis instructions"}
+                },
+                "required": ["path", "prompt"]
+            }),
+            risk: RiskLevel::ExternalSideEffect,
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, arguments: Value) -> Result<Value> {
+        let path = workspace_path(&context.cwd, string_arg(&arguments, "path")?)?;
+        let prompt = string_arg(&arguments, "prompt")?;
+        let bytes = fs::read(&path)?;
+        if bytes.len() > 20 * 1024 * 1024 {
+            bail!("image exceeds 20 MiB limit");
+        }
+        let data_url = format!(
+            "data:{};base64,{}",
+            image_mime(&path)?,
+            BASE64.encode(bytes)
+        );
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&json!({
+                "model": self.model,
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]}]
+            }))
+            .send()
+            .await
+            .context("vision request failed")?
+            .error_for_status()
+            .context("vision provider returned an error")?
+            .json::<Value>()
+            .await
+            .context("invalid vision response JSON")?;
+        let text = response["choices"][0]["message"]["content"]
+            .as_str()
+            .context("vision provider returned no text")?;
+        Ok(json!({"path": path.display().to_string(), "model": self.model, "text": text}))
+    }
+}
+
+#[derive(Clone)]
+pub struct ImageGenerationTool {
+    client: Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct GeneratedImageResponse {
+    data: Vec<GeneratedImage>,
+}
+
+#[derive(Deserialize)]
+struct GeneratedImage {
+    b64_json: Option<String>,
+    url: Option<String>,
+}
+
+impl ImageGenerationTool {
+    pub fn new(base_url: String, api_key: String, model: String) -> Result<Self> {
+        if base_url.trim().is_empty() || model.trim().is_empty() {
+            bail!("image generation route requires base URL and model");
+        }
+        Ok(Self {
+            client: Client::builder()
+                .timeout(Duration::from_secs(180))
+                .build()?,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+            model,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for ImageGenerationTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "generate_image".into(),
+            description: "Generate an image with the configured image model and save it inside the workspace. This contacts an external model provider.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "output_path": {"type": "string", "description": "Workspace-relative PNG output path in an existing directory"}
+                },
+                "required": ["prompt", "output_path"]
+            }),
+            risk: RiskLevel::ExternalSideEffect,
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, arguments: Value) -> Result<Value> {
+        let prompt = string_arg(&arguments, "prompt")?;
+        let output_path = workspace_new_path(&context.cwd, string_arg(&arguments, "output_path")?)?;
+        if output_path.exists() {
+            bail!("refusing to overwrite existing image");
+        }
+        let endpoint = if self.base_url.ends_with("/images/generations") {
+            self.base_url.clone()
+        } else {
+            format!("{}/images/generations", self.base_url)
+        };
+        let response = self
+            .client
+            .post(endpoint)
+            .bearer_auth(&self.api_key)
+            .json(&json!({"model": self.model, "prompt": prompt, "size": "1024x1024"}))
+            .send()
+            .await
+            .context("image generation request failed")?
+            .error_for_status()
+            .context("image generation provider returned an error")?
+            .json::<GeneratedImageResponse>()
+            .await
+            .context("invalid image generation response JSON")?;
+        let image = response
+            .data
+            .into_iter()
+            .next()
+            .context("provider returned no image")?;
+        let bytes = if let Some(data) = image.b64_json {
+            BASE64
+                .decode(data)
+                .context("invalid generated image base64")?
+        } else if let Some(url) = image.url {
+            self.client
+                .get(url)
+                .send()
+                .await
+                .context("generated image download failed")?
+                .error_for_status()
+                .context("generated image download returned an error")?
+                .bytes()
+                .await?
+                .to_vec()
+        } else {
+            bail!("provider returned no image data");
+        };
+        fs::write(&output_path, &bytes)?;
+        Ok(json!({
+            "path": output_path.display().to_string(),
+            "model": self.model,
+            "bytesWritten": bytes.len()
+        }))
+    }
 }
 
 pub struct ListFilesTool;
@@ -547,7 +755,36 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{ApplyEditsTool, ReplaceTextTool, RunCommandTool, Tool, ToolContext};
+    use super::{
+        ApplyEditsTool, ImageGenerationTool, ReplaceTextTool, RunCommandTool, Tool, ToolContext,
+        VisionTool,
+    };
+
+    #[test]
+    fn multimodal_tools_describe_external_side_effects() {
+        let vision = VisionTool::new(
+            "https://example.com/v1".into(),
+            "test".into(),
+            "vision-model".into(),
+        )
+        .unwrap();
+        let image = ImageGenerationTool::new(
+            "https://example.com/v1".into(),
+            "test".into(),
+            "image-model".into(),
+        )
+        .unwrap();
+        assert_eq!(vision.descriptor().name, "analyze_image");
+        assert_eq!(
+            vision.descriptor().risk,
+            lan_protocol::RiskLevel::ExternalSideEffect
+        );
+        assert_eq!(image.descriptor().name, "generate_image");
+        assert_eq!(
+            image.descriptor().risk,
+            lan_protocol::RiskLevel::ExternalSideEffect
+        );
+    }
 
     #[tokio::test]
     async fn replace_text_requires_one_exact_match() {
