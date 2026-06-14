@@ -1,0 +1,13 @@
+/target/
+/dist/
+/research/repos/
+**/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/gen/
+/.idea/
+/.vscode/
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+/lan.toml

@@ -1,0 +1,7 @@
+database = ".lan-code.sqlite"
+approval_mode = "readOnly"
+
+[provider]
+base_url = "https://api.deepseek.com"
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"

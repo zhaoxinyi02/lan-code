@@ -1,0 +1,852 @@
+mod config;
+mod model;
+mod policy;
+mod store;
+mod tools;
+
+use std::{collections::HashMap, sync::Arc};
+
+use anyhow::{Context, Result, bail};
+use lan_protocol::{
+    ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, PolicyDecision, Session, SessionId,
+    SessionStatus, ToolCall, ToolDescriptor, TurnResult,
+};
+use serde_json::Value;
+use tokio::sync::{RwLock, broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+pub use config::{LanConfig, ProviderConfig};
+pub use model::{
+    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelRole, OpenAiCompatibleProvider,
+    WireFunctionCall, WireToolCall,
+};
+pub use policy::PermissionPolicy;
+pub use store::SqliteStore;
+pub use tools::{
+    ApplyEditsTool, CreateFileTool, EchoTool, GitDiffTool, GitStatusTool, ListFilesTool,
+    ReadFileTool, ReplaceTextTool, RunCommandTool, SearchTextTool, Tool, ToolContext, ToolRegistry,
+};
+
+struct SessionState {
+    session: Session,
+    messages: Vec<ModelMessage>,
+}
+
+struct PendingApproval {
+    request: ApprovalRequest,
+    response: oneshot::Sender<ApprovalDecision>,
+}
+
+pub struct AgentCore {
+    sessions: RwLock<HashMap<SessionId, SessionState>>,
+    tools: ToolRegistry,
+    provider: Option<Arc<dyn ModelProvider>>,
+    store: Option<SqliteStore>,
+    active_turns: RwLock<HashMap<SessionId, CancellationToken>>,
+    pending_approvals: RwLock<HashMap<Uuid, PendingApproval>>,
+    events: broadcast::Sender<CoreEvent>,
+}
+
+impl AgentCore {
+    pub fn new() -> Self {
+        let (events, _) = broadcast::channel(512);
+        let tools = ToolRegistry::new();
+        tools.register(Arc::new(EchoTool));
+        tools.register(Arc::new(ListFilesTool));
+        tools.register(Arc::new(ReadFileTool));
+        tools.register(Arc::new(SearchTextTool));
+        tools.register(Arc::new(ReplaceTextTool));
+        tools.register(Arc::new(RunCommandTool));
+        tools.register(Arc::new(CreateFileTool));
+        tools.register(Arc::new(GitStatusTool));
+        tools.register(Arc::new(GitDiffTool));
+        tools.register(Arc::new(ApplyEditsTool));
+        Self {
+            sessions: RwLock::new(HashMap::new()),
+            tools,
+            provider: None,
+            store: None,
+            active_turns: RwLock::new(HashMap::new()),
+            pending_approvals: RwLock::new(HashMap::new()),
+            events,
+        }
+    }
+
+    pub fn with_provider(provider: Arc<dyn ModelProvider>) -> Self {
+        let mut core = Self::new();
+        core.provider = Some(provider);
+        core
+    }
+
+    pub fn with_store(store: SqliteStore) -> Result<Self> {
+        let mut core = Self::new();
+        core.sessions = RwLock::new(
+            store
+                .load_sessions()?
+                .into_iter()
+                .map(|(mut session, messages)| {
+                    if matches!(
+                        session.status,
+                        SessionStatus::Running | SessionStatus::WaitingForApproval
+                    ) {
+                        session.status = SessionStatus::Interrupted;
+                        let _ = store.save_session(&session, &messages);
+                    }
+                    (session.id, SessionState { session, messages })
+                })
+                .collect(),
+        );
+        core.store = Some(store);
+        Ok(core)
+    }
+
+    pub fn with_provider_and_store(
+        provider: Arc<dyn ModelProvider>,
+        store: SqliteStore,
+    ) -> Result<Self> {
+        let mut core = Self::with_store(store)?;
+        core.provider = Some(provider);
+        Ok(core)
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<CoreEvent> {
+        self.events.subscribe()
+    }
+
+    pub async fn create_session(&self, cwd: String, title: Option<String>) -> Session {
+        let session = Session {
+            id: Uuid::new_v4(),
+            cwd,
+            title,
+            status: SessionStatus::Idle,
+        };
+        self.sessions
+            .write()
+            .await
+            .insert(session.id, SessionState {
+                session: session.clone(),
+                messages: vec![ModelMessage::text(
+                    ModelRole::System,
+                    "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering. Never invent file contents. Keep the final answer concise.",
+                )],
+            });
+        self.persist_session(session.id).await;
+        self.emit(
+            session.id,
+            CoreEvent::SessionCreated {
+                event_id: Uuid::new_v4(),
+                session: session.clone(),
+            },
+        );
+        session
+    }
+
+    pub async fn list_sessions(&self) -> Vec<Session> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .map(|state| state.session.clone())
+            .collect()
+    }
+
+    pub fn list_tools(&self) -> Vec<ToolDescriptor> {
+        self.tools.list()
+    }
+
+    pub fn events_for_session(&self, session_id: SessionId) -> Result<Vec<CoreEvent>> {
+        self.store
+            .as_ref()
+            .context("no persistent store configured")?
+            .load_events(session_id)
+    }
+
+    fn emit(&self, session_id: SessionId, event: CoreEvent) {
+        if let Some(store) = &self.store {
+            let _ = store.append_event(session_id, &event);
+        }
+        let _ = self.events.send(event);
+    }
+
+    async fn persist_session(&self, session_id: SessionId) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Some(state) = self.sessions.read().await.get(&session_id) {
+            let _ = store.save_session(&state.session, &state.messages);
+        }
+    }
+
+    async fn set_status(&self, session_id: SessionId, status: SessionStatus) {
+        if let Some(state) = self.sessions.write().await.get_mut(&session_id) {
+            state.session.status = status;
+        }
+        self.persist_session(session_id).await;
+    }
+
+    pub async fn call_tool(
+        &self,
+        session_id: SessionId,
+        call: ToolCall,
+        mode: ApprovalMode,
+    ) -> Result<Value> {
+        let result = self
+            .execute_tool(session_id, call, mode, CancellationToken::new())
+            .await;
+        self.set_status(session_id, SessionStatus::Idle).await;
+        result
+    }
+
+    async fn execute_tool(
+        &self,
+        session_id: SessionId,
+        call: ToolCall,
+        mode: ApprovalMode,
+        cancel: CancellationToken,
+    ) -> Result<Value> {
+        let session = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|state| state.session.clone())
+            .context("session not found")?;
+        let tool = self.tools.get(&call.name).context("tool not found")?;
+        match PermissionPolicy::evaluate(mode, &tool.descriptor(), call.arguments.clone()) {
+            PolicyDecision::Allow => {}
+            PolicyDecision::Ask { request } => {
+                self.await_approval(session_id, request, cancel.clone())
+                    .await?;
+                self.set_status(session_id, SessionStatus::Running).await;
+            }
+            PolicyDecision::Deny { reason } => bail!(reason),
+        }
+        let call_id = call.id.clone();
+        let tool_name = call.name.clone();
+        self.emit(
+            session_id,
+            CoreEvent::ToolStarted {
+                event_id: Uuid::new_v4(),
+                session_id,
+                tool_call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: call.arguments.clone(),
+            },
+        );
+        let result: Result<Value> = tokio::select! {
+            _ = cancel.cancelled() => bail!("turn interrupted"),
+            output = tool.execute(
+                ToolContext {
+                    session_id,
+                    cwd: session.cwd,
+                },
+                call.arguments,
+            ) => output,
+        };
+        match result {
+            Ok(output) => {
+                self.emit(
+                    session_id,
+                    CoreEvent::ToolCompleted {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        tool_call_id: call_id,
+                        tool_name,
+                        output: output.clone(),
+                    },
+                );
+                Ok(output)
+            }
+            Err(error) => {
+                self.emit(
+                    session_id,
+                    CoreEvent::ToolFailed {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        tool_call_id: call_id,
+                        tool_name,
+                        error: error.to_string(),
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
+    async fn await_approval(
+        &self,
+        session_id: SessionId,
+        request: ApprovalRequest,
+        cancel: CancellationToken,
+    ) -> Result<()> {
+        let request_id = request.id;
+        let (tx, rx) = oneshot::channel();
+        self.pending_approvals.write().await.insert(
+            request_id,
+            PendingApproval {
+                request: request.clone(),
+                response: tx,
+            },
+        );
+        self.set_status(session_id, SessionStatus::WaitingForApproval)
+            .await;
+        self.emit(
+            session_id,
+            CoreEvent::ApprovalRequested {
+                event_id: Uuid::new_v4(),
+                session_id,
+                request,
+            },
+        );
+        let decision = tokio::select! {
+            _ = cancel.cancelled() => {
+                self.pending_approvals.write().await.remove(&request_id);
+                bail!("turn interrupted");
+            }
+            result = rx => result.context("approval channel closed")?,
+        };
+        match decision {
+            ApprovalDecision::AllowOnce => Ok(()),
+            ApprovalDecision::Deny => bail!("approval denied"),
+        }
+    }
+
+    pub async fn resolve_approval(
+        &self,
+        request_id: Uuid,
+        decision: ApprovalDecision,
+    ) -> Result<()> {
+        let pending = self
+            .pending_approvals
+            .write()
+            .await
+            .remove(&request_id)
+            .context("approval request not found")?;
+        pending
+            .response
+            .send(decision)
+            .map_err(|_| anyhow::anyhow!("approval requester no longer active"))
+    }
+
+    pub async fn pending_approvals(&self) -> Vec<ApprovalRequest> {
+        self.pending_approvals
+            .read()
+            .await
+            .values()
+            .map(|pending| pending.request.clone())
+            .collect()
+    }
+
+    pub async fn interrupt_turn(&self, session_id: SessionId) -> bool {
+        if let Some(cancel) = self.active_turns.read().await.get(&session_id) {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn start_turn(
+        &self,
+        session_id: SessionId,
+        prompt: String,
+        mode: ApprovalMode,
+    ) -> Result<TurnResult> {
+        let provider = self
+            .provider
+            .clone()
+            .context("no model provider configured")?;
+        let turn_id = Uuid::new_v4();
+        let cancel = CancellationToken::new();
+        {
+            let mut active = self.active_turns.write().await;
+            if active.contains_key(&session_id) {
+                bail!("session already has an active turn");
+            }
+            active.insert(session_id, cancel.clone());
+        }
+        let result = self
+            .run_turn(session_id, turn_id, prompt, mode, provider, cancel.clone())
+            .await;
+        self.active_turns.write().await.remove(&session_id);
+        match &result {
+            Ok(_) => self.set_status(session_id, SessionStatus::Idle).await,
+            Err(error) if cancel.is_cancelled() => {
+                self.set_status(session_id, SessionStatus::Interrupted)
+                    .await;
+                self.emit(
+                    session_id,
+                    CoreEvent::TurnInterrupted {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        turn_id,
+                    },
+                );
+                let _ = error;
+            }
+            Err(error) => {
+                self.set_status(session_id, SessionStatus::Failed).await;
+                self.emit(
+                    session_id,
+                    CoreEvent::TurnFailed {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        turn_id,
+                        error: error.to_string(),
+                    },
+                );
+            }
+        }
+        result
+    }
+
+    async fn run_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: Uuid,
+        prompt: String,
+        mode: ApprovalMode,
+        provider: Arc<dyn ModelProvider>,
+        cancel: CancellationToken,
+    ) -> Result<TurnResult> {
+        {
+            let mut sessions = self.sessions.write().await;
+            let state = sessions.get_mut(&session_id).context("session not found")?;
+            state.session.status = SessionStatus::Running;
+            state
+                .messages
+                .push(ModelMessage::text(ModelRole::User, prompt));
+        }
+        self.persist_session(session_id).await;
+        self.emit(
+            session_id,
+            CoreEvent::TurnStarted {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+            },
+        );
+
+        for round in 1..=12 {
+            let messages = self
+                .sessions
+                .read()
+                .await
+                .get(&session_id)
+                .context("session not found")?
+                .messages
+                .clone();
+            let response = tokio::select! {
+                _ = cancel.cancelled() => bail!("turn interrupted"),
+                response = provider.complete(ModelRequest {
+                    messages,
+                    tools: self.list_tools(),
+                }) => response?,
+            };
+            {
+                let mut sessions = self.sessions.write().await;
+                sessions
+                    .get_mut(&session_id)
+                    .context("session not found")?
+                    .messages
+                    .push(response.message.clone());
+            }
+            self.persist_session(session_id).await;
+            if response.tool_calls.is_empty() {
+                let text = response.text;
+                self.emit(
+                    session_id,
+                    CoreEvent::TextDelta {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        turn_id,
+                        text: text.clone(),
+                    },
+                );
+                self.emit(
+                    session_id,
+                    CoreEvent::TurnCompleted {
+                        event_id: Uuid::new_v4(),
+                        session_id,
+                        turn_id,
+                    },
+                );
+                return Ok(TurnResult {
+                    session_id,
+                    turn_id,
+                    text,
+                    provider_rounds: round,
+                });
+            }
+            for call in response.tool_calls {
+                let call_id = call.id.clone();
+                let output = match self
+                    .execute_tool(session_id, call, mode, cancel.clone())
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(error) if cancel.is_cancelled() => return Err(error),
+                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                };
+                self.sessions
+                    .write()
+                    .await
+                    .get_mut(&session_id)
+                    .context("session not found")?
+                    .messages
+                    .push(ModelMessage {
+                        role: ModelRole::Tool,
+                        content: Some(output.to_string()),
+                        reasoning_content: None,
+                        tool_call_id: Some(call_id),
+                        tool_calls: None,
+                    });
+                self.persist_session(session_id).await;
+            }
+        }
+        bail!("agent exceeded 12 provider rounds")
+    }
+}
+
+impl Default for AgentCore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        fs, future,
+        sync::{Arc, Mutex},
+    };
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use lan_protocol::{ApprovalDecision, ApprovalMode, CoreEvent, SessionStatus, ToolCall};
+    use serde_json::json;
+
+    use super::{
+        AgentCore, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelRole,
+        SqliteStore, WireFunctionCall, WireToolCall,
+    };
+
+    #[tokio::test]
+    async fn creates_session_and_executes_safe_tool() {
+        let core = AgentCore::new();
+        let session = core.create_session(".".into(), None).await;
+        let output = core
+            .call_tool(
+                session.id,
+                ToolCall {
+                    id: "call-1".into(),
+                    name: "echo".into(),
+                    arguments: json!({"text": "hello"}),
+                },
+                ApprovalMode::ReadOnly,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, json!({"text": "hello"}));
+    }
+
+    #[tokio::test]
+    async fn read_only_mode_denies_host_commands_before_execution() {
+        let core = AgentCore::new();
+        let session = core.create_session(".".into(), None).await;
+        let error = core
+            .call_tool(
+                session.id,
+                ToolCall {
+                    id: "call-command".into(),
+                    name: "run_command".into(),
+                    arguments: json!({"program": "definitely-does-not-exist", "args": []}),
+                },
+                ApprovalMode::ReadOnly,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not allowed in read-only mode"));
+    }
+
+    struct ScriptedProvider {
+        responses: Mutex<VecDeque<ModelResponse>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ScriptedProvider {
+        fn model_name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            Ok(self.responses.lock().unwrap().pop_front().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_executes_tool_before_final_answer() {
+        let tool_call = WireToolCall {
+            id: "call-1".into(),
+            kind: "function".into(),
+            function: WireFunctionCall {
+                name: "echo".into(),
+                arguments: r#"{"text":"observed"}"#.into(),
+            },
+        };
+        let provider = ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([
+                ModelResponse {
+                    message: ModelMessage {
+                        role: ModelRole::Assistant,
+                        content: None,
+                        reasoning_content: None,
+                        tool_call_id: None,
+                        tool_calls: Some(vec![tool_call]),
+                    },
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "echo".into(),
+                        arguments: json!({"text": "observed"}),
+                    }],
+                },
+                ModelResponse {
+                    message: ModelMessage::text(ModelRole::Assistant, "done"),
+                    text: "done".into(),
+                    tool_calls: Vec::new(),
+                },
+            ])),
+        };
+        let core = AgentCore::with_provider(Arc::new(provider));
+        let session = core.create_session(".".into(), None).await;
+        let result = core
+            .start_turn(session.id, "inspect".into(), ApprovalMode::ReadOnly)
+            .await
+            .unwrap();
+        assert_eq!(result.text, "done");
+        assert_eq!(result.provider_rounds, 2);
+    }
+
+    fn scripted_tool_response(id: &str, name: &str, arguments: serde_json::Value) -> ModelResponse {
+        let arguments = arguments.to_string();
+        let call = WireToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: WireFunctionCall {
+                name: name.into(),
+                arguments: arguments.clone(),
+            },
+        };
+        ModelResponse {
+            message: ModelMessage {
+                role: ModelRole::Assistant,
+                content: None,
+                reasoning_content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![call]),
+            },
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: serde_json::from_str(&arguments).unwrap(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn coding_eval_completes_multi_file_edit_and_review_loop() {
+        let root = std::env::temp_dir().join(format!("lan-eval-edit-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("alpha.txt"), "alpha = false\n").unwrap();
+        fs::write(root.join("beta.txt"), "beta = false\n").unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+
+        let provider = ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([
+                scripted_tool_response(
+                    "edit",
+                    "apply_edits",
+                    json!({"edits": [
+                        {"path": "alpha.txt", "old_text": "false", "new_text": "true"},
+                        {"path": "beta.txt", "old_text": "false", "new_text": "true"}
+                    ]}),
+                ),
+                scripted_tool_response("review", "git_diff", json!({})),
+                ModelResponse {
+                    message: ModelMessage::text(ModelRole::Assistant, "implemented and reviewed"),
+                    text: "implemented and reviewed".into(),
+                    tool_calls: Vec::new(),
+                },
+            ])),
+        };
+        let core = AgentCore::with_provider(Arc::new(provider));
+        let session = core.create_session(root.display().to_string(), None).await;
+        let result = core
+            .start_turn(
+                session.id,
+                "enable both flags".into(),
+                ApprovalMode::Workspace,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.text, "implemented and reviewed");
+        assert_eq!(result.provider_rounds, 3);
+        assert_eq!(
+            fs::read_to_string(root.join("alpha.txt")).unwrap(),
+            "alpha = true\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("beta.txt")).unwrap(),
+            "beta = true\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn coding_eval_creates_a_new_file() {
+        let root = std::env::temp_dir().join(format!("lan-eval-create-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let provider = ScriptedProvider {
+            responses: Mutex::new(VecDeque::from([
+                scripted_tool_response(
+                    "create",
+                    "create_file",
+                    json!({"path": "hello.txt", "content": "hello from Lan Code\n"}),
+                ),
+                ModelResponse {
+                    message: ModelMessage::text(ModelRole::Assistant, "created"),
+                    text: "created".into(),
+                    tool_calls: Vec::new(),
+                },
+            ])),
+        };
+        let core = AgentCore::with_provider(Arc::new(provider));
+        let session = core.create_session(root.display().to_string(), None).await;
+        core.start_turn(
+            session.id,
+            "create greeting".into(),
+            ApprovalMode::Workspace,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).unwrap(),
+            "hello from Lan Code\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_store_restores_sessions_and_events() {
+        let root = std::env::temp_dir().join(format!("lan-store-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("lan.sqlite");
+        let session_id;
+        {
+            let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
+            let session = core.create_session(root.display().to_string(), None).await;
+            session_id = session.id;
+            assert_eq!(core.events_for_session(session_id).unwrap().len(), 1);
+        }
+        {
+            let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
+            assert_eq!(core.list_sessions().await[0].id, session_id);
+            assert_eq!(core.events_for_session(session_id).unwrap().len(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ask_mode_pauses_until_approval_is_resolved() {
+        let root = std::env::temp_dir().join(format!("lan-approval-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("sample.txt"), "before\n").unwrap();
+        let core = Arc::new(AgentCore::new());
+        let session = core.create_session(root.display().to_string(), None).await;
+        let mut events = core.subscribe();
+        let worker = {
+            let core = core.clone();
+            tokio::spawn(async move {
+                core.call_tool(
+                    session.id,
+                    ToolCall {
+                        id: "call-write".into(),
+                        name: "replace_text".into(),
+                        arguments: json!({
+                            "path": "sample.txt",
+                            "old_text": "before",
+                            "new_text": "after"
+                        }),
+                    },
+                    ApprovalMode::Ask,
+                )
+                .await
+            })
+        };
+        let request_id = loop {
+            if let CoreEvent::ApprovalRequested { request, .. } = events.recv().await.unwrap() {
+                break request.id;
+            }
+        };
+        assert_eq!(
+            core.list_sessions().await[0].status,
+            SessionStatus::WaitingForApproval
+        );
+        core.resolve_approval(request_id, ApprovalDecision::AllowOnce)
+            .await
+            .unwrap();
+        worker.await.unwrap().unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("sample.txt")).unwrap(),
+            "after\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct BlockingProvider;
+
+    #[async_trait]
+    impl ModelProvider for BlockingProvider {
+        fn model_name(&self) -> &str {
+            "blocking"
+        }
+
+        async fn complete(&self, _request: ModelRequest) -> Result<ModelResponse> {
+            future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_active_provider_wait() {
+        let core = Arc::new(AgentCore::with_provider(Arc::new(BlockingProvider)));
+        let session = core.create_session(".".into(), None).await;
+        let worker = {
+            let core = core.clone();
+            tokio::spawn(async move {
+                core.start_turn(session.id, "wait".into(), ApprovalMode::ReadOnly)
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(core.interrupt_turn(session.id).await);
+        assert!(worker.await.unwrap().is_err());
+        assert_eq!(
+            core.list_sessions().await[0].status,
+            SessionStatus::Interrupted
+        );
+    }
+}

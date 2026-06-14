@@ -1,0 +1,16 @@
+[package]
+name = "lan-desktop"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+lan-core = { path = "../../../crates/lan-core" }
+lan-protocol = { path = "../../../crates/lan-protocol" }
+serde.workspace = true
+tauri = { version = "2", features = [] }
+tokio.workspace = true

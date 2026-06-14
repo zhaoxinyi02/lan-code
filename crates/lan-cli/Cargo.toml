@@ -1,0 +1,12 @@
+[package]
+name = "lan-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lan-core = { path = "../lan-core" }
+lan-protocol = { path = "../lan-protocol" }
+tokio.workspace = true
+
