@@ -8,6 +8,7 @@
 * { box-sizing: border-box; }
 button, textarea, input, select { font: inherit; }
 button { cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .4; }
 body { margin: 0; overflow: hidden; }
 
 .app-shell {
@@ -16,6 +17,7 @@ body { margin: 0; overflow: hidden; }
   height: 100vh;
   background: #f6f6f4;
 }
+.app-shell.sidebar-collapsed { grid-template-columns: minmax(520px, 1fr) 260px; }
 
 .sidebar {
   display: flex;
@@ -36,9 +38,15 @@ body { margin: 0; overflow: hidden; }
 .new-chat { background: #fff; border: 1px solid #dedfdb; box-shadow: 0 1px 2px #00000008; margin-bottom: 12px; }
 nav { display: grid; gap: 2px; }
 nav button:hover, .sessions button:hover, .sessions button.active { background: #e7e8e5; }
+.session-search { margin: 8px 2px 0; width: calc(100% - 4px); border: 1px solid #d9dad6; border-radius: 8px; padding: 8px 9px; outline: none; }
 .section-label { padding: 24px 10px 8px; color: #969893; font-size: 12px; }
 .sessions { display: grid; gap: 2px; overflow: auto; }
 .sessions span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sessions button { position: relative; }
+.sessions .status { width: 6px; height: 6px; border-radius: 50%; margin-left: auto; background: #bbb; }
+.sessions .status.running { background: #3986f7; }
+.sessions .status.failed { background: #d55252; }
+.sessions .status.waitingForApproval { background: #d49a28; }
 .settings-button { margin-top: auto; }
 
 main { display: flex; flex-direction: column; min-width: 0; background: #fff; }
@@ -47,6 +55,7 @@ header {
   padding: 0 22px; border-bottom: 1px solid #ececea;
 }
 header h1 { font-size: 15px; margin: 0 0 3px; font-weight: 600; }
+.title-row { display: flex; align-items: center; gap: 10px; }
 .subtle { color: #999; font-size: 11px; }
 .header-actions { display: flex; gap: 7px; }
 .pill, .mini {
@@ -71,8 +80,11 @@ article.assistant { padding: 2px 0; }
 .message-label { color: #92948f; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
 article p { margin: 6px 0 0; }
 .thinking { display: flex; align-items: center; gap: 8px; color: #777; }
+.error-banner { display: flex; align-items: center; gap: 8px; padding: 9px 16px; color: #9b2f2f; background: #fff0f0; border-bottom: 1px solid #f1cccc; font-size: 12px; }
+.error-banner button { margin-left: auto; border: 0; background: transparent; color: inherit; }
 
 .composer-wrap { position: absolute; bottom: 24px; left: 248px; right: 260px; padding: 0 clamp(24px, 8vw, 120px); pointer-events: none; }
+.sidebar-collapsed .composer-wrap { left: 0; }
 .composer { max-width: 760px; margin: auto; background: #fff; border: 1px solid #dcded9; border-radius: 16px; box-shadow: 0 12px 35px #00000014; pointer-events: auto; }
 .composer textarea { width: 100%; min-height: 72px; max-height: 180px; resize: none; border: 0; outline: none; padding: 16px 16px 6px; background: transparent; }
 .composer-footer { display: flex; justify-content: space-between; align-items: center; padding: 7px 9px 9px; }
@@ -83,19 +95,37 @@ article p { margin: 6px 0 0; }
 
 .inspector { padding: 23px 17px; border-left: 1px solid #e1e2df; background: #fafaf9; }
 .inspector h3 { margin: 0 0 13px; color: #969893; font-size: 12px; font-weight: 500; }
-.info-row { display: grid; grid-template-columns: 20px 1fr auto; gap: 7px; align-items: center; padding: 8px 0; font-size: 12px; }
+.info-row { display: grid; grid-template-columns: 20px 1fr auto; gap: 7px; align-items: center; padding: 8px 0; font-size: 12px; width: 100%; border: 0; background: transparent; text-align: left; }
+.info-row.clickable:hover { color: #176bd6; }
 .info-row strong { font-weight: 500; }
 .divider { height: 1px; background: #e8e9e6; margin: 18px 0; }
 .progress-item { display: flex; align-items: center; gap: 8px; padding: 7px 0; font-size: 12px; color: #666; }
 .progress-item.done svg { color: #7a9684; }
+.progress-item.failed { color: #a84646; }
+.empty-small { color: #a0a29e; font-size: 11px; line-height: 1.5; }
 .pulse { width: 9px; height: 9px; border-radius: 50%; background: #4389f5; box-shadow: 0 0 0 4px #4389f51c; }
 
 .modal-backdrop { position: fixed; inset: 0; display: grid; place-items: center; background: #0004; }
 .modal { width: 430px; background: #fff; border: 1px solid #ddd; border-radius: 16px; box-shadow: 0 24px 60px #0003; padding: 22px; }
+.settings-modal { width: min(620px, calc(100vw - 40px)); }
+.modal-title { display: flex; justify-content: space-between; align-items: flex-start; }
+.modal-title p { margin: 4px 0 0; color: #888; font-size: 12px; }
 .modal h2 { margin: 0 0 20px; font-size: 18px; }
+.modal-title h2 { margin: 0; }
 .modal label { display: grid; gap: 7px; margin: 13px 0; color: #666; font-size: 12px; }
 .modal input, .modal select { border: 1px solid #ddd; border-radius: 8px; padding: 10px; background: #fff; }
-.primary { width: 100%; border: 0; border-radius: 8px; background: #222; color: #fff; padding: 10px; margin-top: 12px; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; margin-top: 14px; }
+.form-grid .span-2 { grid-column: span 2; }
+.input-action { display: grid; grid-template-columns: 1fr auto; gap: 7px; }
+.input-action button, .modal-actions button { border: 1px solid #d8d9d5; background: #fff; border-radius: 8px; padding: 9px 12px; }
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.primary-inline { border: 0 !important; border-radius: 8px; background: #222 !important; color: #fff; padding: 9px 13px; }
+.settings-status { margin-top: 9px; padding: 9px 10px; border-radius: 8px; color: #267146; background: #edf8f0; font-size: 12px; }
+.settings-status.failed { color: #a33f3f; background: #fff0f0; }
+.approval-bar { position: fixed; z-index: 5; left: 50%; bottom: 130px; transform: translateX(-50%); width: min(700px, calc(100vw - 48px)); display: flex; align-items: center; gap: 8px; padding: 12px; border: 1px solid #d9d4c8; border-radius: 12px; background: #fffdf7; box-shadow: 0 15px 40px #0002; }
+.approval-bar div { display: grid; gap: 3px; margin-right: auto; }
+.approval-bar span { color: #777; font-size: 11px; }
+.approval-bar button { border: 1px solid #ddd; background: #fff; border-radius: 8px; padding: 8px 11px; }
 
 @media (max-width: 1150px) {
   .app-shell { grid-template-columns: 220px 1fr; }

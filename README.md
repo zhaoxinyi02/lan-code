@@ -6,6 +6,10 @@ desktop, CLI, VS Code, JetBrains, and web.
 Version 0.1 ships a Rust agent core, an interactive CLI, a JSONL daemon for
 future clients, and a Tauri desktop application.
 
+The desktop application includes first-run provider setup, secure API-key
+storage through the Windows Credential Manager, workspace selection, persistent
+sessions, live tool progress, approval controls, and actionable error messages.
+
 ![Lan Code desktop](docs/screenshots/lan-code-desktop.png)
 
 The first milestone is deliberately small:

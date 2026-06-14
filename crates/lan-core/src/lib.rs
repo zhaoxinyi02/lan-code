@@ -151,6 +151,15 @@ impl AgentCore {
             .collect()
     }
 
+    pub async fn messages_for_session(&self, session_id: SessionId) -> Result<Vec<ModelMessage>> {
+        self.sessions
+            .read()
+            .await
+            .get(&session_id)
+            .map(|state| state.messages.clone())
+            .context("session not found")
+    }
+
     pub fn list_tools(&self) -> Vec<ToolDescriptor> {
         self.tools.list()
     }

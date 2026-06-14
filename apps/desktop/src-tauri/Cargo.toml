@@ -12,5 +12,9 @@ anyhow.workspace = true
 lan-core = { path = "../../../crates/lan-core" }
 lan-protocol = { path = "../../../crates/lan-protocol" }
 serde.workspace = true
+serde_json.workspace = true
 tauri = { version = "2", features = [] }
 tokio.workspace = true
+uuid.workspace = true
+rfd = "0.15"
+keyring = { version = "3", features = ["windows-native"] }

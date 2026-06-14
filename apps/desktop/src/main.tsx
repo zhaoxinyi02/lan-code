@@ -2,221 +2,244 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  Bot,
-  CheckCircle2,
-  ChevronDown,
-  CircleStop,
-  Code2,
-  FileDiff,
-  FolderGit2,
-  GitBranch,
-  History,
-  PanelLeftClose,
-  Plus,
-  Search,
-  Send,
-  Settings,
-  ShieldCheck,
-  Sparkles,
-  TerminalSquare,
+  Bot, CheckCircle2, ChevronDown, CircleStop, Code2, FileDiff, FolderGit2,
+  GitBranch, History, KeyRound, PanelLeftClose, PanelLeftOpen, Plus, Search,
+  Send, Settings, ShieldCheck, Sparkles, TerminalSquare, XCircle,
 } from "lucide-react";
 import "./styles.css";
 
-type Session = {
-  id: string;
-  cwd: string;
-  title?: string;
-  status: "idle" | "running" | "waitingForApproval" | "interrupted" | "failed";
-};
+type Mode = "readOnly" | "ask" | "workspace" | "fullAccess";
+type Session = { id: string; cwd: string; title?: string; status: string };
+type SettingsData = { baseUrl: string; model: string; apiKey: string; workspace: string; approvalMode: Mode };
+type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
+type CoreEvent = { type: string; toolName?: string; error?: string; text?: string };
+type Approval = { id: string; toolName: string; reason: string; arguments: unknown };
+type ChatMessage = { role: "user" | "assistant"; text: string };
 
-type Message = {
-  role: "user" | "assistant";
-  text: string;
+const DEFAULT_SETTINGS: SettingsData = {
+  baseUrl: "https://api.deepseek.com",
+  model: "deepseek-v4-pro",
+  apiKey: "",
+  workspace: "",
+  approvalMode: "readOnly",
 };
-
-const isTauri = "__TAURI_INTERNALS__" in window;
 
 function App() {
+  const [settings, setSettings] = React.useState(DEFAULT_SETTINGS);
+  const [draft, setDraft] = React.useState(DEFAULT_SETTINGS);
   const [sessions, setSessions] = React.useState<Session[]>([]);
   const [activeId, setActiveId] = React.useState<string>();
-  const [messages, setMessages] = React.useState<Message[]>([]);
+  const [messages, setMessages] = React.useState<ChatMessage[]>([]);
+  const [events, setEvents] = React.useState<CoreEvent[]>([]);
+  const [approvals, setApprovals] = React.useState<Approval[]>([]);
   const [prompt, setPrompt] = React.useState("");
-  const [cwd, setCwd] = React.useState("D:\\Lan Code");
-  const [mode, setMode] = React.useState("workspace");
   const [busy, setBusy] = React.useState(false);
-  const [showSettings, setShowSettings] = React.useState(false);
+  const [settingsOpen, setSettingsOpen] = React.useState(false);
+  const [settingsStatus, setSettingsStatus] = React.useState("");
+  const [searchOpen, setSearchOpen] = React.useState(false);
+  const [query, setQuery] = React.useState("");
+  const [sidebarOpen, setSidebarOpen] = React.useState(true);
+  const [fatal, setFatal] = React.useState("");
 
-  React.useEffect(() => {
-    if (isTauri) {
-      invoke<Session[]>("list_sessions").then(setSessions).catch(console.error);
-    }
+  const refreshSessions = React.useCallback(async () => {
+    const rows = await invoke<Session[]>("list_sessions");
+    setSessions(rows.reverse());
   }, []);
 
-  async function newSession() {
-    const session = isTauri
-      ? await invoke<Session>("create_session", { cwd, title: "新对话" })
-      : { id: crypto.randomUUID(), cwd, title: "新对话", status: "idle" as const };
-    setSessions((items) => [session, ...items]);
+  React.useEffect(() => {
+    Promise.all([invoke<SettingsData>("get_settings"), invoke<Session[]>("list_sessions")])
+      .then(([loaded, rows]) => {
+        setSettings(loaded);
+        setDraft(loaded);
+        setSessions(rows.reverse());
+        if (!loaded.apiKey) setSettingsOpen(true);
+      })
+      .catch((error) => setFatal(String(error)));
+  }, []);
+
+  React.useEffect(() => {
+    if (!activeId) return;
+    invoke<ModelMessage[]>("session_messages", { sessionId: activeId })
+      .then((rows) => setMessages(rows
+        .filter((row) => (row.role === "user" || row.role === "assistant") && row.content)
+        .map((row) => ({ role: row.role as "user" | "assistant", text: row.content! }))))
+      .catch((error) => setFatal(String(error)));
+  }, [activeId]);
+
+  React.useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (activeId) invoke<CoreEvent[]>("session_events", { sessionId: activeId }).then(setEvents).catch(() => {});
+      invoke<Approval[]>("pending_approvals").then(setApprovals).catch(() => {});
+      refreshSessions().catch(() => {});
+    }, 700);
+    return () => window.clearInterval(timer);
+  }, [activeId, refreshSessions]);
+
+  async function chooseWorkspace() {
+    const path = await invoke<string | null>("pick_workspace");
+    if (path) setDraft((value) => ({ ...value, workspace: path }));
+  }
+
+  async function saveSettings() {
+    setSettingsStatus("正在保存...");
+    try {
+      await invoke("save_settings", { settings: draft });
+      setSettings(draft);
+      setSettingsOpen(false);
+      setSettingsStatus("");
+      setActiveId(undefined);
+      setMessages([]);
+      await refreshSessions();
+    } catch (error) {
+      setSettingsStatus(`保存失败：${String(error)}`);
+    }
+  }
+
+  async function testProvider() {
+    setSettingsStatus("正在测试 API...");
+    try {
+      const result = await invoke<string>("test_provider", { settings: draft });
+      setSettingsStatus(`连接成功：${result || "模型已响应"}`);
+    } catch (error) {
+      setSettingsStatus(`连接失败：${String(error)}`);
+    }
+  }
+
+  async function newSession(title = "新对话") {
+    if (!settings.apiKey) {
+      setSettingsOpen(true);
+      setSettingsStatus("请先配置并测试 API");
+      return undefined;
+    }
+    const session = await invoke<Session>("create_session", { cwd: settings.workspace, title });
+    await refreshSessions();
     setActiveId(session.id);
     setMessages([]);
+    setEvents([]);
+    return session.id;
   }
 
   async function send() {
     const text = prompt.trim();
     if (!text || busy) return;
-    let sessionId = activeId;
-    if (!sessionId) {
-      const session = isTauri
-        ? await invoke<Session>("create_session", { cwd, title: text.slice(0, 30) })
-        : { id: crypto.randomUUID(), cwd, title: text.slice(0, 30), status: "idle" as const };
-      setSessions((items) => [session, ...items]);
-      sessionId = session.id;
-      setActiveId(session.id);
-    }
-    setMessages((items) => [...items, { role: "user", text }]);
-    setPrompt("");
-    setBusy(true);
     try {
-      const result = isTauri
-        ? await invoke<{ text: string }>("start_turn", { sessionId, prompt: text, mode })
-        : { text: "桌面预览模式已就绪。连接 Tauri 后，这里会由 Lan Code Core 执行真实编码任务。" };
+      let sessionId = activeId;
+      if (!sessionId) sessionId = await newSession(text.slice(0, 32));
+      if (!sessionId) return;
+      setMessages((items) => [...items, { role: "user", text }]);
+      setPrompt("");
+      setBusy(true);
+      const result = await invoke<{ text: string }>("start_turn", {
+        sessionId, prompt: text, mode: settings.approvalMode,
+      });
       setMessages((items) => [...items, { role: "assistant", text: result.text }]);
     } catch (error) {
       setMessages((items) => [...items, { role: "assistant", text: `执行失败：${String(error)}` }]);
     } finally {
       setBusy(false);
+      await refreshSessions();
     }
   }
 
   async function interrupt() {
-    if (activeId && isTauri) await invoke("interrupt_turn", { sessionId: activeId });
-    setBusy(false);
+    if (activeId) await invoke("interrupt_turn", { sessionId: activeId });
   }
 
+  async function decide(requestId: string, decision: "allowOnce" | "deny") {
+    await invoke("resolve_approval", { requestId, decision });
+    setApprovals((rows) => rows.filter((row) => row.id !== requestId));
+  }
+
+  const filtered = sessions.filter((row) =>
+    !query || `${row.title || ""} ${row.cwd}`.toLowerCase().includes(query.toLowerCase()));
+  const recentTools = events.filter((event) =>
+    ["toolStarted", "toolCompleted", "toolFailed"].includes(event.type)).slice(-8).reverse();
+
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <img src="/lan-code-logo.png" alt="Lan Code" />
-          <strong>Lan Code</strong>
-          <button className="icon-button"><PanelLeftClose size={17} /></button>
+    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
+      {sidebarOpen && <aside className="sidebar">
+        <div className="brand"><img src="/lan-code-logo.png" alt="Lan Code" /><strong>Lan Code</strong>
+          <button title="收起侧栏" className="icon-button" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={17} /></button>
         </div>
-        <button className="new-chat" onClick={newSession}><Plus size={16} /> 新对话</button>
+        <button className="new-chat" onClick={() => void newSession()}><Plus size={16} /> 新对话</button>
         <nav>
-          <button><Search size={16} /> 搜索</button>
-          <button><History size={16} /> 历史</button>
-          <button><FolderGit2 size={16} /> 工作区</button>
+          <button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen(!searchOpen)}><Search size={16} /> 搜索</button>
+          <button onClick={() => { setSearchOpen(true); setQuery(""); }}><History size={16} /> 历史</button>
+          <button onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><FolderGit2 size={16} /> 工作区</button>
         </nav>
+        {searchOpen && <input className="session-search" autoFocus placeholder="搜索会话或路径" value={query} onChange={(e) => setQuery(e.target.value)} />}
         <div className="section-label">最近对话</div>
-        <div className="sessions">
-          {sessions.map((session) => (
-            <button
-              key={session.id}
-              className={session.id === activeId ? "active" : ""}
-              onClick={() => setActiveId(session.id)}
-            >
-              <Code2 size={15} />
-              <span>{session.title || "未命名对话"}</span>
-            </button>
-          ))}
-        </div>
-        <button className="settings-button" onClick={() => setShowSettings(!showSettings)}>
-          <Settings size={16} /> 设置
-        </button>
-      </aside>
+        <div className="sessions">{filtered.map((session) => (
+          <button key={session.id} className={session.id === activeId ? "active" : ""} onClick={() => setActiveId(session.id)}>
+            <Code2 size={15} /><span>{session.title || "未命名对话"}</span><i className={`status ${session.status}`} />
+          </button>
+        ))}</div>
+        <button className="settings-button" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+      </aside>}
 
       <main>
         <header>
-          <div>
-            <h1>{sessions.find((item) => item.id === activeId)?.title || "开始新的编码任务"}</h1>
-            <span className="subtle">{cwd}</span>
+          <div className="title-row">
+            {!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}
+            <div><h1>{sessions.find((item) => item.id === activeId)?.title || "开始新的编码任务"}</h1><span className="subtle">{settings.workspace || "尚未选择工作区"}</span></div>
           </div>
           <div className="header-actions">
-            <button className="pill"><GitBranch size={15} /> main <ChevronDown size={14} /></button>
-            <button className="pill"><ShieldCheck size={15} /> {mode}</button>
+            <button className="pill" onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><GitBranch size={15} /> 工作区 <ChevronDown size={14} /></button>
+            <button className="pill" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><ShieldCheck size={15} /> {settings.approvalMode}</button>
           </div>
         </header>
-
+        {fatal && <div className="error-banner"><XCircle size={16} />{fatal}<button onClick={() => setFatal("")}>关闭</button></div>}
         <section className="conversation">
-          {messages.length === 0 ? (
-            <div className="welcome">
-              <img src="/lan-code-logo.png" alt="" />
-              <h2>把想法交给 Lan Code</h2>
-              <p>它会先理解仓库，再修改代码、运行检查并审阅差异。</p>
-              <div className="suggestions">
-                <button onClick={() => setPrompt("阅读当前项目并解释架构")}><Bot size={18} /> 理解项目</button>
-                <button onClick={() => setPrompt("检查当前 Git diff 并指出风险")}><FileDiff size={18} /> 审阅改动</button>
-                <button onClick={() => setPrompt("运行测试并修复失败项")}><CheckCircle2 size={18} /> 修复测试</button>
-              </div>
+          {messages.length === 0 ? <div className="welcome">
+            <img src="/lan-code-logo.png" alt="" /><h2>{settings.apiKey ? "把想法交给 Lan Code" : "先完成首次配置"}</h2>
+            <p>{settings.apiKey ? "它会先理解仓库，再修改代码、运行检查并审阅差异。" : "配置 API Key 和工作区后即可开始真实编码任务。"}</p>
+            <div className="suggestions">
+              {!settings.apiKey && <button onClick={() => setSettingsOpen(true)}><KeyRound size={18} /> 配置 API</button>}
+              <button onClick={() => setPrompt("阅读当前项目并解释架构")}><Bot size={18} /> 理解项目</button>
+              <button onClick={() => setPrompt("检查当前 Git diff 并指出风险")}><FileDiff size={18} /> 审阅改动</button>
+              <button onClick={() => setPrompt("运行测试并修复失败项")}><CheckCircle2 size={18} /> 修复测试</button>
             </div>
-          ) : (
-            <div className="messages">
-              {messages.map((message, index) => (
-                <article key={index} className={message.role}>
-                  <div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>
-                  <p>{message.text}</p>
-                </article>
-              ))}
-              {busy && <article className="assistant thinking"><Sparkles size={16} /> 正在分析工作区...</article>}
-            </div>
-          )}
+          </div> : <div className="messages">
+            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div><p>{message.text}</p></article>)}
+            {busy && <article className="assistant thinking"><Sparkles size={16} /> 正在分析并执行...</article>}
+          </div>}
         </section>
-
-        <div className="composer-wrap">
-          <div className="composer">
-            <textarea
-              value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void send();
-                }
-              }}
-              placeholder="描述你想完成的编码任务"
-            />
-            <div className="composer-footer">
-              <div>
-                <button className="mini"><Plus size={15} /></button>
-                <button className="mini"><TerminalSquare size={15} /> 本地</button>
-              </div>
-              {busy ? (
-                <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button>
-              ) : (
-                <button className="send" onClick={send}><Send size={17} /></button>
-              )}
-            </div>
-          </div>
-        </div>
+        <div className="composer-wrap"><div className="composer">
+          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }} placeholder={settings.apiKey ? "描述你想完成的编码任务" : "请先在设置中配置 API"} />
+          <div className="composer-footer"><div>
+            <button title="选择工作区" className="mini" onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><Plus size={15} /></button>
+            <button className="mini" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><TerminalSquare size={15} /> {settings.model}</button>
+          </div>{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!settings.apiKey} onClick={send}><Send size={17} /></button>}</div>
+        </div></div>
       </main>
 
       <aside className="inspector">
         <h3>环境信息</h3>
-        <div className="info-row"><FolderGit2 size={16} /><span>工作区</span><strong>本地</strong></div>
-        <div className="info-row"><GitBranch size={16} /><span>分支</span><strong>main</strong></div>
-        <div className="info-row"><ShieldCheck size={16} /><span>权限</span><strong>{mode}</strong></div>
-        <div className="divider" />
-        <h3>进度</h3>
-        <div className="progress-item done"><CheckCircle2 size={16} /> Core 0.1</div>
-        <div className="progress-item done"><CheckCircle2 size={16} /> CLI 客户端</div>
-        <div className="progress-item"><div className="pulse" /> 桌面端会话</div>
+        <button className="info-row clickable" onClick={() => { setDraft(settings); void chooseWorkspace().then(() => setSettingsOpen(true)); }}><FolderGit2 size={16} /><span>工作区</span><strong>{settings.workspace ? "已选择" : "未配置"}</strong></button>
+        <button className="info-row clickable" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><KeyRound size={16} /><span>模型</span><strong>{settings.apiKey ? settings.model : "未配置"}</strong></button>
+        <button className="info-row clickable" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><ShieldCheck size={16} /><span>权限</span><strong>{settings.approvalMode}</strong></button>
+        <div className="divider" /><h3>工具进度</h3>
+        {recentTools.length === 0 ? <div className="empty-small">发送任务后在这里查看工具执行过程</div> : recentTools.map((event, index) => (
+          <div className={`progress-item ${event.type === "toolCompleted" ? "done" : event.type === "toolFailed" ? "failed" : ""}`} key={index}>
+            {event.type === "toolFailed" ? <XCircle size={15} /> : <CheckCircle2 size={15} />} {event.toolName}
+          </div>
+        ))}
       </aside>
 
-      {showSettings && (
-        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
-          <div className="modal" onClick={(event) => event.stopPropagation()}>
-            <h2>工作区设置</h2>
-            <label>工作目录<input value={cwd} onChange={(event) => setCwd(event.target.value)} /></label>
-            <label>权限模式<select value={mode} onChange={(event) => setMode(event.target.value)}>
-              <option value="readOnly">只读</option>
-              <option value="ask">每次询问</option>
-              <option value="workspace">工作区写入</option>
-              <option value="fullAccess">完全访问</option>
-            </select></label>
-            <button className="primary" onClick={() => setShowSettings(false)}>完成</button>
-          </div>
+      {approvals.length > 0 && <div className="approval-bar"><div><strong>需要你的批准</strong><span>{approvals[0].toolName}：{approvals[0].reason}</span></div><button onClick={() => decide(approvals[0].id, "deny")}>拒绝</button><button className="primary-inline" onClick={() => decide(approvals[0].id, "allowOnce")}>允许一次</button></div>}
+
+      {settingsOpen && <div className="modal-backdrop"><div className="modal settings-modal">
+        <div className="modal-title"><div><h2>Lan Code 设置</h2><p>配置会保存在当前 Windows 用户目录。</p></div><button className="icon-button" onClick={() => setSettingsOpen(false)}>×</button></div>
+        <div className="form-grid">
+          <label>API 地址<input value={draft.baseUrl} onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })} /></label>
+          <label>模型名称<input value={draft.model} onChange={(e) => setDraft({ ...draft, model: e.target.value })} /></label>
+          <label className="span-2">API Key<input type="password" placeholder="sk-..." value={draft.apiKey} onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })} /></label>
+          <label className="span-2">工作区<div className="input-action"><input value={draft.workspace} onChange={(e) => setDraft({ ...draft, workspace: e.target.value })} /><button onClick={chooseWorkspace}>选择文件夹</button></div></label>
+          <label>权限模式<select value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as Mode })}><option value="readOnly">只读</option><option value="ask">每次询问</option><option value="workspace">工作区写入</option><option value="fullAccess">完全访问</option></select></label>
         </div>
-      )}
+        {settingsStatus && <div className={settingsStatus.includes("失败") ? "settings-status failed" : "settings-status"}>{settingsStatus}</div>}
+        <div className="modal-actions"><button onClick={testProvider}>测试 API</button><button className="primary-inline" onClick={saveSettings}>保存并启用</button></div>
+      </div></div>}
     </div>
   );
 }
