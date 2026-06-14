@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "lan-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "lan-core",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "lan-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2011,7 +2011,7 @@ dependencies = [
 
 [[package]]
 name = "lan-daemon"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "lan-core",
  "lan-protocol",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "lan-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "keyring",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "lan-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
