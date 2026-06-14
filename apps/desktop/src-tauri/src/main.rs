@@ -159,6 +159,14 @@ struct WorkspaceFile {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceSearchMatch {
+    path: String,
+    line: usize,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateInfo {
     current_version: String,
     latest_version: String,
@@ -319,6 +327,17 @@ fn workspace_path(settings: &DesktopSettings, relative: &str) -> Result<PathBuf,
     };
     if !resolved.starts_with(&root) {
         return Err("拒绝访问工作区之外的路径".into());
+    }
+    Ok(resolved)
+}
+
+fn mutable_workspace_path(settings: &DesktopSettings, relative: &str) -> Result<PathBuf, String> {
+    let resolved = workspace_path(settings, relative)?;
+    let root = PathBuf::from(&settings.workspace)
+        .canonicalize()
+        .map_err(|error| format!("工作区不可用：{error}"))?;
+    if resolved == root {
+        return Err("拒绝修改工作区根目录".into());
     }
     Ok(resolved)
 }
@@ -516,12 +535,66 @@ async fn list_workspace_files(state: State<'_, AppState>) -> Result<Vec<Workspac
 }
 
 #[tauri::command]
+async fn search_workspace(
+    query: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<WorkspaceSearchMatch>, String> {
+    let query = query.trim().to_lowercase();
+    if query.len() < 2 {
+        return Err("搜索内容至少需要 2 个字符".into());
+    }
+    let settings = state.settings.read().await;
+    let root = PathBuf::from(&settings.workspace);
+    let ignored = [".git", "node_modules", "target", "dist", ".idea", ".vscode"];
+    let mut matches = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(12)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !ignored.contains(&entry.file_name().to_string_lossy().as_ref())
+        })
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        if entry
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(u64::MAX)
+            > 2 * 1024 * 1024
+        {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        for (index, line) in content.lines().enumerate() {
+            if line.to_lowercase().contains(&query) {
+                matches.push(WorkspaceSearchMatch {
+                    path: entry
+                        .path()
+                        .strip_prefix(&root)
+                        .map_err(|error| error.to_string())?
+                        .display()
+                        .to_string(),
+                    line: index + 1,
+                    text: line.trim().chars().take(180).collect(),
+                });
+                if matches.len() >= 200 {
+                    return Ok(matches);
+                }
+            }
+        }
+    }
+    Ok(matches)
+}
+
+#[tauri::command]
 async fn read_workspace_file(
     path: String,
     state: State<'_, AppState>,
 ) -> Result<WorkspaceFile, String> {
     let settings = state.settings.read().await;
-    let resolved = workspace_path(&settings, &path)?;
+    let resolved = mutable_workspace_path(&settings, &path)?;
     let metadata = fs::metadata(&resolved).map_err(|error| error.to_string())?;
     if metadata.len() > 2 * 1024 * 1024 {
         return Err("文件超过 2MB，暂不在内置编辑器中打开".into());
@@ -539,8 +612,57 @@ async fn write_workspace_file(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let settings = state.settings.read().await;
-    let resolved = workspace_path(&settings, &path)?;
+    let resolved = mutable_workspace_path(&settings, &path)?;
     fs::write(resolved, content).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn create_workspace_entry(
+    path: String,
+    is_dir: bool,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = state.settings.read().await;
+    let resolved = mutable_workspace_path(&settings, &path)?;
+    if resolved.exists() {
+        return Err("同名文件或文件夹已存在".into());
+    }
+    if is_dir {
+        fs::create_dir_all(resolved).map_err(|error| error.to_string())
+    } else {
+        let parent = resolved.parent().ok_or("文件路径无效")?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        fs::write(resolved, "").map_err(|error| error.to_string())
+    }
+}
+
+#[tauri::command]
+async fn rename_workspace_entry(
+    path: String,
+    new_path: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let settings = state.settings.read().await;
+    let source = mutable_workspace_path(&settings, &path)?;
+    let target = mutable_workspace_path(&settings, &new_path)?;
+    if !source.exists() {
+        return Err("原文件或文件夹不存在".into());
+    }
+    if target.exists() {
+        return Err("目标名称已存在".into());
+    }
+    fs::rename(source, target).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn delete_workspace_entry(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings.read().await;
+    let resolved = mutable_workspace_path(&settings, &path)?;
+    if resolved.is_dir() {
+        fs::remove_dir_all(resolved).map_err(|error| error.to_string())
+    } else {
+        fs::remove_file(resolved).map_err(|error| error.to_string())
+    }
 }
 
 #[tauri::command]
@@ -902,8 +1024,12 @@ fn main() {
             save_settings,
             test_provider,
             list_workspace_files,
+            search_workspace,
             read_workspace_file,
             write_workspace_file,
+            create_workspace_entry,
+            rename_workspace_entry,
+            delete_workspace_entry,
             workspace_git_diff,
             inline_completion,
             check_for_updates,

@@ -58,17 +58,35 @@ nav button:hover, .sessions button:hover, .sessions button.active { background: 
 .sessions .status.waitingForApproval { background: #d49a28; }
 .settings-button { margin-top: auto; }
 .code-label { display: flex; align-items: center; justify-content: space-between; padding-top: 4px; }
-.code-label button { display: grid; place-items: center; border: 0; background: transparent; color: #777; }
+.code-label div { display: flex; gap: 2px; }
+.code-label button { display: grid; place-items: center; border: 0; border-radius: 4px; padding: 4px; background: transparent; color: #777; }
+.code-label button:hover { color: #176bd6; background: #e2e5e8; }
 .file-tree { flex: 1; overflow: auto; }
 .file-tree button { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; border: 0; background: transparent; padding: 4px 7px; color: #555; text-align: left; font-size: 12px; }
-.file-tree button:disabled { opacity: 1; cursor: default; color: #777; }
-.file-tree button:not(:disabled):hover, .file-tree button.active { background: #e5e7e3; color: #176bd6; }
+.file-tree button:hover, .file-tree button.active { background: #e5e7e3; color: #176bd6; }
 .file-tree span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree .tree-spacer { flex: 0 0 13px; }
+.workspace-search { display: flex; align-items: center; gap: 5px; margin: 0 3px 7px; border: 1px solid #d8d9d5; border-radius: 6px; padding: 0 6px; background: #fff; color: #888; }
+.workspace-search:focus-within { border-color: #82aee2; }
+.workspace-search input { min-width: 0; width: 100%; border: 0; outline: 0; padding: 6px 0; background: transparent; font-size: 11px; }
+.workspace-search button { border: 0; background: transparent; color: #888; }
+.search-results { flex: 1; overflow: auto; display: grid; align-content: start; gap: 2px; }
+.search-results button { display: grid; gap: 2px; width: 100%; border: 0; border-radius: 5px; padding: 6px 7px; background: transparent; text-align: left; }
+.search-results button:hover { background: #e5e7e3; }
+.search-results strong, .search-results span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-results strong { color: #3d638c; font-size: 11px; }
+.search-results span { color: #777; font-size: 10px; }
 
 main { display: flex; flex-direction: column; min-width: 0; background: #fff; }
 .code-main { background: #fff; }
-.editor-tabs { height: 34px; display: flex; align-items: center; border-bottom: 1px solid #e5e5e2; background: #f5f5f3; color: #888; font-size: 11px; }
-.editor-tabs button { height: 34px; display: flex; align-items: center; gap: 6px; border: 0; border-right: 1px solid #ddd; background: #fff; padding: 0 12px; color: #444; }
+.editor-tabs { height: 34px; display: flex; align-items: center; overflow-x: auto; border-bottom: 1px solid #e5e5e2; background: #f5f5f3; color: #888; font-size: 11px; }
+.editor-tabs > span { padding: 0 12px; }
+.editor-tabs button { height: 34px; display: flex; flex: 0 0 auto; align-items: center; gap: 6px; border: 0; border-right: 1px solid #ddd; border-top: 2px solid transparent; background: #efefed; padding: 0 7px 0 10px; color: #666; }
+.editor-tabs button.active { border-top-color: #2378d4; background: #fff; color: #333; }
+.editor-tabs button span { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.editor-tabs button i { width: 6px; height: 6px; border-radius: 50%; background: #2378d4; }
+.editor-tabs button b { display: grid; place-items: center; width: 17px; height: 17px; border-radius: 4px; color: #888; font-size: 15px; font-weight: 400; }
+.editor-tabs button b:hover { background: #e0e0de; color: #222; }
 .editor-host { flex: 1; min-height: 0; }
 .code-welcome { height: 100%; display: grid; place-content: center; justify-items: center; color: #999; text-align: center; }
 .code-welcome h2 { color: #333; margin: 16px 0 3px; }
@@ -86,6 +104,7 @@ header h1 { font-size: 15px; margin: 0 0 3px; font-weight: 600; }
   display: inline-flex; align-items: center; gap: 6px; border: 1px solid #e1e2df;
   border-radius: 8px; background: #fff; color: #555; padding: 7px 9px;
 }
+.pill.danger:hover { border-color: #e1baba; color: #b43d3d; background: #fff8f8; }
 .conversation { flex: 1; overflow: auto; padding: 28px clamp(24px, 8vw, 120px) 180px; }
 .welcome { max-width: 650px; margin: 15vh auto 0; text-align: center; }
 .welcome img { width: 72px; height: 72px; object-fit: contain; }

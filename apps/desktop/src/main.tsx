@@ -4,8 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import Editor, { type OnMount } from "@monaco-editor/react";
 import * as monaco from "monaco-editor";
 import {
-  Bot, CheckCircle2, ChevronDown, CircleStop, Code2, File, FileDiff, Folder, FolderGit2, Image,
-  FolderPlus, GitBranch, History, KeyRound, PanelLeftClose, PanelLeftOpen, Plus,
+  Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, Code2, File, FileDiff, FilePlus, Folder, FolderGit2, Image,
+  FolderOpen, FolderPlus, GitBranch, History, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
   Download, MessageSquare, RefreshCw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
   XCircle, Zap,
 } from "lucide-react";
@@ -33,6 +33,8 @@ type SettingsData = {
   speechToTextRoute: CapabilityRoute; textToSpeechRoute: CapabilityRoute;
 };
 type WorkspaceEntry = { path: string; name: string; isDir: boolean; depth: number };
+type WorkspaceSearchMatch = { path: string; line: number; text: string };
+type OpenFile = { path: string; content: string; savedContent: string };
 type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
 type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
 type CoreEvent = { type: string; toolName?: string; error?: string; text?: string; usage?: TokenUsage; model?: string };
@@ -94,13 +96,16 @@ function App() {
   const [downloadedUpdate, setDownloadedUpdate] = React.useState("");
   const [workbench, setWorkbench] = React.useState<"agent" | "code">("agent");
   const [workspaceFiles, setWorkspaceFiles] = React.useState<WorkspaceEntry[]>([]);
+  const [workspaceQuery, setWorkspaceQuery] = React.useState("");
+  const [workspaceMatches, setWorkspaceMatches] = React.useState<WorkspaceSearchMatch[]>([]);
   const [activeFile, setActiveFile] = React.useState("");
-  const [fileContent, setFileContent] = React.useState("");
-  const [savedContent, setSavedContent] = React.useState("");
+  const [openFiles, setOpenFiles] = React.useState<OpenFile[]>([]);
+  const [collapsedDirs, setCollapsedDirs] = React.useState<Set<string>>(new Set());
   const [codeStatus, setCodeStatus] = React.useState("");
   const [diffText, setDiffText] = React.useState("");
   const editorRef = React.useRef<Parameters<OnMount>[0] | null>(null);
   const completionTimer = React.useRef<number | undefined>(undefined);
+  const activeDocument = openFiles.find((file) => file.path === activeFile);
 
   const refreshSessions = React.useCallback(async () => {
     const rows = await invoke<Session[]>("list_sessions");
@@ -122,6 +127,23 @@ function App() {
     if (workbench !== "code" || !settings.workspace) return;
     invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles).catch((error) => setCodeStatus(String(error)));
   }, [workbench, settings.workspace]);
+
+  React.useEffect(() => {
+    setOpenFiles([]);
+    setActiveFile("");
+    setCollapsedDirs(new Set());
+  }, [settings.workspace]);
+
+  React.useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (workbench === "code" && event.ctrlKey && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        void saveWorkspaceFile();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  });
 
   React.useEffect(() => {
     if (!activeId) return;
@@ -258,29 +280,112 @@ function App() {
     }
   }
 
-  async function openWorkspaceFile(path: string) {
+  async function openWorkspaceFile(path: string, line?: number) {
+    const existing = openFiles.find((file) => file.path === path);
+    if (existing) {
+      setActiveFile(path);
+      if (line) window.setTimeout(() => {
+        editorRef.current?.revealLineInCenter(line);
+        editorRef.current?.setPosition({ lineNumber: line, column: 1 });
+      });
+      return;
+    }
     try {
       const file = await invoke<{ path: string; content: string }>("read_workspace_file", { path });
       setActiveFile(file.path);
-      setFileContent(file.content);
-      setSavedContent(file.content);
+      setOpenFiles((items) => [...items, { path: file.path, content: file.content, savedContent: file.content }]);
       setCodeStatus("");
+      if (line) window.setTimeout(() => {
+        editorRef.current?.revealLineInCenter(line);
+        editorRef.current?.setPosition({ lineNumber: line, column: 1 });
+      }, 50);
     } catch (error) {
       setCodeStatus(`打开失败：${String(error)}`);
     }
   }
 
   async function saveWorkspaceFile() {
-    if (!activeFile) return;
-    await invoke("write_workspace_file", { path: activeFile, content: fileContent });
-    setSavedContent(fileContent);
+    if (!activeDocument) return;
+    await invoke("write_workspace_file", { path: activeFile, content: activeDocument.content });
+    setOpenFiles((items) => items.map((file) => file.path === activeFile ? { ...file, savedContent: file.content } : file));
     setCodeStatus(`已保存 ${activeFile}`);
     setDiffText(await invoke<string>("workspace_git_diff"));
   }
 
+  function closeWorkspaceFile(path: string) {
+    const target = openFiles.find((file) => file.path === path);
+    if (target?.content !== target?.savedContent && !window.confirm(`${path} 有未保存修改，确定关闭吗？`)) return;
+    const index = openFiles.findIndex((file) => file.path === path);
+    const remaining = openFiles.filter((file) => file.path !== path);
+    setOpenFiles(remaining);
+    if (activeFile === path) setActiveFile(remaining[Math.min(index, remaining.length - 1)]?.path || "");
+  }
+
+  async function refreshWorkspaceFiles() {
+    setWorkspaceFiles(await invoke<WorkspaceEntry[]>("list_workspace_files"));
+  }
+
+  async function searchWorkspace() {
+    if (workspaceQuery.trim().length < 2) {
+      setWorkspaceMatches([]);
+      return;
+    }
+    try {
+      const matches = await invoke<WorkspaceSearchMatch[]>("search_workspace", { query: workspaceQuery });
+      setWorkspaceMatches(matches);
+      setCodeStatus(`找到 ${matches.length} 条结果${matches.length === 200 ? "，已达到显示上限" : ""}`);
+    } catch (error) {
+      setCodeStatus(`搜索失败：${String(error)}`);
+    }
+  }
+
+  async function createWorkspaceEntry(isDir: boolean) {
+    const path = window.prompt(isDir ? "输入新文件夹相对路径" : "输入新文件相对路径")?.trim();
+    if (!path) return;
+    try {
+      await invoke("create_workspace_entry", { path, isDir });
+      await refreshWorkspaceFiles();
+      if (!isDir) await openWorkspaceFile(path);
+      setCodeStatus(`已创建 ${path}`);
+    } catch (error) {
+      setCodeStatus(`创建失败：${String(error)}`);
+    }
+  }
+
+  async function renameWorkspaceEntry() {
+    if (!activeFile) return;
+    const newPath = window.prompt("输入新的相对路径", activeFile)?.trim();
+    if (!newPath || newPath === activeFile) return;
+    try {
+      await invoke("rename_workspace_entry", { path: activeFile, newPath });
+      setOpenFiles((items) => items.map((file) => file.path === activeFile ? { ...file, path: newPath } : file));
+      setActiveFile(newPath);
+      await refreshWorkspaceFiles();
+      setCodeStatus(`已重命名为 ${newPath}`);
+    } catch (error) {
+      setCodeStatus(`重命名失败：${String(error)}`);
+    }
+  }
+
+  async function deleteWorkspaceEntry() {
+    if (!activeFile || !window.confirm(`确定永久删除 ${activeFile} 吗？`)) return;
+    try {
+      await invoke("delete_workspace_entry", { path: activeFile });
+      const path = activeFile;
+      const index = openFiles.findIndex((file) => file.path === path);
+      const remaining = openFiles.filter((file) => file.path !== path);
+      setOpenFiles(remaining);
+      setActiveFile(remaining[Math.min(index, remaining.length - 1)]?.path || "");
+      await refreshWorkspaceFiles();
+      setCodeStatus(`已删除 ${path}`);
+    } catch (error) {
+      setCodeStatus(`删除失败：${String(error)}`);
+    }
+  }
+
   async function requestCompletion() {
     const editor = editorRef.current;
-    if (!editor || !activeFile) return;
+    if (!editor || !activeDocument) return;
     const model = editor.getModel();
     const position = editor.getPosition();
     if (!model || !position) return;
@@ -288,7 +393,7 @@ function App() {
     try {
       const offset = model.getOffsetAt(position);
       const completion = await invoke<string>("inline_completion", {
-        path: activeFile, prefix: fileContent.slice(0, offset), suffix: fileContent.slice(offset),
+        path: activeFile, prefix: activeDocument.content.slice(0, offset), suffix: activeDocument.content.slice(offset),
       });
       editor.executeEdits("lan-code-completion", [{ range: new monaco.Range(position.lineNumber, position.column, position.lineNumber, position.column), text: completion }]);
       setCodeStatus("已插入 AI 补全");
@@ -413,6 +518,10 @@ function App() {
     }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 });
   const estimatedCost = usage.inputTokens / 1_000_000 * settings.inputPricePerMillion
     + usage.outputTokens / 1_000_000 * settings.outputPricePerMillion;
+  const visibleWorkspaceFiles = workspaceFiles.filter((entry) => {
+    const normalized = entry.path.replaceAll("\\", "/");
+    return !Array.from(collapsedDirs).some((dir) => normalized.startsWith(`${dir.replaceAll("\\", "/")}/`));
+  });
 
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-collapsed"}`}>
@@ -422,8 +531,21 @@ function App() {
         </div>
         <div className="mode-switch"><button className={workbench === "agent" ? "active" : ""} onClick={() => setWorkbench("agent")}><MessageSquare size={14} /> Agent</button><button className={workbench === "code" ? "active" : ""} onClick={() => setWorkbench("code")}><Code2 size={14} /> Code</button></div>
         {workbench === "code" ? <>
-          <div className="section-label code-label">项目文件 <button title="刷新" onClick={() => invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles)}><RefreshCw size={13} /></button></div>
-          <div className="file-tree">{workspaceFiles.map((entry) => <button key={entry.path} title={entry.path} style={{ paddingLeft: `${8 + entry.depth * 13}px` }} className={activeFile === entry.path ? "active" : ""} disabled={entry.isDir} onClick={() => void openWorkspaceFile(entry.path)}>{entry.isDir ? <Folder size={14} /> : <File size={14} />}<span>{entry.name}</span></button>)}</div>
+          <div className="section-label code-label"><span>项目文件</span><div>
+            <button title="新建文件" onClick={() => void createWorkspaceEntry(false)}><FilePlus size={13} /></button>
+            <button title="新建文件夹" onClick={() => void createWorkspaceEntry(true)}><FolderPlus size={13} /></button>
+            <button title="刷新" onClick={() => void refreshWorkspaceFiles()}><RefreshCw size={13} /></button>
+          </div></div>
+          <div className="workspace-search"><Search size={13} /><input value={workspaceQuery} onChange={(event) => setWorkspaceQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void searchWorkspace(); }} placeholder="全文搜索，按 Enter" />{workspaceQuery && <button title="清空" onClick={() => { setWorkspaceQuery(""); setWorkspaceMatches([]); }}>×</button>}</div>
+          {workspaceMatches.length > 0 && <div className="search-results">{workspaceMatches.map((match, index) => <button key={`${match.path}:${match.line}:${index}`} title={match.text} onClick={() => void openWorkspaceFile(match.path, match.line)}><strong>{match.path}:{match.line}</strong><span>{match.text}</span></button>)}</div>}
+          <div className="file-tree">{workspaceMatches.length === 0 && visibleWorkspaceFiles.map((entry) => <button key={entry.path} title={entry.path} style={{ paddingLeft: `${8 + entry.depth * 13}px` }} className={activeFile === entry.path ? "active" : ""} onClick={() => {
+            if (entry.isDir) setCollapsedDirs((items) => {
+              const next = new Set(items);
+              if (next.has(entry.path)) next.delete(entry.path); else next.add(entry.path);
+              return next;
+            });
+            else void openWorkspaceFile(entry.path);
+          }}>{entry.isDir ? collapsedDirs.has(entry.path) ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="tree-spacer" />} {entry.isDir ? collapsedDirs.has(entry.path) ? <Folder size={14} /> : <FolderOpen size={14} /> : <File size={14} />}<span>{entry.name}</span></button>)}</div>
           <button className="settings-button" onClick={() => { setDraft(settings); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
         </> : <>
         <button className="new-chat" onClick={() => void newSession()}><Plus size={16} /> 新对话</button>
@@ -493,15 +615,15 @@ function App() {
         </div></div>
       </main> : <main className="code-main">
         <header>
-          <div className="title-row">{!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}<div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{fileContent !== savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
-          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeFile || fileContent === savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => invoke<string>("workspace_git_diff").then(setDiffText)}><FileDiff size={15} /> 查看改动</button></div>
+          <div className="title-row">{!sidebarOpen && <button title="展开侧栏" className="icon-button" onClick={() => setSidebarOpen(true)}><PanelLeftOpen size={17} /></button>}<div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{activeDocument && activeDocument.content !== activeDocument.savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
+          <div className="header-actions"><button className="pill" onClick={() => void requestCompletion()} disabled={!activeFile}><Sparkles size={15} /> AI 补全</button><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => invoke<string>("workspace_git_diff").then(setDiffText)}><FileDiff size={15} /> 查看改动</button></div>
         </header>
         {codeStatus && <div className="code-status">{codeStatus}</div>}
-        <div className="editor-tabs">{activeFile ? <button className="active"><File size={13} />{activeFile}</button> : <span>从左侧项目树打开文件</span>}</div>
-        <div className="editor-host">{activeFile ? <Editor
+        <div className="editor-tabs">{openFiles.length ? openFiles.map((file) => <button key={file.path} className={file.path === activeFile ? "active" : ""} onClick={() => setActiveFile(file.path)}><File size={13} /><span>{file.path.split(/[\\/]/).at(-1)}</span>{file.content !== file.savedContent && <i />}<b title="关闭" onClick={(event) => { event.stopPropagation(); closeWorkspaceFile(file.path); }}>×</b></button>) : <span>从左侧项目树打开文件</span>}</div>
+        <div className="editor-host">{activeDocument ? <Editor
           path={activeFile}
-          value={fileContent}
-          onChange={(value) => setFileContent(value || "")}
+          value={activeDocument.content}
+          onChange={(value) => setOpenFiles((items) => items.map((file) => file.path === activeFile ? { ...file, content: value || "" } : file))}
           onMount={(editor) => {
             editorRef.current = editor;
             editor.focus();
