@@ -18,6 +18,7 @@ $repos = [ordered]@{
     "plandex"     = "plandex-ai/plandex"
     "codex"       = "openai/codex"
     "trae-agent"  = "bytedance/trae-agent"
+    "kun"         = "KunAgent/Kun"
 }
 
 $root = Join-Path $PSScriptRoot "repos"
@@ -31,4 +32,3 @@ foreach ($entry in $repos.GetEnumerator()) {
         git clone --depth 1 "https://github.com/$($entry.Value).git" $path
     }
 }
-

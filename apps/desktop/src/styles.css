@@ -43,6 +43,12 @@ nav button:hover, .sessions button:hover, .sessions button.active { background: 
 .sessions { display: grid; gap: 2px; overflow: auto; }
 .sessions span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sessions button { position: relative; }
+.session-row { display: grid; grid-template-columns: minmax(0, 1fr) 28px; gap: 2px; }
+.session-row > button:first-child { min-width: 0; }
+.session-row .row-action { display: grid; place-items: center; padding: 0; opacity: 0; color: #777; }
+.session-row:hover .row-action, .session-row .row-action:focus { opacity: 1; }
+.session-row .row-action:hover { color: #b33d3d; background: #f8e8e8; }
+.project-list { max-height: 150px; }
 .sessions .status { width: 6px; height: 6px; border-radius: 50%; margin-left: auto; background: #bbb; }
 .sessions .status.running { background: #3986f7; }
 .sessions .status.failed { background: #d55252; }
@@ -122,6 +128,7 @@ article p { margin: 6px 0 0; }
 .primary-inline { border: 0 !important; border-radius: 8px; background: #222 !important; color: #fff; padding: 9px 13px; }
 .settings-status { margin-top: 9px; padding: 9px 10px; border-radius: 8px; color: #267146; background: #edf8f0; font-size: 12px; }
 .settings-status.failed { color: #a33f3f; background: #fff0f0; }
+.settings-note { margin-top: 10px; padding: 9px 10px; border-radius: 8px; color: #805f23; background: #fff8e8; font-size: 11px; line-height: 1.5; }
 .approval-bar { position: fixed; z-index: 5; left: 50%; bottom: 130px; transform: translateX(-50%); width: min(700px, calc(100vw - 48px)); display: flex; align-items: center; gap: 8px; padding: 12px; border: 1px solid #d9d4c8; border-radius: 12px; background: #fffdf7; box-shadow: 0 15px 40px #0002; }
 .approval-bar div { display: grid; gap: 3px; margin-right: auto; }
 .approval-bar span { color: #777; font-size: 11px; }

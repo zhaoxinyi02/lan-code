@@ -28,6 +28,8 @@ pub use tools::{
     ReadFileTool, ReplaceTextTool, RunCommandTool, SearchTextTool, Tool, ToolContext, ToolRegistry,
 };
 
+const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
+
 struct SessionState {
     session: Session,
     messages: Vec<ModelMessage>,
@@ -46,6 +48,7 @@ pub struct AgentCore {
     active_turns: RwLock<HashMap<SessionId, CancellationToken>>,
     pending_approvals: RwLock<HashMap<Uuid, PendingApproval>>,
     events: broadcast::Sender<CoreEvent>,
+    max_provider_rounds: usize,
 }
 
 impl AgentCore {
@@ -70,7 +73,13 @@ impl AgentCore {
             active_turns: RwLock::new(HashMap::new()),
             pending_approvals: RwLock::new(HashMap::new()),
             events,
+            max_provider_rounds: DEFAULT_MAX_PROVIDER_ROUNDS,
         }
+    }
+
+    pub fn with_max_provider_rounds(mut self, max_provider_rounds: usize) -> Self {
+        self.max_provider_rounds = max_provider_rounds.clamp(4, 256);
+        self
     }
 
     pub fn with_provider(provider: Arc<dyn ModelProvider>) -> Self {
@@ -149,6 +158,21 @@ impl AgentCore {
             .values()
             .map(|state| state.session.clone())
             .collect()
+    }
+
+    pub async fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        if self.active_turns.read().await.contains_key(&session_id) {
+            bail!("cannot delete a session while a turn is running");
+        }
+        self.sessions
+            .write()
+            .await
+            .remove(&session_id)
+            .context("session not found")?;
+        if let Some(store) = &self.store {
+            store.delete_session(session_id)?;
+        }
+        Ok(())
     }
 
     pub async fn messages_for_session(&self, session_id: SessionId) -> Result<Vec<ModelMessage>> {
@@ -249,6 +273,7 @@ impl AgentCore {
                 ToolContext {
                     session_id,
                     cwd: session.cwd,
+                    allow_unsandboxed_commands: mode == ApprovalMode::FullAccess,
                 },
                 call.arguments,
             ) => output,
@@ -437,7 +462,8 @@ impl AgentCore {
             },
         );
 
-        for round in 1..=12 {
+        let mut repeated_calls = HashMap::<String, usize>::new();
+        for round in 1..=self.max_provider_rounds {
             let messages = self
                 .sessions
                 .read()
@@ -485,18 +511,39 @@ impl AgentCore {
                     session_id,
                     turn_id,
                     text,
-                    provider_rounds: round,
+                    provider_rounds: round as u32,
                 });
             }
             for call in response.tool_calls {
                 let call_id = call.id.clone();
-                let output = match self
-                    .execute_tool(session_id, call, mode, cancel.clone())
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(error) if cancel.is_cancelled() => return Err(error),
-                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                let signature = format!("{}:{}", call.name, call.arguments);
+                let repeated = repeated_calls.entry(signature).or_default();
+                *repeated += 1;
+                let output = if *repeated > 3 {
+                    let error = format!(
+                        "blocked repeated identical tool call after {} attempts; inspect the previous result and choose a different action",
+                        *repeated - 1
+                    );
+                    self.emit(
+                        session_id,
+                        CoreEvent::ToolFailed {
+                            event_id: Uuid::new_v4(),
+                            session_id,
+                            tool_call_id: call_id.clone(),
+                            tool_name: call.name,
+                            error: error.clone(),
+                        },
+                    );
+                    serde_json::json!({"error": error})
+                } else {
+                    match self
+                        .execute_tool(session_id, call, mode, cancel.clone())
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(error) if cancel.is_cancelled() => return Err(error),
+                        Err(error) => serde_json::json!({"error": error.to_string()}),
+                    }
                 };
                 self.sessions
                     .write()
@@ -514,7 +561,72 @@ impl AgentCore {
                 self.persist_session(session_id).await;
             }
         }
-        bail!("agent exceeded 12 provider rounds")
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions
+                .get_mut(&session_id)
+                .context("session not found")?
+                .messages
+                .push(ModelMessage::text(
+                    ModelRole::System,
+                    "The execution budget is exhausted. Do not call tools. Summarize what was completed, list unfinished work, and explain how the user can continue.",
+                ));
+        }
+        self.persist_session(session_id).await;
+        let messages = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .context("session not found")?
+            .messages
+            .clone();
+        let response = tokio::select! {
+            _ = cancel.cancelled() => bail!("turn interrupted"),
+            response = provider.complete(ModelRequest {
+                messages,
+                tools: Vec::new(),
+            }) => response?,
+        };
+        let text = if response.text.trim().is_empty() {
+            format!(
+                "任务已达到 {} 轮执行预算。已经完成的文件修改会保留，请检查 Git diff 后继续任务。",
+                self.max_provider_rounds
+            )
+        } else {
+            response.text.clone()
+        };
+        self.sessions
+            .write()
+            .await
+            .get_mut(&session_id)
+            .context("session not found")?
+            .messages
+            .push(response.message);
+        self.persist_session(session_id).await;
+        self.emit(
+            session_id,
+            CoreEvent::TextDelta {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                text: text.clone(),
+            },
+        );
+        self.emit(
+            session_id,
+            CoreEvent::TurnCompleted {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+            },
+        );
+        Ok(TurnResult {
+            session_id,
+            turn_id,
+            text,
+            provider_rounds: (self.max_provider_rounds + 1) as u32,
+        })
     }
 }
 
@@ -637,6 +749,35 @@ mod tests {
             .unwrap();
         assert_eq!(result.text, "done");
         assert_eq!(result.provider_rounds, 2);
+    }
+
+    #[tokio::test]
+    async fn execution_budget_forces_a_final_summary_instead_of_failing() {
+        let mut responses = VecDeque::new();
+        for index in 0..4 {
+            responses.push_back(scripted_tool_response(
+                &format!("call-{index}"),
+                "echo",
+                json!({"text": format!("step-{index}")}),
+            ));
+        }
+        responses.push_back(ModelResponse {
+            message: ModelMessage::text(ModelRole::Assistant, "已完成四个步骤，剩余工作可继续。"),
+            text: "已完成四个步骤，剩余工作可继续。".into(),
+            tool_calls: Vec::new(),
+        });
+        let core = AgentCore::with_provider(Arc::new(ScriptedProvider {
+            responses: Mutex::new(responses),
+        }))
+        .with_max_provider_rounds(4);
+        let session = core.create_session(".".into(), None).await;
+        let result = core
+            .start_turn(session.id, "执行长任务".into(), ApprovalMode::ReadOnly)
+            .await
+            .unwrap();
+        assert_eq!(result.provider_rounds, 5);
+        assert!(result.text.contains("剩余工作"));
+        assert_eq!(core.list_sessions().await[0].status, SessionStatus::Idle);
     }
 
     fn scripted_tool_response(id: &str, name: &str, arguments: serde_json::Value) -> ModelResponse {
@@ -775,6 +916,27 @@ mod tests {
             let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
             assert_eq!(core.list_sessions().await[0].id, session_id);
             assert_eq!(core.events_for_session(session_id).unwrap().len(), 1);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_removes_persisted_history_and_events() {
+        let root = std::env::temp_dir().join(format!("lan-delete-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db = root.join("lan.sqlite");
+        let session_id;
+        {
+            let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
+            let session = core.create_session(root.display().to_string(), None).await;
+            session_id = session.id;
+            core.delete_session(session_id).await.unwrap();
+            assert!(core.list_sessions().await.is_empty());
+        }
+        {
+            let core = AgentCore::with_store(SqliteStore::open(&db).unwrap()).unwrap();
+            assert!(core.list_sessions().await.is_empty());
+            assert!(core.events_for_session(session_id).unwrap().is_empty());
         }
         fs::remove_dir_all(root).unwrap();
     }

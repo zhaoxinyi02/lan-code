@@ -77,6 +77,21 @@ impl SqliteStore {
         .collect()
     }
 
+    pub fn delete_session(&self, session_id: SessionId) -> Result<()> {
+        let mut connection = self.connection.lock().expect("sqlite lock poisoned");
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM events WHERE session_id = ?1",
+            params![session_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![session_id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn append_event(&self, session_id: SessionId, event: &CoreEvent) -> Result<()> {
         self.connection
             .lock()

@@ -22,10 +22,14 @@ dependencies and no source has been copied into Lan Code.
 | `tabby` | `TabbyML/tabby` | `e8608d6d8f4016b9836a72037f72630d7e993468` |
 | `trae-agent` | `bytedance/trae-agent` | `e839e559ac61bdd0e057c375dd1dee391fee797d` |
 | `void` | `voideditor/void` | `b3166e7ef2aefbdfeb139445fdf248a561b85d4d` |
+| `kun` | `KunAgent/Kun` | `a4c91b31d4f7b777769f1dd3e1ea8d13a2c17941` |
 
 `anthropics/claude-code` is the official public repository, but it does not
 contain the full proprietary Claude Code core. Unauthorized leak mirrors are
 intentionally excluded.
 
-Run `./refresh.ps1` from this directory to update every shallow checkout.
+`KunAgent/Kun` uses the PolyForm Noncommercial License 1.0.0. It is included
+for architecture research only; its source must not be copied into a
+commercial Lan Code distribution without separate permission.
 
+Run `./refresh.ps1` from this directory to update every shallow checkout.

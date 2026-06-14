@@ -16,6 +16,7 @@ use walkdir::WalkDir;
 pub struct ToolContext {
     pub session_id: SessionId,
     pub cwd: String,
+    pub allow_unsandboxed_commands: bool,
 }
 
 #[async_trait]
@@ -489,7 +490,9 @@ impl Tool for RunCommandTool {
     }
 
     async fn execute(&self, context: ToolContext, arguments: Value) -> Result<Value> {
-        if std::env::var("LAN_ALLOW_UNSANDBOXED_COMMANDS").as_deref() != Ok("1") {
+        if !context.allow_unsandboxed_commands
+            && std::env::var("LAN_ALLOW_UNSANDBOXED_COMMANDS").as_deref() != Ok("1")
+        {
             bail!(
                 "command execution is not sandboxed; set LAN_ALLOW_UNSANDBOXED_COMMANDS=1 to explicitly accept full host-process authority"
             );
@@ -557,6 +560,7 @@ mod tests {
             ToolContext {
                 session_id: SessionId::new_v4(),
                 cwd: root.display().to_string(),
+                allow_unsandboxed_commands: false,
             },
             json!({
                 "path": "sample.txt",
@@ -584,6 +588,7 @@ mod tests {
                 ToolContext {
                     session_id: SessionId::new_v4(),
                     cwd: root.display().to_string(),
+                    allow_unsandboxed_commands: false,
                 },
                 json!({
                     "edits": [
@@ -615,6 +620,7 @@ mod tests {
                 ToolContext {
                     session_id: SessionId::new_v4(),
                     cwd: root.display().to_string(),
+                    allow_unsandboxed_commands: false,
                 },
                 json!({
                     "edits": [
@@ -639,6 +645,7 @@ mod tests {
                 ToolContext {
                     session_id: SessionId::new_v4(),
                     cwd: std::env::current_dir().unwrap().display().to_string(),
+                    allow_unsandboxed_commands: false,
                 },
                 json!({
                     "program": "rustc",
@@ -653,5 +660,25 @@ mod tests {
                 .to_string()
                 .contains("LAN_ALLOW_UNSANDBOXED_COMMANDS=1")
         );
+    }
+
+    #[tokio::test]
+    async fn run_command_accepts_explicit_full_access_context() {
+        let output = RunCommandTool
+            .execute(
+                ToolContext {
+                    session_id: SessionId::new_v4(),
+                    cwd: std::env::current_dir().unwrap().display().to_string(),
+                    allow_unsandboxed_commands: true,
+                },
+                json!({
+                    "program": "rustc",
+                    "args": ["--version"],
+                    "timeout_seconds": 10
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output["success"], true);
     }
 }

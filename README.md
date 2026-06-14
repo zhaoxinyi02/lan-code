@@ -31,6 +31,7 @@ cargo test --workspace
 
 See `docs/architecture.md` and `docs/research-analysis.zh-CN.md`.
 The concrete 0.1 release gate is documented in `docs/roadmap-0.1.md`.
+当前开发进度、已知问题和跨 Agent 交接信息见 `项目进度与交接.md`。
 
 Build a Windows release bundle with:
 
