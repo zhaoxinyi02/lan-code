@@ -2,9 +2,10 @@
 
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -17,11 +18,26 @@ use lan_protocol::{
     ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, RiskLevel, Session, SessionId,
     ToolDescriptor, TurnResult,
 };
+use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
-use tokio::{process::Command as TokioCommand, sync::RwLock};
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::RwLock;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    command
+}
+
+fn is_local_provider(provider: &str) -> bool {
+    matches!(provider, "ollama" | "lmstudio")
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,6 +146,13 @@ struct AppState {
     core: RwLock<Arc<AgentCore>>,
     settings: RwLock<DesktopSettings>,
     data_dir: RwLock<PathBuf>,
+    terminal: Mutex<Option<TerminalSession>>,
+}
+
+struct TerminalSession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn Child + Send + Sync>,
 }
 
 #[derive(Serialize)]
@@ -171,15 +194,6 @@ struct WorkspaceSearchMatch {
 struct GitChange {
     status: String,
     path: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalOutput {
-    success: bool,
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
 }
 
 #[derive(Serialize)]
@@ -408,7 +422,7 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
     fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
     let store =
         SqliteStore::open(data_dir.join("lan-code.sqlite")).map_err(|error| error.to_string())?;
-    let core = if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
+    let core = if settings.api_key.trim().is_empty() && !is_local_provider(&settings.provider) {
         AgentCore::with_store(store)
             .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
             .map_err(|error| error.to_string())?
@@ -495,7 +509,7 @@ async fn save_settings(
 
 #[tauri::command]
 async fn test_provider(settings: DesktopSettings) -> Result<ProviderTestResult, String> {
-    if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
+    if settings.api_key.trim().is_empty() && !is_local_provider(&settings.provider) {
         return Err("请先填写 API Key".into());
     }
     let api_key = if settings.api_key.trim().is_empty() {
@@ -709,7 +723,7 @@ async fn delete_workspace_entry(path: String, state: State<'_, AppState>) -> Res
 #[tauri::command]
 async fn workspace_git_diff(state: State<'_, AppState>) -> Result<String, String> {
     let settings = state.settings.read().await;
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .args(["diff", "--", "."])
         .current_dir(&settings.workspace)
         .output()
@@ -723,7 +737,7 @@ async fn workspace_git_diff(state: State<'_, AppState>) -> Result<String, String
 #[tauri::command]
 async fn workspace_git_changes(state: State<'_, AppState>) -> Result<Vec<GitChange>, String> {
     let settings = state.settings.read().await;
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .current_dir(&settings.workspace)
         .output()
@@ -750,7 +764,7 @@ async fn workspace_git_changes(state: State<'_, AppState>) -> Result<Vec<GitChan
 async fn workspace_file_diff(path: String, state: State<'_, AppState>) -> Result<String, String> {
     let settings = state.settings.read().await;
     workspace_path(&settings, &path)?;
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .args(["diff", "--no-ext-diff", "HEAD", "--", &path])
         .current_dir(&settings.workspace)
         .output()
@@ -765,7 +779,7 @@ async fn workspace_file_diff(path: String, state: State<'_, AppState>) -> Result
 async fn discard_workspace_changes(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings.read().await;
     mutable_workspace_path(&settings, &path)?;
-    let status = Command::new("git")
+    let status = hidden_command("git")
         .args(["status", "--porcelain=v1", "--", &path])
         .current_dir(&settings.workspace)
         .output()
@@ -774,7 +788,7 @@ async fn discard_workspace_changes(path: String, state: State<'_, AppState>) -> 
     if summary.starts_with("??") {
         return Err("未跟踪文件不会被自动删除，请在文件树中手动确认删除".into());
     }
-    let output = Command::new("git")
+    let output = hidden_command("git")
         .args(["restore", "--worktree", "--", &path])
         .current_dir(&settings.workspace)
         .output()
@@ -786,43 +800,99 @@ async fn discard_workspace_changes(path: String, state: State<'_, AppState>) -> 
 }
 
 #[tauri::command]
-async fn run_workspace_terminal(
-    command: String,
+async fn terminal_start(
+    cols: u16,
+    rows: u16,
+    app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<TerminalOutput, String> {
-    if command.trim().is_empty() {
-        return Err("命令不能为空".into());
-    }
-    let settings = state.settings.read().await;
+) -> Result<(), String> {
+    let settings = state.settings.read().await.clone();
     if settings.approval_mode != ApprovalMode::FullAccess {
         return Err("集成终端要求权限模式为 fullAccess".into());
     }
-    let mut process = TokioCommand::new("powershell");
-    process
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &command,
-        ])
-        .current_dir(&settings.workspace)
-        .kill_on_drop(true);
-    #[cfg(windows)]
-    process.creation_flags(0x08000000);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(120), process.output())
-        .await
-        .map_err(|_| "命令执行超过 120 秒，已终止".to_string())?
-        .map_err(|error| error.to_string())?;
-    fn bounded(bytes: &[u8]) -> String {
-        String::from_utf8_lossy(&bytes[..bytes.len().min(128 * 1024)]).into_owned()
+    let mut guard = state.terminal.lock().map_err(|error| error.to_string())?;
+    if guard.is_some() {
+        return Ok(());
     }
-    Ok(TerminalOutput {
-        success: output.status.success(),
-        exit_code: output.status.code(),
-        stdout: bounded(&output.stdout),
-        stderr: bounded(&output.stderr),
-    })
+    let pair = NativePtySystem::default()
+        .openpty(PtySize {
+            rows: rows.max(2),
+            cols: cols.max(2),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| error.to_string())?;
+    let mut command = CommandBuilder::new("powershell.exe");
+    command.args(["-NoLogo"]);
+    command.cwd(&settings.workspace);
+    command.env("TERM", "xterm-256color");
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| error.to_string())?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| error.to_string())?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| error.to_string())?;
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(size) => {
+                    let text = String::from_utf8_lossy(&buffer[..size]).into_owned();
+                    let _ = app.emit("terminal-output", text);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = app.emit("terminal-exit", ());
+    });
+    *guard = Some(TerminalSession {
+        master: pair.master,
+        writer,
+        child,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_write(data: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.terminal.lock().map_err(|error| error.to_string())?;
+    let terminal = guard.as_mut().ok_or("终端尚未启动")?;
+    terminal
+        .writer
+        .write_all(data.as_bytes())
+        .and_then(|_| terminal.writer.flush())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn terminal_resize(cols: u16, rows: u16, state: State<'_, AppState>) -> Result<(), String> {
+    let guard = state.terminal.lock().map_err(|error| error.to_string())?;
+    let terminal = guard.as_ref().ok_or("终端尚未启动")?;
+    terminal
+        .master
+        .resize(PtySize {
+            rows: rows.max(2),
+            cols: cols.max(2),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn terminal_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.terminal.lock().map_err(|error| error.to_string())?;
+    if let Some(mut terminal) = guard.take() {
+        terminal.child.kill().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -833,7 +903,7 @@ async fn inline_completion(
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let settings = state.settings.read().await.clone();
-    if settings.api_key.trim().is_empty() && settings.provider != "ollama" {
+    if settings.api_key.trim().is_empty() && !is_local_provider(&settings.provider) {
         return Err("请先配置 API Key".into());
     }
     let provider = OpenAiCompatibleProvider::new(
@@ -1164,6 +1234,7 @@ fn main() {
             core: RwLock::new(Arc::new(core)),
             settings: RwLock::new(settings),
             data_dir: RwLock::new(data_dir),
+            terminal: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -1180,7 +1251,10 @@ fn main() {
             workspace_git_changes,
             workspace_file_diff,
             discard_workspace_changes,
-            run_workspace_terminal,
+            terminal_start,
+            terminal_write,
+            terminal_resize,
+            terminal_stop,
             inline_completion,
             check_for_updates,
             download_update,

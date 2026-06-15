@@ -223,6 +223,27 @@ impl AgentCore {
         let _ = self.events.send(event);
     }
 
+    fn text_emitter(
+        &self,
+        session_id: SessionId,
+        turn_id: Uuid,
+    ) -> Arc<dyn Fn(String) + Send + Sync> {
+        let events = self.events.clone();
+        let store = self.store.clone();
+        Arc::new(move |text| {
+            let event = CoreEvent::TextDelta {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                text,
+            };
+            if let Some(store) = &store {
+                let _ = store.append_event(session_id, &event);
+            }
+            let _ = events.send(event);
+        })
+    }
+
     async fn persist_session(&self, session_id: SessionId) {
         let Some(store) = &self.store else {
             return;
@@ -496,10 +517,10 @@ impl AgentCore {
                 .clone();
             let response = tokio::select! {
                 _ = cancel.cancelled() => bail!("turn interrupted"),
-                response = provider.complete(ModelRequest {
+                response = provider.complete_stream(ModelRequest {
                     messages,
                     tools: self.list_tools(),
-                }) => response?,
+                }, self.text_emitter(session_id, turn_id)) => response?,
             };
             accumulate_usage(&mut usage, response.usage);
             {
@@ -513,15 +534,6 @@ impl AgentCore {
             self.persist_session(session_id).await;
             if response.tool_calls.is_empty() {
                 let text = response.text;
-                self.emit(
-                    session_id,
-                    CoreEvent::TextDelta {
-                        event_id: Uuid::new_v4(),
-                        session_id,
-                        turn_id,
-                        text: text.clone(),
-                    },
-                );
                 self.emit(
                     session_id,
                     CoreEvent::UsageRecorded {
@@ -617,10 +629,10 @@ impl AgentCore {
             .clone();
         let response = tokio::select! {
             _ = cancel.cancelled() => bail!("turn interrupted"),
-            response = provider.complete(ModelRequest {
+            response = provider.complete_stream(ModelRequest {
                 messages,
                 tools: Vec::new(),
-            }) => response?,
+            }, self.text_emitter(session_id, turn_id)) => response?,
         };
         accumulate_usage(&mut usage, response.usage);
         let text = if response.text.trim().is_empty() {
@@ -639,15 +651,6 @@ impl AgentCore {
             .messages
             .push(response.message);
         self.persist_session(session_id).await;
-        self.emit(
-            session_id,
-            CoreEvent::TextDelta {
-                event_id: Uuid::new_v4(),
-                session_id,
-                turn_id,
-                text: text.clone(),
-            },
-        );
         self.emit(
             session_id,
             CoreEvent::UsageRecorded {
