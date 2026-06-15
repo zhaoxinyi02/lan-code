@@ -15,12 +15,12 @@ import {
   Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, Code2, File, FileDiff, FilePlus, Folder, FolderGit2, Image,
   FolderOpen, FolderPlus, GitBranch, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
   Download, MessageSquare, RefreshCw, RotateCcw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
-  XCircle, Zap, Sun, Moon, Monitor, Check,
+  XCircle, Zap, Sun, Moon, Monitor, Check, Menu, GitCommitHorizontal, Eye, ExternalLink,
 } from "lucide-react";
 import "./styles.css";
 
 type Mode = "readOnly" | "ask" | "workspace" | "fullAccess";
-type Session = { id: string; cwd: string; title?: string; status: string };
+type Session = { id: string; cwd: string; title?: string; status: string; updatedAt: number };
 type Project = { name: string; path: string };
 type ProviderProfile = {
   id: string; name: string; provider: string; baseUrl: string; model: string; apiKey: string;
@@ -42,10 +42,12 @@ type SettingsData = {
 };
 type WorkspaceEntry = { path: string; name: string; isDir: boolean; depth: number };
 type GitChange = { status: string; path: string };
+type GitCommit = { hash: string; subject: string; author: string; relativeTime: string };
+type GitOverview = { isRepository: boolean; branch: string; additions: number; deletions: number; commits: GitCommit[] };
 type OpenFile = { path: string; content: string; savedContent: string; pinned: boolean };
 type SettingsSection = "appearance" | "model" | "capabilities" | "workspace" | "agent" | "updates";
 type ThemeMode = "system" | "light" | "dark";
-type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string };
+type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string; reasoning_content?: string };
 type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
 type CoreEvent = {
   type: string; eventId?: string; turnId?: string; toolCallId?: string; toolName?: string; error?: string; text?: string;
@@ -57,7 +59,7 @@ type ToolStep = {
   arguments?: unknown; output?: unknown; error?: string;
 };
 type Approval = { id: string; toolName: string; reason: string; arguments: unknown };
-type ChatMessage = { role: "user" | "assistant"; text: string };
+type ChatMessage = { role: "user" | "assistant"; text: string; reasoning?: string };
 type UpdateInfo = {
   currentVersion: string; latestVersion: string; available: boolean; releaseUrl: string;
   installerUrl?: string; installerName?: string; publishedAt?: string; notes?: string;
@@ -229,7 +231,18 @@ function ToolStepCard({ step }: { step: ToolStep }) {
 }
 
 function Markdown({ children }: { children: string }) {
-  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown></div>;
+  return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+    a: ({ href, children: label }) => <a href={href} target="_blank" rel="noreferrer"><ExternalLink size={11} />{label}</a>,
+  }}>{children}</ReactMarkdown></div>;
+}
+
+function MessageBody({ message, changes, overview, latest }: { message: ChatMessage; changes: GitChange[]; overview?: GitOverview; latest: boolean }) {
+  return <>{message.reasoning && <details className="reasoning-card"><summary><Eye size={13} /><span>查看分析与执行思路</span><ChevronRight size={12} /></summary><Markdown>{message.reasoning}</Markdown></details>}
+    <Markdown>{message.text}</Markdown>
+    {latest && changes.length > 0 && <details className="change-summary" open><summary><FileDiff size={13} /><strong>本次工作区改动</strong><span className="diff-add">+{overview?.additions || 0}</span><span className="diff-remove">-{overview?.deletions || 0}</span><ChevronRight size={12} /></summary>
+      <div>{changes.slice(0, 12).map((change) => <span key={`${change.status}:${change.path}`}><i className={change.status.includes("D") ? "removed" : change.status === "??" ? "added" : "modified"}>{change.status.trim() || "M"}</i><FileTypeIcon path={change.path} size={13} /><b>{change.path}</b></span>)}</div>
+    </details>}
+  </>;
 }
 
 const normalizePath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
@@ -340,7 +353,9 @@ function App() {
   const [codeStatus, setCodeStatus] = React.useState("");
   const [diffText, setDiffText] = React.useState("");
   const [gitChanges, setGitChanges] = React.useState<GitChange[]>([]);
+  const [gitOverview, setGitOverview] = React.useState<GitOverview>();
   const [selectedGitPath, setSelectedGitPath] = React.useState("");
+  const [appMenu, setAppMenu] = React.useState<"file" | "view" | "help">();
   const [terminalOpen, setTerminalOpen] = React.useState(false);
   const [terminalStarted, setTerminalStarted] = React.useState(false);
   const [inspectorOpen, setInspectorOpen] = React.useState(true);
@@ -385,7 +400,7 @@ function App() {
 
   const refreshSessions = React.useCallback(async () => {
     const rows = await invoke<Session[]>("list_sessions");
-    setSessions(rows.reverse());
+    setSessions(rows);
   }, []);
 
   React.useEffect(() => {
@@ -428,7 +443,7 @@ function App() {
       .then(([loaded, rows]) => {
         setSettings(loaded);
         setDraft(loaded);
-        setSessions(rows.reverse());
+        setSessions(rows);
         if (!loaded.apiKey && !["ollama", "lmstudio"].includes(loaded.provider)) {
           setSettingsSection("model");
           setSettingsOpen(true);
@@ -441,7 +456,19 @@ function App() {
     if (workbench !== "code" || !settings.workspace) return;
     invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles).catch((error) => setCodeStatus(String(error)));
     invoke<GitChange[]>("workspace_git_changes").then(setGitChanges).catch(() => {});
+    invoke<GitOverview>("workspace_git_overview").then(setGitOverview).catch(() => setGitOverview(undefined));
   }, [workbench, settings.workspace]);
+
+  React.useEffect(() => {
+    if (!settings.workspace) return;
+    Promise.all([
+      invoke<GitChange[]>("workspace_git_changes"),
+      invoke<GitOverview>("workspace_git_overview"),
+    ]).then(([changes, overview]) => {
+      setGitChanges(changes);
+      setGitOverview(overview);
+    }).catch(() => setGitOverview(undefined));
+  }, [activeId, busy, settings.workspace]);
 
   React.useEffect(() => {
     setOpenFiles([]);
@@ -469,8 +496,8 @@ function App() {
     if (!activeId) return;
     invoke<ModelMessage[]>("session_messages", { sessionId: activeId })
       .then((rows) => setMessages(rows
-        .filter((row) => (row.role === "user" || row.role === "assistant") && row.content)
-        .map((row) => ({ role: row.role as "user" | "assistant", text: row.content! }))))
+        .filter((row) => (row.role === "user" || row.role === "assistant") && (row.content || row.reasoning_content))
+        .map((row) => ({ role: row.role as "user" | "assistant", text: row.content || "", reasoning: row.reasoning_content }))))
       .catch((error) => setFatal(String(error)));
   }, [activeId]);
 
@@ -693,8 +720,12 @@ function App() {
   }
 
   async function refreshGitChanges() {
-    const changes = await invoke<GitChange[]>("workspace_git_changes");
+    const [changes, overview] = await Promise.all([
+      invoke<GitChange[]>("workspace_git_changes"),
+      invoke<GitOverview>("workspace_git_overview"),
+    ]);
     setGitChanges(changes);
+    setGitOverview(overview);
     if (selectedGitPath && !changes.some((change) => change.path === selectedGitPath)) {
       setSelectedGitPath("");
       setDiffText("");
@@ -946,6 +977,17 @@ function App() {
 
   return (
     <div className={`app-shell ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`} style={{ "--sidebar-width": `${sidebarWidth}px`, "--inspector-width": `${inspectorWidth}px` } as React.CSSProperties}>
+      <div className="app-menu-bar">
+        <button className="app-menu-logo" title="Lan Code"><img src="/lan-code-logo.png" alt="" /></button>
+        {(["file", "view", "help"] as const).map((menu) => <div className="app-menu-host" key={menu}>
+          <button className={appMenu === menu ? "active" : ""} onClick={() => setAppMenu(appMenu === menu ? undefined : menu)}>{menu === "file" ? "文件" : menu === "view" ? "视图" : "帮助"}</button>
+          {appMenu === menu && <div className="app-menu-popover">
+            {menu === "file" && <><button onClick={() => { setAppMenu(undefined); void newSession(); }}><MessageSquare size={14} />新建对话<kbd>Ctrl+N</kbd></button><button onClick={() => { setAppMenu(undefined); void addProject(); }}><FolderPlus size={14} />添加项目</button><i /><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={14} />设置</button></>}
+            {menu === "view" && <><button onClick={() => { setAppMenu(undefined); setWorkbench("agent"); }}><MessageSquare size={14} />Agent 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("code"); }}><Code2 size={14} />Code 工作台</button><i /><button onClick={() => { setAppMenu(undefined); setSidebarOpen((value) => !value); }}><PanelLeftOpen size={14} />切换侧栏</button><button onClick={() => { setAppMenu(undefined); setInspectorOpen((value) => !value); }}><Eye size={14} />切换观察面板</button></>}
+            {menu === "help" && <><button onClick={() => { setAppMenu(undefined); window.open("https://github.com/zhaoxinyi02/lan-code", "_blank"); }}><ExternalLink size={14} />GitHub 仓库</button><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("updates"); setSettingsOpen(true); }}><Download size={14} />检查更新</button></>}
+          </div>}
+        </div>)}
+      </div>
       {sidebarOpen && <aside className="sidebar" style={{ width: sidebarWidth }}>
         <div className="brand"><img src="/lan-code-logo.png" alt="Lan Code" /><strong>Lan Code</strong>
           <button title="收起侧栏" className="icon-button" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={17} /></button>
@@ -1044,7 +1086,7 @@ function App() {
               <button onClick={() => void createImage()}><Sparkles size={18} /> 生成图片</button>
             </div>
           </div> : <div className="messages">
-            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown>{message.text}</Markdown> : <p>{message.text}</p>}</article>)}
+            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} /> : <p>{message.text}</p>}</article>)}
             {busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={16} /> 正在分析项目并准备下一步...</div>}</article>}
           </div>}
         </section>
@@ -1115,6 +1157,11 @@ function App() {
         <div className="divider" /><h3>任务步骤</h3>
         {toolSteps.length > 0 && <div className="tool-stats"><span>{toolSteps.length} 步</span><b>{toolStepStats.completed} 完成</b>{toolStepStats.running > 0 && <i>{toolStepStats.running} 执行中</i>}{toolStepStats.failed + toolStepStats.stale > 0 && <em>{toolStepStats.failed + toolStepStats.stale} 异常</em>}</div>}
         {toolSteps.length === 0 ? <div className="empty-small">发送任务后在这里查看文件读取、搜索、修改和命令执行过程。</div> : <div className="tool-step-list">{toolSteps.map((step) => <ToolStepCard key={step.id} step={step} />)}</div>}
+        <div className="divider" /><div className="git-heading"><h3>Git 仓库</h3><button title="刷新 Git 信息" onClick={() => void refreshGitChanges()}><RefreshCw size={12} /></button></div>
+        {!gitOverview?.isRepository ? <div className="empty-small">当前项目不是 Git 仓库。</div> : <div className="git-overview">
+          <div className="git-branch-card"><GitBranch size={14} /><strong>{gitOverview.branch}</strong><span>{gitChanges.length} 个文件</span><b>+{gitOverview.additions}</b><i>-{gitOverview.deletions}</i></div>
+          <div className="git-history">{gitOverview.commits.map((commit) => <div key={commit.hash}><GitCommitHorizontal size={13} /><span><strong>{commit.subject}</strong><small>{commit.hash} · {commit.author} · {commit.relativeTime}</small></span></div>)}</div>
+        </div>}
         </>}
       </aside>}
 

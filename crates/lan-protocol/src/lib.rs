@@ -83,6 +83,8 @@ pub struct Session {
     pub cwd: String,
     pub title: Option<String>,
     pub status: SessionStatus,
+    #[serde(default)]
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

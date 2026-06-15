@@ -4,7 +4,11 @@ mod policy;
 mod store;
 mod tools;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail};
 use lan_protocol::{
@@ -30,6 +34,13 @@ pub use tools::{
 };
 
 const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
 
 struct SessionState {
     session: Session,
@@ -130,6 +141,7 @@ impl AgentCore {
             cwd,
             title,
             status: SessionStatus::Idle,
+            updated_at: unix_timestamp(),
         };
         self.sessions
             .write()
@@ -153,12 +165,15 @@ impl AgentCore {
     }
 
     pub async fn list_sessions(&self) -> Vec<Session> {
-        self.sessions
+        let mut sessions = self
+            .sessions
             .read()
             .await
             .values()
             .map(|state| state.session.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+        sessions
     }
 
     pub async fn delete_session(&self, session_id: SessionId) -> Result<()> {
@@ -181,13 +196,14 @@ impl AgentCore {
         if title.is_empty() {
             bail!("session title cannot be empty");
         }
-        self.sessions
-            .write()
-            .await
+        let mut sessions = self.sessions.write().await;
+        let session = &mut sessions
             .get_mut(&session_id)
             .context("session not found")?
-            .session
-            .title = Some(title.chars().take(80).collect());
+            .session;
+        session.title = Some(title.chars().take(80).collect());
+        session.updated_at = unix_timestamp();
+        drop(sessions);
         self.persist_session(session_id).await;
         Ok(())
     }
@@ -256,6 +272,7 @@ impl AgentCore {
     async fn set_status(&self, session_id: SessionId, status: SessionStatus) {
         if let Some(state) = self.sessions.write().await.get_mut(&session_id) {
             state.session.status = status;
+            state.session.updated_at = unix_timestamp();
         }
         self.persist_session(session_id).await;
     }
@@ -490,6 +507,7 @@ impl AgentCore {
             let mut sessions = self.sessions.write().await;
             let state = sessions.get_mut(&session_id).context("session not found")?;
             state.session.status = SessionStatus::Running;
+            state.session.updated_at = unix_timestamp();
             state
                 .messages
                 .push(ModelMessage::text(ModelRole::User, prompt));

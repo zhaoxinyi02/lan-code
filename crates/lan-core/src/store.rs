@@ -63,14 +63,24 @@ impl SqliteStore {
 
     pub fn load_sessions(&self) -> Result<Vec<(Session, Vec<ModelMessage>)>> {
         let connection = self.connection.lock().expect("sqlite lock poisoned");
-        let mut statement = connection.prepare("SELECT data, messages FROM sessions")?;
+        let mut statement =
+            connection.prepare("SELECT data, messages, updated_at FROM sessions")?;
         let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
         })?;
         rows.map(|row| {
-            let (session, messages) = row?;
+            let (session, messages, updated_at) = row?;
+            let mut session: Session =
+                serde_json::from_str(&session).context("invalid stored session")?;
+            if session.updated_at == 0 {
+                session.updated_at = updated_at;
+            }
             Ok((
-                serde_json::from_str(&session).context("invalid stored session")?,
+                session,
                 serde_json::from_str(&messages).context("invalid stored messages")?,
             ))
         })

@@ -198,6 +198,25 @@ struct GitChange {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct GitCommit {
+    hash: String,
+    subject: String,
+    author: String,
+    relative_time: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitOverview {
+    is_repository: bool,
+    branch: String,
+    additions: u64,
+    deletions: u64,
+    commits: Vec<GitCommit>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct UpdateInfo {
     current_version: String,
     latest_version: String,
@@ -761,6 +780,69 @@ async fn workspace_git_changes(state: State<'_, AppState>) -> Result<Vec<GitChan
 }
 
 #[tauri::command]
+async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOverview, String> {
+    let settings = state.settings.read().await;
+    let branch = hidden_command("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !branch.status.success() {
+        return Ok(GitOverview {
+            is_repository: false,
+            branch: String::new(),
+            additions: 0,
+            deletions: 0,
+            commits: Vec::new(),
+        });
+    }
+    let numstat = hidden_command("git")
+        .args(["diff", "--numstat", "HEAD", "--", "."])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let (additions, deletions) = String::from_utf8_lossy(&numstat.stdout).lines().fold(
+        (0, 0),
+        |(additions, deletions), line| {
+            let mut fields = line.split('\t');
+            let added = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            let removed = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            (additions + added, deletions + removed)
+        },
+    );
+    let history = hidden_command("git")
+        .args(["log", "-12", "--pretty=format:%h%x1f%s%x1f%an%x1f%ar"])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let commits = String::from_utf8_lossy(&history.stdout)
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\u{1f}').collect::<Vec<_>>();
+            (fields.len() == 4).then(|| GitCommit {
+                hash: fields[0].to_string(),
+                subject: fields[1].to_string(),
+                author: fields[2].to_string(),
+                relative_time: fields[3].to_string(),
+            })
+        })
+        .collect();
+    Ok(GitOverview {
+        is_repository: true,
+        branch: String::from_utf8_lossy(&branch.stdout).trim().to_string(),
+        additions,
+        deletions,
+        commits,
+    })
+}
+
+#[tauri::command]
 async fn workspace_file_diff(path: String, state: State<'_, AppState>) -> Result<String, String> {
     let settings = state.settings.read().await;
     workspace_path(&settings, &path)?;
@@ -1249,6 +1331,7 @@ fn main() {
             delete_workspace_entry,
             workspace_git_diff,
             workspace_git_changes,
+            workspace_git_overview,
             workspace_file_diff,
             discard_workspace_changes,
             terminal_start,
