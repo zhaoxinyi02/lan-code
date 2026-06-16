@@ -26,7 +26,7 @@ type Session = { id: string; cwd: string; title?: string; status: string; update
 type Project = { name: string; path: string };
 type ProviderProfile = {
   id: string; name: string; enabled: boolean; provider: string; baseUrl: string; model: string; apiKey: string;
-  inputPricePerMillion: number; outputPricePerMillion: number;
+  inputPricePerMillion: number; outputPricePerMillion: number; contextWindow: number; maxOutputTokens: number;
 };
 type ModelCapabilities = {
   imageInput: boolean; imageOutput: boolean; audioInput: boolean; audioOutput: boolean; toolCalling: boolean;
@@ -45,7 +45,10 @@ type SettingsData = {
 type WorkspaceEntry = { path: string; name: string; isDir: boolean; depth: number };
 type GitChange = { status: string; path: string };
 type GitCommit = { hash: string; subject: string; author: string; relativeTime: string };
-type GitOverview = { isRepository: boolean; branch: string; additions: number; deletions: number; commits: GitCommit[] };
+type GitOverview = {
+  isRepository: boolean; branch: string; additions: number; deletions: number;
+  changedFiles: number; stagedFiles: number; unstagedFiles: number; untrackedFiles: number; commits: GitCommit[];
+};
 type OpenFile = { path: string; content: string; savedContent: string; pinned: boolean };
 type SettingsSection = "appearance" | "model" | "capabilities" | "workspace" | "agent" | "updates";
 type ThemeMode = "system" | "light" | "dark";
@@ -68,6 +71,10 @@ type UpdateInfo = {
 };
 type FileContextMenu = { x: number; y: number; path: string; isDir: boolean };
 type AppDialog = { kind: "confirm" | "input"; title: string; message: string; value?: string; danger?: boolean };
+type TerminalKind = "powershell" | "cmd" | "wsl";
+type TerminalTab = { id: string; title: string; shell: TerminalKind };
+type TerminalPayload = { id: string; data: string };
+type ContextMeterProps = { used: number; limit: number; compact?: boolean };
 
 const DEFAULT_SETTINGS: SettingsData = {
   provider: "deepseek",
@@ -89,7 +96,16 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.3";
+const CURRENT_VERSION = "0.2.4";
+const DEFAULT_UPDATE_INFO: UpdateInfo = {
+  currentVersion: CURRENT_VERSION,
+  latestVersion: "",
+  available: false,
+  releaseUrl: "",
+};
+
+const DEFAULT_CONTEXT_WINDOW = 128_000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
 
 const PROVIDERS = [
   { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", inputPrice: 0.27, outputPrice: 1.10 },
@@ -126,6 +142,15 @@ const PROVIDERS = [
 const APPROVAL_MODES: { id: Mode; label: string }[] = [
   { id: "readOnly", label: "只读" }, { id: "ask", label: "每次询问" },
   { id: "workspace", label: "工作区写入" }, { id: "fullAccess", label: "完全访问" },
+];
+
+const TASK_TEMPLATES = [
+  { id: "understand", title: "理解项目", description: "梳理目录、架构、启动方式和风险点", prompt: "阅读当前项目并解释架构、技术栈、启动方式和关键风险点。", icon: Bot },
+  { id: "review", title: "审阅改动", description: "检查 Git diff，给出风险和修复建议", prompt: "检查当前 Git diff，指出潜在 bug、风险、遗漏测试，并给出修复建议。", icon: FileDiff },
+  { id: "fix-tests", title: "修复测试", description: "运行测试，定位失败并修复", prompt: "运行项目测试，定位失败原因并修复，最后重新验证。", icon: CheckCircle2 },
+  { id: "implement", title: "实现功能", description: "按软件工程方式拆解、修改、验证", prompt: "根据我的需求实现功能。请先理解现有代码结构，再小步修改并运行必要检查。", icon: Code2 },
+  { id: "cleanup", title: "整理代码", description: "消除重复、改善命名和边界", prompt: "审查当前项目中可以安全整理的代码，消除明显重复、改善命名和模块边界，并保持行为不变。", icon: Sparkles },
+  { id: "release", title: "发布检查", description: "构建、版本、文档和交付物检查", prompt: "做一次发布前检查：构建、测试、版本号、文档、安装包和 Git 状态都确认一遍。", icon: Download },
 ];
 
 type IconDefinition = { iconPath?: string };
@@ -165,6 +190,26 @@ function resolveMaterialIcon(path: string, light: boolean): string {
 
 function FileTypeIcon({ path, size = 16, light = false }: { path: string; size?: number; light?: boolean }) {
   return <img className="material-file-icon" src={resolveMaterialIcon(path, light)} width={size} height={size} alt="" />;
+}
+
+function gitStatusLabel(status: string): string {
+  const value = status.trim();
+  if (value === "??") return "新增";
+  if (value.includes("D")) return "删除";
+  if (value.includes("R")) return "重命名";
+  if (value.includes("A")) return "新增";
+  if (value.includes("M")) return "修改";
+  return value || "修改";
+}
+
+function ContextMeter({ used, limit, compact = false }: ContextMeterProps) {
+  const safeLimit = Math.max(1, limit || DEFAULT_CONTEXT_WINDOW);
+  const percent = Math.min(100, Math.round((used / safeLimit) * 100));
+  const title = `上下文 ${used.toLocaleString()} / ${safeLimit.toLocaleString()} Token（${percent}%）`;
+  return <div className={`context-meter ${compact ? "compact" : ""}`} title={title} style={{ "--context-percent": `${percent}%` } as React.CSSProperties}>
+    <svg viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="15.5" pathLength="100" /><circle cx="18" cy="18" r="15.5" pathLength="100" /></svg>
+    {!compact && <span>{percent}%</span>}
+  </div>;
 }
 
 function Dropdown<T extends string>({ value, options, icon, title, onChange, upward = false }: {
@@ -293,7 +338,7 @@ function MessageBody({ message, changes, overview, latest }: { message: ChatMess
   return <>{message.reasoning && <details className="reasoning-card"><summary><span>已处理</span><ChevronRight size={12} /></summary><Markdown>{message.reasoning}</Markdown></details>}
     <Markdown>{message.text}</Markdown>
     {latest && changes.length > 0 && <details className="change-summary" open><summary><FileDiff size={13} /><strong>本次工作区改动</strong><span className="diff-add">+{overview?.additions || 0}</span><span className="diff-remove">-{overview?.deletions || 0}</span><ChevronRight size={12} /></summary>
-      <div>{changes.slice(0, 12).map((change) => <span key={`${change.status}:${change.path}`}><i className={change.status.includes("D") ? "removed" : change.status === "??" ? "added" : "modified"}>{change.status.trim() || "M"}</i><FileTypeIcon path={change.path} size={13} /><b>{change.path}</b></span>)}</div>
+      <div>{changes.slice(0, 12).map((change) => <span key={`${change.status}:${change.path}`}><i className={change.status.includes("D") ? "removed" : change.status === "??" ? "added" : "modified"}>{gitStatusLabel(change.status)}</i><FileTypeIcon path={change.path} size={13} /><b>{change.path}</b></span>)}</div>
     </details>}
   </>;
 }
@@ -331,7 +376,7 @@ const storedSize = (key: string, fallback: number) => {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 };
 
-function IntegratedTerminal({ workspace, visible, dark, onClose }: { workspace: string; visible: boolean; dark: boolean; onClose: () => void }) {
+function TerminalPane({ tab, workspace, visible, dark }: { tab: TerminalTab; workspace: string; visible: boolean; dark: boolean }) {
   const host = React.useRef<HTMLDivElement>(null);
   const terminal = React.useRef<Terminal | null>(null);
   const fit = React.useRef<FitAddon | null>(null);
@@ -341,31 +386,33 @@ function IntegratedTerminal({ workspace, visible, dark, onClose }: { workspace: 
     if (!instance) return;
     fit.current?.fit();
     try {
-      await invoke("terminal_start", { cols: instance.cols, rows: instance.rows });
+      await invoke("terminal_start", { id: tab.id, shell: tab.shell, cols: instance.cols, rows: instance.rows });
       instance.focus();
     } catch (error) {
       instance.writeln(`\r\n\x1b[31m${String(error)}\x1b[0m`);
     }
-  }, []);
+  }, [tab.id, tab.shell]);
 
   React.useEffect(() => {
     if (!host.current) return;
     const instance = new Terminal({
-      cursorBlink: true, convertEol: true, fontFamily: "Cascadia Mono, Consolas, monospace", fontSize: 12,
-      scrollback: 10000, theme: { background: "#17191c", foreground: "#d9dce1", cursor: "#d9dce1", selectionBackground: "#4d78a866" },
+      cursorBlink: true, convertEol: true, fontFamily: "Cascadia Code, Cascadia Mono, JetBrains Mono, Consolas, monospace", fontSize: 12,
+      scrollback: 10000, theme: dark
+        ? { background: "#17191c", foreground: "#d9dce1", cursor: "#d9dce1", selectionBackground: "#4d78a866" }
+        : { background: "#fbfcfd", foreground: "#243142", cursor: "#243142", selectionBackground: "#6aa6e833" },
     });
     const fitAddon = new FitAddon();
     terminal.current = instance;
     fit.current = fitAddon;
     instance.loadAddon(fitAddon);
     instance.open(host.current);
-    const data = instance.onData((value) => { void invoke("terminal_write", { data: value }); });
-    const resize = instance.onResize((size) => { void invoke("terminal_resize", size).catch(() => {}); });
+    const data = instance.onData((value) => { void invoke("terminal_write", { id: tab.id, data: value }); });
+    const resize = instance.onResize((size) => { void invoke("terminal_resize", { id: tab.id, ...size }).catch(() => {}); });
     let stopOutput = () => {};
     let stopExit = () => {};
     void Promise.all([
-      listen<string>("terminal-output", (event) => instance.write(event.payload)),
-      listen("terminal-exit", () => instance.writeln("\r\n\x1b[90m[终端进程已退出]\x1b[0m")),
+      listen<TerminalPayload>("terminal-output", (event) => { if (event.payload.id === tab.id) instance.write(event.payload.data); }),
+      listen<TerminalPayload>("terminal-exit", (event) => { if (event.payload.id === tab.id) instance.writeln("\r\n\x1b[90m[终端进程已退出]\x1b[0m"); }),
     ]).then(([output, exit]) => { stopOutput = output; stopExit = exit; return start(); });
     const observer = new ResizeObserver(() => requestAnimationFrame(() => fitAddon.fit()));
     observer.observe(host.current);
@@ -373,7 +420,7 @@ function IntegratedTerminal({ workspace, visible, dark, onClose }: { workspace: 
       observer.disconnect(); stopOutput(); stopExit(); data.dispose(); resize.dispose(); instance.dispose();
       terminal.current = null; fit.current = null;
     };
-  }, [start]);
+  }, [dark, start, tab.id]);
 
   React.useEffect(() => {
     if (visible) requestAnimationFrame(() => { fit.current?.fit(); terminal.current?.focus(); });
@@ -383,16 +430,46 @@ function IntegratedTerminal({ workspace, visible, dark, onClose }: { workspace: 
     if (!terminal.current) return;
     terminal.current.options.theme = dark
       ? { background: "#17191c", foreground: "#d9dce1", cursor: "#d9dce1", selectionBackground: "#4d78a866" }
-      : { background: "#f7f7f5", foreground: "#282b30", cursor: "#282b30", selectionBackground: "#3979b933" };
+      : { background: "#fbfcfd", foreground: "#243142", cursor: "#243142", selectionBackground: "#6aa6e833" };
   }, [dark]);
 
-  async function restart() {
-    terminal.current?.clear();
-    await invoke("terminal_stop").catch(() => {});
-    await start();
+  return <div className={`terminal-pane ${visible ? "active" : ""}`} data-workspace={workspace} ref={host} />;
+}
+
+function IntegratedTerminal({ workspace, visible, dark, onClose }: { workspace: string; visible: boolean; dark: boolean; onClose: () => void }) {
+  const [tabs, setTabs] = React.useState<TerminalTab[]>(() => [{ id: crypto.randomUUID(), title: "PowerShell", shell: "powershell" }]);
+  const [activeId, setActiveId] = React.useState(() => tabs[0].id);
+  const [pickerOpen, setPickerOpen] = React.useState(false);
+
+  React.useEffect(() => {
+    if (visible && tabs.length === 0) addTerminal("powershell");
+  }, [visible, tabs.length]);
+
+  function addTerminal(shell: TerminalKind) {
+    const title = shell === "cmd" ? "CMD" : shell === "wsl" ? "WSL" : "PowerShell";
+    const tab = { id: crypto.randomUUID(), title, shell };
+    setTabs((items) => [...items, tab]);
+    setActiveId(tab.id);
+    setPickerOpen(false);
   }
 
-  return <section className={`terminal-panel ${visible ? "" : "terminal-hidden"}`}><div className="terminal-title"><strong>PowerShell · {workspace}</strong><button onClick={() => terminal.current?.clear()}>清空</button><button onClick={() => void restart()}>重启</button><button title="隐藏终端" onClick={onClose}>×</button></div><div className="terminal-host" ref={host} /></section>;
+  async function closeTerminal(id: string) {
+    await invoke("terminal_stop_one", { id }).catch(() => {});
+    setTabs((items) => {
+      const next = items.filter((item) => item.id !== id);
+      if (!next.length) {
+        onClose();
+        return next;
+      }
+      if (activeId === id) setActiveId(next.at(-1)!.id);
+      return next;
+    });
+  }
+
+  return <section className={`terminal-panel ${visible ? "" : "terminal-hidden"}`}>
+    <div className="terminal-title"><strong>终端 · {workspace}</strong><div className="terminal-tabs">{tabs.map((tab) => <button key={tab.id} className={tab.id === activeId ? "active" : ""} onClick={() => setActiveId(tab.id)}>{tab.title}<span onClick={(event) => { event.stopPropagation(); void closeTerminal(tab.id); }}>×</span></button>)}</div><div className="terminal-add"><button onClick={() => setPickerOpen((value) => !value)}>新建</button>{pickerOpen && <div><button onClick={() => addTerminal("powershell")}>PowerShell</button><button onClick={() => addTerminal("cmd")}>CMD</button><button onClick={() => addTerminal("wsl")}>WSL</button></div>}</div><button title="隐藏终端" onClick={onClose}>×</button></div>
+    <div className="terminal-host">{tabs.map((tab) => <TerminalPane key={tab.id} tab={tab} workspace={workspace} visible={visible && tab.id === activeId} dark={dark} />)}</div>
+  </section>;
 }
 
 function App() {
@@ -418,7 +495,7 @@ function App() {
   const [query, setQuery] = React.useState("");
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
   const [fatal, setFatal] = React.useState("");
-  const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo>();
+  const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo>(DEFAULT_UPDATE_INFO);
   const [updateStatus, setUpdateStatus] = React.useState("");
   const [downloadedUpdate, setDownloadedUpdate] = React.useState("");
   const [workbench, setWorkbench] = React.useState<"agent" | "code">("agent");
@@ -435,6 +512,7 @@ function App() {
   const [appMenu, setAppMenu] = React.useState<"file" | "edit" | "view" | "help">();
   const [terminalOpen, setTerminalOpen] = React.useState(false);
   const [terminalStarted, setTerminalStarted] = React.useState(false);
+  const [completionEnabled, setCompletionEnabled] = React.useState(() => localStorage.getItem("lan-code-completion-enabled") !== "false");
   const [inspectorOpen, setInspectorOpen] = React.useState(true);
   const [sidebarWidth, setSidebarWidth] = React.useState(() => storedSize("lan-code-sidebar-width", 238));
   const [inspectorWidth, setInspectorWidth] = React.useState(() => storedSize("lan-code-inspector-width", 252));
@@ -443,14 +521,17 @@ function App() {
   const [fileContextMenu, setFileContextMenu] = React.useState<FileContextMenu>();
   const [appDialog, setAppDialog] = React.useState<AppDialog>();
   const [dialogValue, setDialogValue] = React.useState("");
+  const [paletteOpen, setPaletteOpen] = React.useState(false);
   const dialogResolver = React.useRef<((value: string | boolean | undefined) => void) | undefined>(undefined);
   const editorRef = React.useRef<Parameters<OnMount>[0] | null>(null);
   const completionTimer = React.useRef<number | undefined>(undefined);
   const completionDisposable = React.useRef<monaco.IDisposable | null>(null);
+  const completionEnabledRef = React.useRef(completionEnabled);
   const conversationRef = React.useRef<HTMLElement | null>(null);
   const activeDocument = openFiles.find((file) => file.path === activeFile);
   const providerReady = Boolean(settings.apiKey) || ["ollama", "lmstudio"].includes(settings.provider);
   const darkTheme = themeMode === "dark" || (themeMode === "system" && systemDark);
+  const workingTreeDirty = Boolean(gitOverview?.isRepository && gitOverview.changedFiles > 0);
 
   function resolveDialog(value: string | boolean | undefined) {
     dialogResolver.current?.(value);
@@ -469,6 +550,13 @@ function App() {
     return new Promise<string | undefined>((resolve) => { dialogResolver.current = resolve as (value: string | boolean | undefined) => void; });
   }
 
+  function chooseTaskTemplate(template: (typeof TASK_TEMPLATES)[number]) {
+    setPrompt(template.prompt);
+    setPaletteOpen(false);
+    setWorkbench("agent");
+    requestAnimationFrame(() => conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight, behavior: "smooth" }));
+  }
+
   function startResize(panel: "sidebar" | "inspector" | "activity", event: React.PointerEvent) {
     event.preventDefault();
     const startX = event.clientX;
@@ -476,7 +564,7 @@ function App() {
     const startSize = panel === "sidebar" ? sidebarWidth : panel === "inspector" ? inspectorWidth : activityHeight;
     const move = (pointer: PointerEvent) => {
       if (panel === "activity") {
-        setActivityHeight(Math.min(480, Math.max(150, startSize + startY - pointer.clientY)));
+        setActivityHeight(Math.min(420, Math.max(120, startSize + pointer.clientY - startY)));
         return;
       }
       const delta = pointer.clientX - startX;
@@ -520,11 +608,31 @@ function App() {
   }, [sidebarWidth, inspectorWidth, activityHeight]);
 
   React.useEffect(() => {
+    localStorage.setItem("lan-code-completion-enabled", String(completionEnabled));
+    completionEnabledRef.current = completionEnabled;
+  }, [completionEnabled]);
+
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((value) => !value);
+      }
+      if (event.key === "Escape") setPaletteOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  React.useEffect(() => {
     const disableWebviewMenu = (event: MouseEvent) => {
       event.preventDefault();
       if (!(event.target as HTMLElement).closest(".file-tree")) setFileContextMenu(undefined);
     };
-    const closeMenu = () => setFileContextMenu(undefined);
+    const closeMenu = (event?: Event) => {
+      setFileContextMenu(undefined);
+      if (event && !(event.target as HTMLElement).closest(".app-menu-host")) setAppMenu(undefined);
+    };
     window.addEventListener("contextmenu", disableWebviewMenu);
     window.addEventListener("pointerdown", closeMenu);
     window.addEventListener("blur", closeMenu);
@@ -542,10 +650,16 @@ function App() {
           id: crypto.randomUUID(), name: PROVIDERS.find((item) => item.id === loaded.provider)?.name || loaded.provider,
           enabled: true, provider: loaded.provider, baseUrl: loaded.baseUrl, model: loaded.model, apiKey: loaded.apiKey,
           inputPricePerMillion: loaded.inputPricePerMillion, outputPricePerMillion: loaded.outputPricePerMillion,
+          contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
         };
-        const profiles = loaded.providerProfiles.some((profile) => profile.provider === loaded.provider && profile.baseUrl === loaded.baseUrl && profile.model === loaded.model)
-          ? loaded.providerProfiles
-          : [currentProfile, ...loaded.providerProfiles];
+        const hydratedProfiles = loaded.providerProfiles.map((profile) => ({
+          ...profile,
+          contextWindow: profile.contextWindow || DEFAULT_CONTEXT_WINDOW,
+          maxOutputTokens: profile.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
+        }));
+        const profiles = hydratedProfiles.some((profile) => profile.provider === loaded.provider && profile.baseUrl === loaded.baseUrl && profile.model === loaded.model)
+          ? hydratedProfiles
+          : [currentProfile, ...hydratedProfiles];
         const normalized = { ...loaded, providerProfiles: profiles };
         setSettings(normalized);
         setDraft(normalized);
@@ -556,6 +670,10 @@ function App() {
         }
       })
       .catch((error) => setFatal(String(error)));
+  }, []);
+
+  React.useEffect(() => {
+    void checkUpdates(true);
   }, []);
 
   React.useEffect(() => {
@@ -720,6 +838,7 @@ function App() {
     const profile: ProviderProfile = {
       id: crypto.randomUUID(), name: preset.name, enabled: true, provider: preset.id, baseUrl: preset.baseUrl, model: preset.model,
       apiKey: "", inputPricePerMillion: preset.inputPrice || 0, outputPricePerMillion: preset.outputPrice || 0,
+      contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
     };
     setDraft({ ...draft, providerProfiles: [...draft.providerProfiles, profile] });
   }
@@ -953,14 +1072,14 @@ function App() {
     }
   }
 
-  async function checkUpdates() {
-    setUpdateStatus("正在检查 GitHub Release...");
+  async function checkUpdates(silent = false) {
+    if (!silent) setUpdateStatus("正在检查 GitHub Release...");
     try {
       const info = await invoke<UpdateInfo>("check_for_updates");
       setUpdateInfo(info);
       setUpdateStatus(info.available ? `发现新版本 v${info.latestVersion}` : `当前已是最新版本 v${info.currentVersion}`);
     } catch (error) {
-      setUpdateStatus(`检查失败：${String(error)}`);
+      setUpdateStatus(silent ? "自动检查更新失败，可稍后手动重试。" : `检查失败：${String(error)}`);
     }
   }
 
@@ -1121,6 +1240,11 @@ function App() {
     + usage.outputTokens / 1_000_000 * settings.outputPricePerMillion;
   const enabledProfiles = settings.providerProfiles.filter((profile) => profile.enabled !== false);
   const activeProfileId = enabledProfiles.find((profile) => profile.provider === settings.provider && profile.baseUrl === settings.baseUrl && profile.model === settings.model)?.id || "__current";
+  const activeProfile = enabledProfiles.find((profile) => profile.id === activeProfileId);
+  const currentContextWindow = activeProfile?.contextWindow || DEFAULT_CONTEXT_WINDOW;
+  const currentProject = settings.projects.find((project) => project.path === settings.workspace)
+    || (settings.workspace ? { name: settings.workspace.split(/[\\/]/).filter(Boolean).at(-1) || "当前项目", path: settings.workspace } : undefined);
+  const currentProjectSessions = sessions.filter((session) => currentProject && normalizePath(session.cwd) === normalizePath(currentProject.path));
   const modelOptions = [
     ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型", provider: settings.provider, model: settings.model, meta: "当前配置" }] : []),
     ...enabledProfiles.map((profile) => ({ id: profile.id, label: `${profile.name} · ${profile.model || "未选择模型"}`, provider: profile.name, model: profile.model || "未选择模型", meta: profile.baseUrl.replace(/^https?:\/\//, "") })),
@@ -1133,7 +1257,7 @@ function App() {
   const projectSessions = (project: Project) => filtered.filter((session) => normalizePath(session.cwd) === normalizePath(project.path));
   const orphanSessions = filtered.filter((session) => !settings.projects.some((project) => normalizePath(session.cwd) === normalizePath(project.path)));
   const archivedProjects: Project[] = [];
-  const updatePublishedAt = updateInfo?.publishedAt ? new Date(updateInfo.publishedAt).toLocaleString() : "检查后显示";
+  const updatePublishedAt = updateInfo?.publishedAt ? new Date(updateInfo.publishedAt).toLocaleString() : "自动检查中";
   const renderSession = (session: Session) => (
     <div className="session-row nested-session" key={session.id}>
       <button title="双击可重命名" className={session.id === activeId ? "active" : ""} onClick={() => setActiveId(session.id)} onDoubleClick={() => void renameSession(session)}>
@@ -1155,7 +1279,7 @@ function App() {
             <button className={appMenu === menu ? "active" : ""} onClick={() => setAppMenu(appMenu === menu ? undefined : menu)}>{menu === "file" ? "文件" : menu === "edit" ? "编辑" : menu === "view" ? "视图" : "帮助"}</button>
             {appMenu === menu && <div className="app-menu-popover">
               {menu === "file" && <><button onClick={() => { setAppMenu(undefined); void newSession(); }}><MessageSquare size={14} />新建对话<kbd>Ctrl+N</kbd></button><button onClick={() => { setAppMenu(undefined); void addProject(); }}><FolderPlus size={14} />添加项目</button><i /><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={14} />设置</button></>}
-              {menu === "edit" && <><button disabled={!activeFile} onClick={() => { setAppMenu(undefined); void saveWorkspaceFile(); }}><Save size={14} />保存文件<kbd>Ctrl+S</kbd></button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(false); }}><FilePlus size={14} />新建文件</button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(true); }}><FolderPlus size={14} />新建文件夹</button></>}
+              {menu === "edit" && <><button onClick={() => { setAppMenu(undefined); setPaletteOpen(true); }}><Sparkles size={14} />快速任务<kbd>Ctrl+K</kbd></button><i /><button disabled={!activeFile} onClick={() => { setAppMenu(undefined); void saveWorkspaceFile(); }}><Save size={14} />保存文件<kbd>Ctrl+S</kbd></button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(false); }}><FilePlus size={14} />新建文件</button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(true); }}><FolderPlus size={14} />新建文件夹</button></>}
               {menu === "view" && <><button onClick={() => { setAppMenu(undefined); setWorkbench("agent"); }}><MessageSquare size={14} />Agent 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("code"); }}><Code2 size={14} />Code 工作台</button><i /><button onClick={() => { setAppMenu(undefined); setSidebarOpen((value) => !value); }}><PanelLeftOpen size={14} />切换侧栏</button><button onClick={() => { setAppMenu(undefined); setInspectorOpen((value) => !value); }}><Eye size={14} />切换观察面板</button></>}
               {menu === "help" && <><button onClick={() => { setAppMenu(undefined); window.open("https://github.com/zhaoxinyi02/lan-code", "_blank"); }}><ExternalLink size={14} />GitHub 仓库</button><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("updates"); setSettingsOpen(true); }}><Download size={14} />检查更新</button></>}
             </div>}
@@ -1168,7 +1292,7 @@ function App() {
           <button title="关闭" className="window-close" onClick={() => void appWindow.close().catch(() => undefined)}><X size={15} /></button>
         </div>
       </div>
-      {sidebarOpen && <aside className="sidebar" style={{ width: sidebarWidth }}>
+      <aside className={`sidebar ${sidebarOpen ? "" : "collapsed"}`} style={{ width: sidebarWidth }}>
         <div className="brand"><img src="/lan-code-logo.png" alt="Lan Code" /><strong>Lan Code</strong>
         </div>
         <div className="mode-switch"><button className={workbench === "agent" ? "active" : ""} onClick={() => setWorkbench("agent")}><MessageSquare size={14} /> Agent</button><button className={workbench === "code" ? "active" : ""} onClick={() => setWorkbench("code")}><Code2 size={14} /> Code</button></div>
@@ -1181,11 +1305,11 @@ function App() {
             <button title="新建文件夹" onClick={() => void createWorkspaceEntry(true)}><FolderPlus size={13} /></button>
             <button title="刷新" onClick={() => void refreshWorkspaceFiles()}><RefreshCw size={13} /></button>
           </div></div>
-          <div className="project-tree">{settings.projects.map((project) => <div className="project-group" key={project.path}>
-            <button className={`project-heading ${project.path === settings.workspace ? "active" : ""}`} title={project.path} onClick={() => { if (project.path !== settings.workspace) void selectProject(project); else toggleProject(project); }}>
-              {collapsedProjects.has(project.path) ? <ChevronRight size={14} /> : <ChevronDown size={14} />}<FolderGit2 size={14} /><span>{project.name}</span>
+          <div className="project-tree">{currentProject && <div className="project-group" key={currentProject.path}>
+            <button className="project-heading active" title={currentProject.path} onClick={() => toggleProject(currentProject)}>
+              {collapsedProjects.has(currentProject.path) ? <ChevronRight size={14} /> : <ChevronDown size={14} />}<FolderGit2 size={14} /><span>{currentProject.name}</span>
             </button>
-            {project.path === settings.workspace && !collapsedProjects.has(project.path) && <>
+            {!collapsedProjects.has(currentProject.path) && <>
               <div className="file-tree">{visibleWorkspaceFiles.map((entry) => <button key={entry.path} title={entry.path} style={{ paddingLeft: `${16 + entry.depth * 11}px` }} className={activeFile === entry.path ? "active" : ""} onContextMenu={(event) => {
             event.preventDefault();
             event.stopPropagation();
@@ -1198,16 +1322,16 @@ function App() {
               return next;
             });
             else void openWorkspaceFile(entry.path);
-          }} onDoubleClick={() => { if (!entry.isDir) void openWorkspaceFile(entry.path, undefined, true); }}>{entry.isDir ? collapsedDirs.has(entry.path) ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="tree-spacer" />} {entry.isDir ? collapsedDirs.has(entry.path) ? <Folder size={14} /> : <FolderOpen size={14} /> : <FileTypeIcon path={entry.path} light={!darkTheme} />}<span>{entry.name}</span></button>)}</div>
+          }} onDoubleClick={() => { if (!entry.isDir) void openWorkspaceFile(entry.path, undefined, true); }}>{entry.isDir ? collapsedDirs.has(entry.path) ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="tree-spacer" />} {entry.isDir ? collapsedDirs.has(entry.path) ? <Folder size={14} /> : <FolderOpen size={14} /> : <FileTypeIcon path={entry.path} />}<span>{entry.name}</span></button>)}</div>
             </>}
-          </div>)}</div>
-          <div className="horizontal-resizer" title="拖动调整区域高度，双击恢复默认" onPointerDown={(event) => startResize("activity", event)} onDoubleClick={() => setActivityHeight(260)} />
-          <div className="code-left-panels" style={{ height: activityHeight }}>
-            <section><div className="git-heading"><h3>Agent 执行过程</h3></div>
+          </div>}</div>
+          <div className="code-left-panels" style={{ "--activity-height": `${activityHeight}px` } as React.CSSProperties}>
+            <section className="code-agent-panel"><div className="git-heading"><h3>Agent 执行过程</h3></div>
               <div className="code-tool-timeline">{groupedToolSteps.length === 0 ? <div className="empty-small">工具调用会显示在这里。</div> : groupedToolSteps.slice(0, 6).map((step) => <ToolStepCard key={step.id} step={step} />)}</div>
             </section>
-            <section><div className="git-heading"><h3>Git 改动</h3><button title="刷新" onClick={() => void refreshGitChanges()}><RefreshCw size={12} /></button></div>
-              <div className="git-changes">{gitChanges.length === 0 ? <div className="empty-small">暂无已加载改动。</div> : gitChanges.map((change) => <div className={selectedGitPath === change.path ? "active" : ""} key={`${change.status}:${change.path}`}><button title={change.path} onClick={() => void openGitChange(change.path)}><i>{change.status}</i><span>{change.path}</span></button><button title="撤销未暂存改动" disabled={change.status === "??"} onClick={() => void discardGitChange(change)}><RotateCcw size={11} /></button></div>)}</div>
+            <div className="horizontal-resizer inline" title="拖动调整 Agent / Git 区域高度，双击恢复默认" onPointerDown={(event) => startResize("activity", event)} onDoubleClick={() => setActivityHeight(220)} />
+            <section className="code-git-panel"><div className="git-heading"><h3>Git 改动</h3><button title="刷新" onClick={() => void refreshGitChanges()}><RefreshCw size={12} /></button></div>
+              <div className="git-changes">{gitOverview?.isRepository && !workingTreeDirty ? <div className="git-clean-inline">当前工作区干净</div> : gitChanges.length === 0 ? <div className="empty-small">暂无已加载改动。</div> : gitChanges.map((change) => <div className={selectedGitPath === change.path ? "active" : ""} key={`${change.status}:${change.path}`}><button title={change.path} onClick={() => void openGitChange(change.path)}><i className={change.status === "??" ? "added" : change.status.includes("D") ? "removed" : "modified"}>{gitStatusLabel(change.status)}</i><FileTypeIcon path={change.path} size={14} /><span>{change.path}</span></button><button title="撤销未暂存改动" disabled={change.status === "??"} onClick={() => void discardGitChange(change)}><RotateCcw size={11} /></button></div>)}</div>
               {selectedGitPath && <pre className="diff-preview">{diffText}</pre>}
             </section>
           </div>
@@ -1235,7 +1359,7 @@ function App() {
         <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
         </>}
         <div className="panel-resizer sidebar-resizer" title="拖动调整侧栏宽度，双击恢复默认" onPointerDown={(event) => startResize("sidebar", event)} onDoubleClick={() => setSidebarWidth(238)} />
-      </aside>}
+      </aside>
 
       {workbench === "agent" ? <main className="mode-panel mode-agent">
         <header>
@@ -1257,9 +1381,10 @@ function App() {
             <p>{providerReady ? "它会先理解仓库，再修改代码、运行检查并审阅差异。" : "配置 API Key 和工作区后即可开始真实编码任务。"}</p>
             <div className="suggestions">
               {!providerReady && <button onClick={() => { setSettingsSection("model"); setSettingsOpen(true); }}><KeyRound size={18} /> 配置 API</button>}
-              <button onClick={() => setPrompt("阅读当前项目并解释架构")}><Bot size={18} /> 理解项目</button>
-              <button onClick={() => setPrompt("检查当前 Git diff 并指出风险")}><FileDiff size={18} /> 审阅改动</button>
-              <button onClick={() => setPrompt("运行测试并修复失败项")}><CheckCircle2 size={18} /> 修复测试</button>
+              {TASK_TEMPLATES.slice(0, 4).map((template) => {
+                const TemplateIcon = template.icon;
+                return <button key={template.id} onClick={() => setPrompt(template.prompt)}><TemplateIcon size={18} /><span><strong>{template.title}</strong><small>{template.description}</small></span></button>;
+              })}
               <button onClick={() => void understandImage()}><Image size={18} /> 图片理解</button>
               <button onClick={() => void createImage()}><Sparkles size={18} /> 生成图片</button>
             </div>
@@ -1274,15 +1399,15 @@ function App() {
           <div className="composer-footer"><div>
             <button title="添加项目" className="mini" onClick={() => void addProject()}><Plus size={15} /></button>
             <ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} />
-          </div>{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!providerReady} onClick={send}><Send size={17} /></button>}</div>
+          </div><div className="send-area"><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact />{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!providerReady} onClick={send}><Send size={17} /></button>}</div></div>
         </div></div>
       </main> : <main className="code-main mode-panel mode-code">
         <header>
           <div className="title-row"><div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{activeDocument && activeDocument.content !== activeDocument.savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
-          <div className="header-actions"><span className="completion-hint" title="输入代码时自动生成建议，按 Tab 接受"><Sparkles size={14} /> 自动补全 · Tab 接受</span><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => void refreshGitChanges()}><FileDiff size={15} /> 查看改动</button><button className="pill" onClick={() => { setTerminalStarted(true); setTerminalOpen(!terminalOpen); }}><TerminalSquare size={15} /> 终端</button><button className="pill" onClick={() => setInspectorOpen((value) => !value)}><PanelLeftOpen size={15} /> {inspectorOpen ? "隐藏助手" : "显示助手"}</button></div>
+          <div className="header-actions"><button className={`completion-toggle ${completionEnabled ? "on" : ""}`} title="输入代码时自动生成建议，按 Tab 接受" onClick={() => setCompletionEnabled((value) => !value)}><Sparkles size={14} /><span>自动补全</span><i>{completionEnabled ? "开" : "关"}</i></button><button className="pill" onClick={() => void renameWorkspaceEntry()} disabled={!activeFile}><Pencil size={15} /> 重命名</button><button className="pill danger" onClick={() => void deleteWorkspaceEntry()} disabled={!activeFile}><Trash2 size={15} /> 删除</button><button className="pill" onClick={() => void saveWorkspaceFile()} disabled={!activeDocument || activeDocument.content === activeDocument.savedContent}><Save size={15} /> 保存</button><button className="pill" onClick={() => { setTerminalStarted(true); setTerminalOpen(!terminalOpen); }}><TerminalSquare size={15} /> 终端</button><button className="pill" onClick={() => setInspectorOpen((value) => !value)}><PanelLeftOpen size={15} /> {inspectorOpen ? "隐藏助手" : "显示助手"}</button></div>
         </header>
         {codeStatus && <div className="code-status">{codeStatus}</div>}
-        <div className="editor-tabs">{openFiles.length ? openFiles.map((file) => <button key={file.path} title={file.path} className={`${file.path === activeFile ? "active" : ""} ${file.pinned ? "" : "preview"}`} onClick={() => setActiveFile(file.path)} onDoubleClick={() => setOpenFiles((items) => items.map((item) => item.path === file.path ? { ...item, pinned: true } : item))}><FileTypeIcon path={file.path} size={14} light={!darkTheme} /><span>{file.path.split(/[\\/]/).at(-1)}</span>{file.content !== file.savedContent && <i />}<b title="关闭" onClick={(event) => { event.stopPropagation(); void closeWorkspaceFile(file.path); }}>×</b></button>) : <span>单击预览文件，双击固定标签</span>}</div>
+        <div className="editor-tabs">{openFiles.length ? openFiles.map((file) => <button key={file.path} title={file.path} className={`${file.path === activeFile ? "active" : ""} ${file.pinned ? "" : "preview"}`} onClick={() => setActiveFile(file.path)} onDoubleClick={() => setOpenFiles((items) => items.map((item) => item.path === file.path ? { ...item, pinned: true } : item))}><FileTypeIcon path={file.path} size={14} /><span>{file.path.split(/[\\/]/).at(-1)}</span>{file.content !== file.savedContent && <i />}<b title="关闭" onClick={(event) => { event.stopPropagation(); void closeWorkspaceFile(file.path); }}>×</b></button>) : <span>单击预览文件，双击固定标签</span>}</div>
         <div className="editor-host">{activeDocument ? <Editor
           path={activeFile}
           value={activeDocument.content}
@@ -1297,7 +1422,7 @@ function App() {
                 await new Promise<void>((resolve) => {
                   completionTimer.current = window.setTimeout(resolve, 450);
                 });
-                if (token.isCancellationRequested || !providerReady || model.getLineContent(position.lineNumber).trim().length < 2) return { items: [] };
+                if (token.isCancellationRequested || !completionEnabledRef.current || !providerReady || model.getLineContent(position.lineNumber).trim().length < 2) return { items: [] };
                 const offset = model.getOffsetAt(position);
                 const value = model.getValue();
                 try {
@@ -1314,7 +1439,7 @@ function App() {
             });
           }}
           theme={darkTheme ? "vs-dark" : "vs"}
-          options={{ automaticLayout: true, minimap: { enabled: true }, fontSize: 12, tabSize: 2, wordWrap: "off", quickSuggestions: true, inlineSuggest: { enabled: true, mode: "subwordSmart" } }}
+          options={{ automaticLayout: true, minimap: { enabled: true }, fontFamily: "Cascadia Code, Cascadia Mono, JetBrains Mono, Consolas, monospace", fontLigatures: true, fontSize: 12, lineHeight: 19, tabSize: 2, wordWrap: "off", quickSuggestions: true, inlineSuggest: { enabled: completionEnabled, mode: "subwordSmart" } }}
         /> : <div className="code-welcome"><Code2 size={46} /><h2>Lan Code 工作台</h2><p>浏览项目、编辑代码、查看改动，并让同一个 Agent 理解当前仓库。</p></div>}</div>
         {terminalStarted && <IntegratedTerminal workspace={settings.workspace} visible={terminalOpen} dark={darkTheme} onClose={() => setTerminalOpen(false)} />}
       </main>}
@@ -1322,8 +1447,8 @@ function App() {
       {inspectorOpen && <aside className={`inspector ${workbench === "code" ? "code-inspector" : ""}`} style={{ width: inspectorWidth }}>
         <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(252)} />
         {workbench === "code" ? <>
-          <h3>AI 助手</h3>
-          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">针对当前项目提问，Agent 会使用同一套工具、权限和会话。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown>{message.text}</Markdown> : <p>{message.text}</p>}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
+          <div className="assistant-head"><div><h3>AI 助手</h3><p>针对当前项目提问，Agent 会使用同一套工具、权限和会话。</p></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><select value={activeId || ""} onChange={(event) => setActiveId(event.target.value || undefined)}><option value="">选择当前项目对话</option>{currentProjectSessions.map((session) => <option key={session.id} value={session.id}>{session.title || "未命名对话"}</option>)}</select></div></div>
+          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown>{message.text}</Markdown> : <p>{message.text}</p>}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
           <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="询问代码或要求修改项目" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /><Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} /></div><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={14} /></button></div></div>
         </> : <>
         <h3>环境信息</h3>
@@ -1331,14 +1456,25 @@ function App() {
         <div className="info-row"><KeyRound size={16} /><span>模型</span><strong>{providerReady ? settings.model : "未配置"}</strong></div>
         <div className="info-row"><ShieldCheck size={16} /><span>权限</span><strong>{APPROVAL_MODES.find((item) => item.id === settings.approvalMode)?.label}</strong></div>
         <div className="divider" /><h3>当前对话用量</h3>
-        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
+        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact /><strong>{usage.totalTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
         <div className="divider" /><h3>任务步骤</h3>
         {toolSteps.length > 0 && <div className="tool-stats"><span>{toolSteps.length} 步</span><b>{toolStepStats.completed} 完成</b>{toolStepStats.running > 0 && <i>{toolStepStats.running} 执行中</i>}{toolStepStats.failed + toolStepStats.stale > 0 && <em>{toolStepStats.failed + toolStepStats.stale} 异常</em>}</div>}
         {groupedToolSteps.length === 0 ? <div className="empty-small">发送任务后在这里查看文件读取、搜索、修改和命令执行过程。</div> : <div className="tool-step-list">{groupedToolSteps.slice(0, 6).map((step) => <ToolStepCard key={step.id} step={step} />)}{groupedToolSteps.length > 6 && <div className="tool-more">另有 {groupedToolSteps.length - 6} 组较早步骤已收起</div>}</div>}
         <div className="divider" /><div className="git-heading"><h3>Git 仓库</h3><button title="刷新 Git 信息" onClick={() => void refreshGitChanges()}><RefreshCw size={12} /></button></div>
         {!gitOverview?.isRepository ? <div className="empty-small">当前项目不是 Git 仓库。</div> : <div className="git-overview">
-          <div className="git-branch-card"><GitBranch size={14} /><strong>{gitOverview.branch}</strong><span>{gitChanges.length} 个文件</span><b>+{gitOverview.additions}</b><i>-{gitOverview.deletions}</i></div>
-          <div className="git-history">{gitOverview.commits.map((commit) => <div key={commit.hash}><GitCommitHorizontal size={13} /><span><strong>{commit.subject}</strong><small>{commit.hash} · {commit.author} · {commit.relativeTime}</small></span></div>)}</div>
+          <div className="git-repo-card">
+            <div><GitBranch size={15} /><span><strong>{gitOverview.branch}</strong><small>当前分支</small></span></div>
+            {workingTreeDirty ? <span className="git-dirty-count"><b>{gitOverview.changedFiles}</b><small>未提交</small></span> : <span className="git-clean-badge">干净</span>}
+          </div>
+          {workingTreeDirty ? <><div className="git-flow">
+            <div><span>{gitOverview.stagedFiles}</span><strong>已暂存</strong></div>
+            <i />
+            <div><span>{gitOverview.unstagedFiles}</span><strong>未暂存</strong></div>
+            <i />
+            <div><span>{gitOverview.untrackedFiles}</span><strong>新增文件</strong></div>
+          </div>
+          <div className="git-delta-card"><span>{gitChanges.length} 个文件</span><b>+{gitOverview.additions}</b><i>-{gitOverview.deletions}</i></div></> : <div className="git-clean-card"><CheckCircle2 size={15} /><span>当前工作区干净</span></div>}
+          {gitOverview.commits.length ? <div className="git-history">{gitOverview.commits.map((commit) => <div key={commit.hash}><GitCommitHorizontal size={13} /><span><strong>{commit.subject}</strong><small>{commit.hash} · {commit.author} · {commit.relativeTime}</small></span></div>)}</div> : <div className="git-history-empty">暂无提交记录</div>}
         </div>}
         </>}
       </aside>}
@@ -1360,11 +1496,26 @@ function App() {
         </div>
       </div>}
 
-      {settingsOpen && <div className="modal-backdrop"><div className="modal settings-modal">
-        <div className="modal-title"><div><h2>Lan Code 设置</h2><p>按类别管理模型、能力、项目、Agent 和更新。</p></div><button className="icon-button" onClick={() => setSettingsOpen(false)}>×</button></div>
-        <div className="settings-layout"><nav className="settings-nav">
+      {paletteOpen && <div className="modal-backdrop command-backdrop" onPointerDown={() => setPaletteOpen(false)}>
+        <div className="command-palette" onPointerDown={(event) => event.stopPropagation()}>
+          <div className="command-title"><Sparkles size={17} /><div><strong>快速任务</strong><span>参考 Cline、Roo、OpenCode 的常用工作流，一键生成高质量任务提示。</span></div><kbd>Ctrl+K</kbd></div>
+          <div className="command-list">{TASK_TEMPLATES.map((template) => {
+            const TemplateIcon = template.icon;
+            return <button key={template.id} onClick={() => chooseTaskTemplate(template)}>
+              <TemplateIcon size={16} /><span><strong>{template.title}</strong><small>{template.description}</small></span><ChevronRight size={13} />
+            </button>;
+          })}</div>
+        </div>
+      </div>}
+
+      {settingsOpen && <div className="settings-page-shell">
+        <aside className="settings-page-nav">
+          <button className="settings-back" onClick={() => setSettingsOpen(false)}><ArrowLeft size={15} /> 返回应用</button>
+          <div className="settings-search"><Search size={14} /><span>搜索设置...</span></div>
+          <div className="settings-category-label">Lan Code</div>
           {([["appearance", "外观"], ["model", "模型服务"], ["capabilities", "能力路由"], ["workspace", "项目与数据"], ["agent", "Agent 与权限"], ["updates", "软件更新"]] as [SettingsSection, string][]).map(([id, label]) => <button key={id} className={settingsSection === id ? "active" : ""} onClick={() => setSettingsSection(id)}>{label}</button>)}
-        </nav><div className="settings-content">
+        </aside><main className="settings-page-main"><div className="settings-page-inner">
+        <div className="settings-page-title"><div><h2>Lan Code 设置</h2><p>按类别管理模型、能力、项目、Agent 和更新。</p></div><button className="primary-inline" onClick={saveSettings}>保存并启用</button></div>
         {settingsSection === "appearance" && <><div className="settings-section-title"><h3>外观</h3><p>选择浅色、深色，或跟随 Windows 系统主题。</p></div><div className="theme-options">
           {([{ id: "system", label: "跟随系统", icon: <Monitor size={18} /> }, { id: "light", label: "浅色", icon: <Sun size={18} /> }, { id: "dark", label: "深色", icon: <Moon size={18} /> }] as { id: ThemeMode; label: string; icon: React.ReactNode }[]).map((theme) => <button key={theme.id} className={themeMode === theme.id ? "active" : ""} onClick={() => setThemeMode(theme.id)}>{theme.icon}<strong>{theme.label}</strong>{themeMode === theme.id && <Check size={14} />}</button>)}
         </div><div className="settings-note">主题偏好保存在本机，代码编辑器和集成终端会同步切换。</div></>}
@@ -1394,6 +1545,8 @@ function App() {
                   <label className="span-2">模型 ID<div className="model-input"><input placeholder="可手动填写模型 ID" value={profile.model} onChange={(event) => updateProviderProfile(profile.id, { model: event.target.value })} /><select value={models.includes(profile.model) ? profile.model : ""} onChange={(event) => event.target.value && updateProviderProfile(profile.id, { model: event.target.value })}><option value="">从已获取模型中选择...</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select><button onClick={() => void fetchProviderModels(profile)}><RefreshCw size={13} /> 获取模型</button></div></label>
                   <label className="span-2">API 地址<input value={profile.baseUrl} onChange={(event) => updateProviderProfile(profile.id, { baseUrl: event.target.value })} /></label>
                   <label className="span-2">API Key<input type="password" placeholder="sk-..." value={profile.apiKey} onChange={(event) => updateProviderProfile(profile.id, { apiKey: event.target.value })} /></label>
+                  <label>输入上下文 / Token<input type="number" min="1024" step="1024" value={profile.contextWindow || DEFAULT_CONTEXT_WINDOW} onChange={(event) => updateProviderProfile(profile.id, { contextWindow: Number(event.target.value) })} /></label>
+                  <label>最大输出 / Token<input type="number" min="256" step="256" value={profile.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS} onChange={(event) => updateProviderProfile(profile.id, { maxOutputTokens: Number(event.target.value) })} /></label>
                   <label>输入价格 / 百万 Token<input type="number" min="0" step="0.01" value={profile.inputPricePerMillion} onChange={(event) => updateProviderProfile(profile.id, { inputPricePerMillion: Number(event.target.value) })} /></label>
                   <label>输出价格 / 百万 Token<input type="number" min="0" step="0.01" value={profile.outputPricePerMillion} onChange={(event) => updateProviderProfile(profile.id, { outputPricePerMillion: Number(event.target.value) })} /></label>
                 </div>
@@ -1446,21 +1599,20 @@ function App() {
         {settingsSection === "updates" && <><div className="settings-section-title"><h3>软件更新</h3><p>仅从 Lan Code 官方 GitHub Release 检查并下载安装包。</p></div><div className="update-card">
           <div><strong><Zap size={15} /> 软件更新</strong><span>{updateStatus || "仅从 Lan Code 官方 GitHub Release 检查和下载更新。"}</span></div>
           <div>
-            <button onClick={checkUpdates}><RefreshCw size={14} /> 检查更新</button>
+            <button onClick={() => void checkUpdates()}><RefreshCw size={14} /> 检查更新</button>
             {updateInfo?.available && !downloadedUpdate && <button onClick={downloadUpdate}><Download size={14} /> 下载 v{updateInfo.latestVersion}</button>}
             {downloadedUpdate && <button className="primary-inline" onClick={installUpdate}>退出并安装</button>}
           </div>
         </div><div className="update-details">
-          <span>当前版本<strong>{updateInfo?.currentVersion ? `v${updateInfo.currentVersion}` : "检查后显示"}</strong></span>
-          <span>最新版本<strong>{updateInfo?.latestVersion ? `v${updateInfo.latestVersion}` : "检查后显示"}</strong></span>
+          <span>当前版本<strong>v{updateInfo?.currentVersion || CURRENT_VERSION}</strong></span>
+          <span>最新版本<strong>{updateInfo?.latestVersion ? `v${updateInfo.latestVersion}` : "自动检查中"}</strong></span>
           <span>更新时间<strong>{updatePublishedAt}</strong></span>
-          <span>下载文件<strong>{downloadedUpdate || updateInfo?.installerName || "检查后显示"}</strong></span>
+          <span>下载文件<strong>{downloadedUpdate || updateInfo?.installerName || "暂无"}</strong></span>
           {updateInfo?.releaseUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer"><ExternalLink size={13} /> 查看 Release</a>}
         </div></>}
         {settingsStatus && <div className={settingsStatus.includes("失败") ? "settings-status failed" : "settings-status"}>{settingsStatus}</div>}
-        <div className="modal-actions"><button className="primary-inline" onClick={saveSettings}>保存并启用</button></div>
-        </div></div>
-      </div></div>}
+        </div></main>
+      </div>}
     </div>
   );
 }

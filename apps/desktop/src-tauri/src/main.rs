@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -59,10 +60,22 @@ struct ProviderProfile {
     api_key: String,
     input_price_per_million: f64,
     output_price_per_million: f64,
+    #[serde(default = "default_context_window")]
+    context_window: u64,
+    #[serde(default = "default_max_output_tokens")]
+    max_output_tokens: u64,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_context_window() -> u64 {
+    128_000
+}
+
+fn default_max_output_tokens() -> u64 {
+    8_192
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -152,13 +165,20 @@ struct AppState {
     core: RwLock<Arc<AgentCore>>,
     settings: RwLock<DesktopSettings>,
     data_dir: RwLock<PathBuf>,
-    terminal: Mutex<Option<TerminalSession>>,
+    terminals: Mutex<HashMap<String, TerminalSession>>,
 }
 
 struct TerminalSession {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalPayload {
+    id: String,
+    data: String,
 }
 
 #[derive(Serialize)]
@@ -234,6 +254,10 @@ struct GitOverview {
     branch: String,
     additions: u64,
     deletions: u64,
+    changed_files: usize,
+    staged_files: usize,
+    unstaged_files: usize,
+    untracked_files: usize,
     commits: Vec<GitCommit>,
 }
 
@@ -870,6 +894,10 @@ async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOvervie
             branch: String::new(),
             additions: 0,
             deletions: 0,
+            changed_files: 0,
+            staged_files: 0,
+            unstaged_files: 0,
+            untracked_files: 0,
             commits: Vec::new(),
         });
     }
@@ -937,6 +965,32 @@ async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOvervie
             })
         })
         .collect();
+    let status = hidden_command("git")
+        .args(["status", "--porcelain=v1"])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    let mut changed_files = 0;
+    let mut staged_files = 0;
+    let mut unstaged_files = 0;
+    let mut untracked_files = 0;
+    for line in String::from_utf8_lossy(&status.stdout).lines() {
+        if line.len() < 2 {
+            continue;
+        }
+        changed_files += 1;
+        let bytes = line.as_bytes();
+        if bytes[0] == b'?' && bytes[1] == b'?' {
+            untracked_files += 1;
+            continue;
+        }
+        if bytes[0] != b' ' {
+            staged_files += 1;
+        }
+        if bytes[1] != b' ' {
+            unstaged_files += 1;
+        }
+    }
     let branch_name = String::from_utf8_lossy(&branch.stdout).trim().to_string();
     Ok(GitOverview {
         is_repository: true,
@@ -947,6 +1001,10 @@ async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOvervie
         },
         additions,
         deletions,
+        changed_files,
+        staged_files,
+        unstaged_files,
+        untracked_files,
         commits,
     })
 }
@@ -992,6 +1050,8 @@ async fn discard_workspace_changes(path: String, state: State<'_, AppState>) -> 
 
 #[tauri::command]
 async fn terminal_start(
+    id: String,
+    shell: String,
     cols: u16,
     rows: u16,
     app: AppHandle,
@@ -1001,8 +1061,8 @@ async fn terminal_start(
     if settings.approval_mode != ApprovalMode::FullAccess {
         return Err("集成终端要求权限模式为 fullAccess".into());
     }
-    let mut guard = state.terminal.lock().map_err(|error| error.to_string())?;
-    if guard.is_some() {
+    let mut guard = state.terminals.lock().map_err(|error| error.to_string())?;
+    if guard.contains_key(&id) {
         return Ok(());
     }
     let pair = NativePtySystem::default()
@@ -1013,8 +1073,19 @@ async fn terminal_start(
             pixel_height: 0,
         })
         .map_err(|error| error.to_string())?;
-    let mut command = CommandBuilder::new("powershell.exe");
-    command.args(["-NoLogo"]);
+    let mut command = match shell.as_str() {
+        "cmd" => {
+            let mut command = CommandBuilder::new("cmd.exe");
+            command.args(["/K"]);
+            command
+        }
+        "wsl" => CommandBuilder::new("wsl.exe"),
+        _ => {
+            let mut command = CommandBuilder::new("powershell.exe");
+            command.args(["-NoLogo"]);
+            command
+        }
+    };
     command.cwd(&settings.workspace);
     command.env("TERM", "xterm-256color");
     let child = pair
@@ -1029,6 +1100,7 @@ async fn terminal_start(
         .master
         .take_writer()
         .map_err(|error| error.to_string())?;
+    let terminal_id = id.clone();
     std::thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -1036,25 +1108,40 @@ async fn terminal_start(
                 Ok(0) => break,
                 Ok(size) => {
                     let text = String::from_utf8_lossy(&buffer[..size]).into_owned();
-                    let _ = app.emit("terminal-output", text);
+                    let _ = app.emit(
+                        "terminal-output",
+                        TerminalPayload {
+                            id: terminal_id.clone(),
+                            data: text,
+                        },
+                    );
                 }
                 Err(_) => break,
             }
         }
-        let _ = app.emit("terminal-exit", ());
+        let _ = app.emit(
+            "terminal-exit",
+            TerminalPayload {
+                id: terminal_id,
+                data: String::new(),
+            },
+        );
     });
-    *guard = Some(TerminalSession {
-        master: pair.master,
-        writer,
-        child,
-    });
+    guard.insert(
+        id,
+        TerminalSession {
+            master: pair.master,
+            writer,
+            child,
+        },
+    );
     Ok(())
 }
 
 #[tauri::command]
-fn terminal_write(data: String, state: State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.terminal.lock().map_err(|error| error.to_string())?;
-    let terminal = guard.as_mut().ok_or("终端尚未启动")?;
+fn terminal_write(id: String, data: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.terminals.lock().map_err(|error| error.to_string())?;
+    let terminal = guard.get_mut(&id).ok_or("终端尚未启动")?;
     terminal
         .writer
         .write_all(data.as_bytes())
@@ -1063,9 +1150,14 @@ fn terminal_write(data: String, state: State<'_, AppState>) -> Result<(), String
 }
 
 #[tauri::command]
-fn terminal_resize(cols: u16, rows: u16, state: State<'_, AppState>) -> Result<(), String> {
-    let guard = state.terminal.lock().map_err(|error| error.to_string())?;
-    let terminal = guard.as_ref().ok_or("终端尚未启动")?;
+fn terminal_resize(
+    id: String,
+    cols: u16,
+    rows: u16,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let guard = state.terminals.lock().map_err(|error| error.to_string())?;
+    let terminal = guard.get(&id).ok_or("终端尚未启动")?;
     terminal
         .master
         .resize(PtySize {
@@ -1079,8 +1171,17 @@ fn terminal_resize(cols: u16, rows: u16, state: State<'_, AppState>) -> Result<(
 
 #[tauri::command]
 fn terminal_stop(state: State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.terminal.lock().map_err(|error| error.to_string())?;
-    if let Some(mut terminal) = guard.take() {
+    let mut guard = state.terminals.lock().map_err(|error| error.to_string())?;
+    for (_, mut terminal) in guard.drain() {
+        terminal.child.kill().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn terminal_stop_one(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.terminals.lock().map_err(|error| error.to_string())?;
+    if let Some(mut terminal) = guard.remove(&id) {
         terminal.child.kill().map_err(|error| error.to_string())?;
     }
     Ok(())
@@ -1432,7 +1533,7 @@ fn main() {
             core: RwLock::new(Arc::new(core)),
             settings: RwLock::new(settings),
             data_dir: RwLock::new(data_dir),
-            terminal: Mutex::new(None),
+            terminals: Mutex::new(HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -1455,6 +1556,7 @@ fn main() {
             terminal_write,
             terminal_resize,
             terminal_stop,
+            terminal_stop_one,
             inline_completion,
             check_for_updates,
             download_update,
