@@ -20,7 +20,7 @@ use lan_protocol::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -51,12 +51,18 @@ struct DesktopProject {
 struct ProviderProfile {
     id: String,
     name: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
     provider: String,
     base_url: String,
     model: String,
     api_key: String,
     input_price_per_million: f64,
     output_price_per_million: f64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -163,6 +169,22 @@ struct ProviderTestResult {
     text_response: String,
     tool_call_supported: bool,
     capabilities: ModelCapabilities,
+}
+
+#[derive(Deserialize)]
+struct ProviderModelsResponse {
+    #[serde(default)]
+    data: Vec<ProviderModel>,
+    #[serde(default)]
+    models: Vec<ProviderModel>,
+}
+
+#[derive(Deserialize)]
+struct ProviderModel {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Serialize)]
@@ -577,6 +599,61 @@ async fn test_provider(settings: DesktopSettings) -> Result<ProviderTestResult, 
 }
 
 #[tauri::command]
+async fn list_provider_models(
+    provider: String,
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<String>, String> {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.is_empty() {
+        return Err("请先填写 API 地址".into());
+    }
+    if api_key.trim().is_empty() && !is_local_provider(&provider) {
+        return Err("请先填写 API Key".into());
+    }
+
+    let mut request = reqwest::Client::new().get(format!("{base_url}/models"));
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key.trim());
+    }
+    if provider == "anthropic" {
+        request = request
+            .header("x-api-key", api_key.trim())
+            .header("anthropic-version", "2023-06-01");
+    }
+    let response = request
+        .header("User-Agent", "Lan-Code-Desktop")
+        .send()
+        .await
+        .map_err(|error| format!("获取模型失败：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("模型接口返回错误：{error}"))?
+        .json::<ProviderModelsResponse>()
+        .await
+        .map_err(|error| format!("解析模型列表失败：{error}"))?;
+
+    let mut models = response
+        .data
+        .into_iter()
+        .chain(response.models)
+        .map(|model| {
+            if model.id.is_empty() {
+                model.name
+            } else {
+                model.id
+            }
+        })
+        .filter(|model| !model.is_empty())
+        .collect::<Vec<_>>();
+    models.sort_by_key(|model| model.to_ascii_lowercase());
+    models.dedup();
+    if models.is_empty() {
+        return Err("服务端没有返回可用模型 ID".into());
+    }
+    Ok(models)
+}
+
+#[tauri::command]
 async fn list_workspace_files(state: State<'_, AppState>) -> Result<Vec<WorkspaceEntry>, String> {
     let settings = state.settings.read().await;
     let root = PathBuf::from(&settings.workspace);
@@ -782,12 +859,12 @@ async fn workspace_git_changes(state: State<'_, AppState>) -> Result<Vec<GitChan
 #[tauri::command]
 async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOverview, String> {
     let settings = state.settings.read().await;
-    let branch = hidden_command("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+    let inside = hidden_command("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
         .current_dir(&settings.workspace)
         .output()
         .map_err(|error| error.to_string())?;
-    if !branch.status.success() {
+    if !inside.status.success() {
         return Ok(GitOverview {
             is_repository: false,
             branch: String::new(),
@@ -796,12 +873,17 @@ async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOvervie
             commits: Vec::new(),
         });
     }
+    let branch = hidden_command("git")
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
     let numstat = hidden_command("git")
         .args(["diff", "--numstat", "HEAD", "--", "."])
         .current_dir(&settings.workspace)
         .output()
         .map_err(|error| error.to_string())?;
-    let (additions, deletions) = String::from_utf8_lossy(&numstat.stdout).lines().fold(
+    let (mut additions, deletions) = String::from_utf8_lossy(&numstat.stdout).lines().fold(
         (0, 0),
         |(additions, deletions), line| {
             let mut fields = line.split('\t');
@@ -816,6 +898,28 @@ async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOvervie
             (additions + added, deletions + removed)
         },
     );
+    let untracked = hidden_command("git")
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .current_dir(&settings.workspace)
+        .output()
+        .map_err(|error| error.to_string())?;
+    for relative in untracked
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let Ok(relative) = std::str::from_utf8(relative) else {
+            continue;
+        };
+        let path = Path::new(&settings.workspace).join(relative);
+        let Ok(bytes) = fs::read(path) else {
+            continue;
+        };
+        if bytes.len() <= 2 * 1024 * 1024 && !bytes.contains(&0) {
+            additions += bytes.iter().filter(|byte| **byte == b'\n').count() as u64
+                + u64::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'));
+        }
+    }
     let history = hidden_command("git")
         .args(["log", "-12", "--pretty=format:%h%x1f%s%x1f%an%x1f%ar"])
         .current_dir(&settings.workspace)
@@ -833,9 +937,14 @@ async fn workspace_git_overview(state: State<'_, AppState>) -> Result<GitOvervie
             })
         })
         .collect();
+    let branch_name = String::from_utf8_lossy(&branch.stdout).trim().to_string();
     Ok(GitOverview {
         is_repository: true,
-        branch: String::from_utf8_lossy(&branch.stdout).trim().to_string(),
+        branch: if branch_name.is_empty() {
+            "未提交".into()
+        } else {
+            branch_name
+        },
         additions,
         deletions,
         commits,
@@ -1312,6 +1421,13 @@ fn main() {
     persist_bootstrap_settings(&data_dir, &settings);
     let core = build_core(&settings, &data_dir).unwrap_or_else(|_| AgentCore::new());
     tauri::Builder::default()
+        .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/taskbar.png"))?;
+                window.set_icon(icon)?;
+            }
+            Ok(())
+        })
         .manage(AppState {
             core: RwLock::new(Arc::new(core)),
             settings: RwLock::new(settings),
@@ -1322,6 +1438,7 @@ fn main() {
             get_settings,
             save_settings,
             test_provider,
+            list_provider_models,
             list_workspace_files,
             search_workspace,
             read_workspace_file,

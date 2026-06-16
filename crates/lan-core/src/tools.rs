@@ -15,6 +15,16 @@ use serde_json::{Value, json};
 use tokio::{process::Command, time::Duration};
 use walkdir::WalkDir;
 
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
+    command
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub session_id: SessionId,
@@ -620,7 +630,7 @@ impl Tool for ApplyEditsTool {
 async fn run_git(cwd: &str, args: &[&str]) -> Result<Value> {
     let output = tokio::time::timeout(
         Duration::from_secs(30),
-        Command::new("git")
+        hidden_command("git")
             .args(args)
             .current_dir(Path::new(cwd).canonicalize()?)
             .kill_on_drop(true)
@@ -725,7 +735,7 @@ impl Tool for RunCommandTool {
             .clamp(1, 120);
         let output = tokio::time::timeout(
             Duration::from_secs(timeout_seconds),
-            Command::new(program)
+            hidden_command(program)
                 .args(args)
                 .current_dir(Path::new(&context.cwd).canonicalize()?)
                 .kill_on_drop(true)
