@@ -16,7 +16,7 @@ import {
   Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, Code2, File, FileDiff, FilePlus, Folder, FolderGit2, Image,
   FolderOpen, FolderPlus, GitBranch, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
   Download, MessageSquare, RefreshCw, RotateCcw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
-  XCircle, Zap, Sun, Moon, Monitor, Check, Menu, GitCommitHorizontal, Eye, ExternalLink,
+  XCircle, Zap, Sun, Moon, Monitor, Check, Menu, GitCommitHorizontal, Eye, ExternalLink, Github,
   ArrowLeft, ArrowRight, Minus, Square, X,
 } from "lucide-react";
 import "./styles.css";
@@ -96,7 +96,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.4";
+const CURRENT_VERSION = "0.2.5";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -106,6 +106,8 @@ const DEFAULT_UPDATE_INFO: UpdateInfo = {
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
+const CONTEXT_WARN_RATIO = 0.72;
+const CONTEXT_HARD_RATIO = 0.92;
 
 const PROVIDERS = [
   { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", inputPrice: 0.27, outputPrice: 1.10 },
@@ -151,6 +153,8 @@ const TASK_TEMPLATES = [
   { id: "implement", title: "实现功能", description: "按软件工程方式拆解、修改、验证", prompt: "根据我的需求实现功能。请先理解现有代码结构，再小步修改并运行必要检查。", icon: Code2 },
   { id: "cleanup", title: "整理代码", description: "消除重复、改善命名和边界", prompt: "审查当前项目中可以安全整理的代码，消除明显重复、改善命名和模块边界，并保持行为不变。", icon: Sparkles },
   { id: "release", title: "发布检查", description: "构建、版本、文档和交付物检查", prompt: "做一次发布前检查：构建、测试、版本号、文档、安装包和 Git 状态都确认一遍。", icon: Download },
+  { id: "compact", title: "压缩上下文", description: "整理当前对话状态，方便切换小上下文模型", prompt: "请压缩当前任务上下文：保留目标、关键决策、已改文件、未完成事项、风险和下一步操作，输出一份可以继续开发的中文交接摘要。", icon: Zap },
+  { id: "repo-research", title: "研究仓库", description: "分析 GitHub 或本地参考仓库并提炼可用能力", prompt: "研究我给出的 GitHub 仓库或当前 research/repos 参考项目，提炼可借鉴功能、架构优点、缺陷和可落地到 Lan Code 的改进清单。", icon: Github },
 ];
 
 type IconDefinition = { iconPath?: string };
@@ -190,6 +194,41 @@ function resolveMaterialIcon(path: string, light: boolean): string {
 
 function FileTypeIcon({ path, size = 16, light = false }: { path: string; size?: number; light?: boolean }) {
   return <img className="material-file-icon" src={resolveMaterialIcon(path, light)} width={size} height={size} alt="" />;
+}
+
+function activeContextWindowFromSettings(settings: SettingsData) {
+  return settings.providerProfiles.find((profile) =>
+    profile.enabled !== false
+    && profile.provider === settings.provider
+    && profile.baseUrl === settings.baseUrl
+    && profile.model === settings.model
+  )?.contextWindow || DEFAULT_CONTEXT_WINDOW;
+}
+
+function formatTokenCount(value: number) {
+  return value >= 1_000_000 ? `${(value / 1_000_000).toFixed(value % 1_000_000 === 0 ? 0 : 1)}M` : value.toLocaleString();
+}
+
+function githubRepoLabel(href?: string) {
+  if (!href) return undefined;
+  const match = href.match(/^https?:\/\/github\.com\/([^/\s]+)\/([^/#?\s]+)\/?$/i);
+  if (!match) return undefined;
+  return `${match[1]}/${match[2].replace(/\.git$/i, "")}`;
+}
+
+function githubReposInText(text: string) {
+  return Array.from(text.matchAll(/https?:\/\/github\.com\/([^/\s]+)\/([^/#?\s]+)(?:\/)?/gi))
+    .map((match) => `${match[1]}/${match[2].replace(/\.git$/i, "")}`)
+    .filter((repo, index, rows) => rows.indexOf(repo) === index);
+}
+
+function workspaceReference(text: string, entries?: WorkspaceEntry[]) {
+  const clean = text.trim().replace(/^["'`]+|["'`]+$/g, "").replaceAll("\\", "/");
+  if (!clean || clean.length > 180 || !entries?.length) return undefined;
+  const files = entries.filter((entry) => !entry.isDir);
+  return files.find((entry) => entry.path.replaceAll("\\", "/") === clean)
+    || files.find((entry) => entry.path.replaceAll("\\", "/").endsWith(`/${clean}`))
+    || files.find((entry) => entry.name === clean);
 }
 
 function gitStatusLabel(status: string): string {
@@ -328,15 +367,24 @@ function ToolStepCard({ step }: { step: ToolStep }) {
   </details>;
 }
 
-function Markdown({ children }: { children: string }) {
+function Markdown({ children, workspaceFiles }: { children: string; workspaceFiles?: WorkspaceEntry[] }) {
   return <div className="markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-    a: ({ href, children: label }) => <a href={href} target="_blank" rel="noreferrer"><ExternalLink size={11} />{label}</a>,
+    a: ({ href, children: label }) => {
+      const repo = githubRepoLabel(href);
+      return <a className={repo ? "github-link" : ""} href={href} target="_blank" rel="noreferrer">{repo ? <Github size={12} /> : <ExternalLink size={11} />}{repo || label}</a>;
+    },
+    code: ({ children: label, className }) => {
+      const text = String(label).replace(/\n$/, "");
+      const file = !className ? workspaceReference(text, workspaceFiles) : undefined;
+      if (file) return <code className="workspace-file-ref" title={file.path}><FileTypeIcon path={file.path} size={13} />{text}</code>;
+      return <code className={className}>{label}</code>;
+    },
   }}>{children}</ReactMarkdown></div>;
 }
 
-function MessageBody({ message, changes, overview, latest }: { message: ChatMessage; changes: GitChange[]; overview?: GitOverview; latest: boolean }) {
-  return <>{message.reasoning && <details className="reasoning-card"><summary><span>已处理</span><ChevronRight size={12} /></summary><Markdown>{message.reasoning}</Markdown></details>}
-    <Markdown>{message.text}</Markdown>
+function MessageBody({ message, changes, overview, latest, workspaceFiles }: { message: ChatMessage; changes: GitChange[]; overview?: GitOverview; latest: boolean; workspaceFiles?: WorkspaceEntry[] }) {
+  return <>{message.reasoning && <details className="reasoning-card"><summary><span>已处理</span><ChevronRight size={12} /></summary><Markdown workspaceFiles={workspaceFiles}>{message.reasoning}</Markdown></details>}
+    <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown>
     {latest && changes.length > 0 && <details className="change-summary" open><summary><FileDiff size={13} /><strong>本次工作区改动</strong><span className="diff-add">+{overview?.additions || 0}</span><span className="diff-remove">-{overview?.deletions || 0}</span><ChevronRight size={12} /></summary>
       <div>{changes.slice(0, 12).map((change) => <span key={`${change.status}:${change.path}`}><i className={change.status.includes("D") ? "removed" : change.status === "??" ? "added" : "modified"}>{gitStatusLabel(change.status)}</i><FileTypeIcon path={change.path} size={13} /><b>{change.path}</b></span>)}</div>
     </details>}
@@ -870,6 +918,14 @@ function App() {
   async function switchModelProfile(profileId: string) {
     const profile = settings.providerProfiles.find((item) => item.id === profileId);
     if (!profile) return;
+    const currentUsage = currentTokenUsage();
+    if (currentUsage.totalTokens > profile.contextWindow * CONTEXT_HARD_RATIO) {
+      const proceed = await askConfirm(
+        "目标模型上下文较小",
+        `当前对话已使用约 ${currentUsage.totalTokens.toLocaleString()} Token，而“${profile.name} · ${profile.model}”上下文上限是 ${profile.contextWindow.toLocaleString()}。继续切换后，Lan Code 会先压缩历史再处理下一条消息。是否继续？`,
+      );
+      if (!proceed) return;
+    }
     const next = {
       ...settings, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model,
       apiKey: profile.apiKey, inputPricePerMillion: profile.inputPricePerMillion,
@@ -887,6 +943,33 @@ function App() {
       return;
     }
     if (profileId !== "__current") void switchModelProfile(profileId);
+  }
+
+  function currentTokenUsage() {
+    return events.filter((event) => event.type === "usageRecorded" && event.usage)
+      .reduce((total, event) => ({
+        inputTokens: total.inputTokens + event.usage!.inputTokens,
+        outputTokens: total.outputTokens + event.usage!.outputTokens,
+        totalTokens: total.totalTokens + event.usage!.totalTokens,
+        cachedInputTokens: total.cachedInputTokens + event.usage!.cachedInputTokens,
+      }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 });
+  }
+
+  function contextAwarePrompt(text: string) {
+    const currentUsage = currentTokenUsage();
+    const contextWindow = activeContextWindowFromSettings(settings);
+    const ratio = currentUsage.totalTokens / Math.max(1, contextWindow);
+    const githubRepos = githubReposInText(text);
+    const hints = [];
+    if (githubRepos.length) {
+      hints.push(`【Lan Code GitHub 识别】用户提到了 GitHub 仓库：${githubRepos.join(", ")}。把它当作可研究的代码仓库资源；如需要本地源码，请先说明需要克隆或检查已有 research/repos。`);
+    }
+    if (ratio >= CONTEXT_WARN_RATIO) {
+      hints.push(
+      `【Lan Code 上下文守门】当前对话约 ${currentUsage.totalTokens.toLocaleString()} / ${contextWindow.toLocaleString()} Token。请先在内部压缩旧上下文，只保留用户目标、关键文件、已执行操作、未完成事项和风险，再处理下面的新请求。不要把压缩过程冗长展示给用户，最终回答保持清楚。`,
+      );
+    }
+    return hints.length ? [...hints, "", text].join("\n") : text;
   }
 
   function toggleProviderProfile(profile: ProviderProfile) {
@@ -1149,6 +1232,15 @@ function App() {
     const text = prompt.trim();
     if (!text || busy) return;
     try {
+      const currentUsage = currentTokenUsage();
+      const contextWindow = activeContextWindowFromSettings(settings);
+      if (currentUsage.totalTokens > contextWindow * CONTEXT_HARD_RATIO) {
+        const proceed = await askConfirm(
+          "上下文即将超限",
+          `当前对话已使用约 ${currentUsage.totalTokens.toLocaleString()} / ${contextWindow.toLocaleString()} Token。Lan Code 会先压缩旧上下文再处理这条消息，是否继续？`,
+        );
+        if (!proceed) return;
+      }
       let sessionId = activeId;
       if (!sessionId) sessionId = await newSession(text.slice(0, 32));
       if (!sessionId) return;
@@ -1156,7 +1248,7 @@ function App() {
       setPrompt("");
       setBusy(true);
       const result = await invoke<{ text: string }>("start_turn", {
-        sessionId, prompt: text, mode: settings.approvalMode,
+        sessionId, prompt: contextAwarePrompt(text), mode: settings.approvalMode,
       });
       setMessages((items) => [...items, { role: "assistant", text: result.text }]);
     } catch (error) {
@@ -1246,8 +1338,8 @@ function App() {
     || (settings.workspace ? { name: settings.workspace.split(/[\\/]/).filter(Boolean).at(-1) || "当前项目", path: settings.workspace } : undefined);
   const currentProjectSessions = sessions.filter((session) => currentProject && normalizePath(session.cwd) === normalizePath(currentProject.path));
   const modelOptions = [
-    ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型", provider: settings.provider, model: settings.model, meta: "当前配置" }] : []),
-    ...enabledProfiles.map((profile) => ({ id: profile.id, label: `${profile.name} · ${profile.model || "未选择模型"}`, provider: profile.name, model: profile.model || "未选择模型", meta: profile.baseUrl.replace(/^https?:\/\//, "") })),
+    ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型", provider: settings.provider, model: settings.model, meta: `当前配置 · ${formatTokenCount(currentContextWindow)} 上下文` }] : []),
+    ...enabledProfiles.map((profile) => ({ id: profile.id, label: `${profile.name} · ${profile.model || "未选择模型"}`, provider: profile.name, model: profile.model || "未选择模型", meta: `${formatTokenCount(profile.contextWindow || DEFAULT_CONTEXT_WINDOW)} 上下文 · ${profile.baseUrl.replace(/^https?:\/\//, "")}` })),
     { id: "__manage", label: "管理模型配置...", provider: "设置", model: "管理模型配置" },
   ];
   const visibleWorkspaceFiles = workspaceFiles.filter((entry) => {
@@ -1389,8 +1481,8 @@ function App() {
               <button onClick={() => void createImage()}><Sparkles size={18} /> 生成图片</button>
             </div>
           </div> : <div className="messages">
-            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} /> : <p>{message.text}</p>}</article>)}
-            {busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={16} /> 正在分析项目并准备下一步...</div>}</article>}
+            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} workspaceFiles={workspaceFiles} /> : <p>{message.text}</p>}</article>)}
+            {busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={16} /> 正在分析项目并准备下一步...</div>}</article>}
           </div>}
         </section>
         {showScrollBottom && <button className="scroll-bottom" title="回到最新消息" onClick={() => conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight, behavior: "smooth" })}><ChevronDown size={15} /> 最新消息</button>}
@@ -1448,7 +1540,7 @@ function App() {
         <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(252)} />
         {workbench === "code" ? <>
           <div className="assistant-head"><div><h3>AI 助手</h3><p>针对当前项目提问，Agent 会使用同一套工具、权限和会话。</p></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><select value={activeId || ""} onChange={(event) => setActiveId(event.target.value || undefined)}><option value="">选择当前项目对话</option>{currentProjectSessions.map((session) => <option key={session.id} value={session.id}>{session.title || "未命名对话"}</option>)}</select></div></div>
-          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown>{message.text}</Markdown> : <p>{message.text}</p>}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
+          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <p>{message.text}</p>}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
           <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="询问代码或要求修改项目" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /><Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} /></div><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={14} /></button></div></div>
         </> : <>
         <h3>环境信息</h3>

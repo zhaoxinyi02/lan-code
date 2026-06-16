@@ -1,5 +1,5 @@
 :root {
-  font-family: "PingFang SC", "PingFang TC", "Microsoft YaHei UI", "Noto Sans CJK SC", "Segoe UI Variable", "Segoe UI", sans-serif;
+  font-family: "PingFang SC", "PingFang TC", "MiSans", "HarmonyOS Sans SC", "Microsoft YaHei UI", "Noto Sans CJK SC", "Segoe UI Variable", "Segoe UI", sans-serif;
   font-size: 13px;
   color: #202124;
   background: #f6f6f4;
@@ -35,6 +35,7 @@ code, pre, kbd, .monaco-editor, .xterm { font-family: "Cascadia Code", "Cascadia
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .4; }
 body { margin: 0; overflow: hidden; color: var(--text); background: var(--app-bg); }
+body, button, textarea, input, select { -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
 :where(button, input, textarea, select, summary, a):focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
@@ -279,6 +280,9 @@ article p { margin: 6px 0 0; }
 .markdown blockquote { margin: 10px 0; border-left: 3px solid #8eb4dc; padding: 2px 10px; color: var(--text-soft); }
 .markdown a { display: inline-flex; align-items: center; gap: 3px; border-radius: 5px; padding: 1px 4px; color: #176fc2; background: #edf6ff; text-decoration: none; }
 .markdown a:hover { color: #095ba7; background: #dceeff; text-decoration: underline; }
+.markdown a.github-link { border: 1px solid color-mix(in srgb, var(--accent) 16%, var(--border)); border-radius: 999px; padding: 2px 7px; color: #1d5fae; background: color-mix(in srgb, var(--accent) 9%, transparent); font-weight: 650; text-decoration: none; }
+.workspace-file-ref { display: inline-flex; align-items: center; gap: 4px; border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border)); border-radius: 7px; padding: 1px 5px !important; color: #176bd6 !important; background: color-mix(in srgb, var(--accent) 8%, #fff) !important; font-family: inherit !important; font-weight: 650; }
+.workspace-file-ref img { flex: 0 0 auto; }
 .markdown table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 11px; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 6px 8px; text-align: left; }
 .error-banner { display: flex; align-items: center; gap: 8px; padding: 9px 16px; color: #9b2f2f; background: #fff0f0; border-bottom: 1px solid #f1cccc; font-size: 12px; }
@@ -1246,6 +1250,8 @@ html[data-theme="dark"] .suggestions button { background: var(--control); color:
 html[data-theme="dark"] .suggestions button:hover { background: #26364a; color: var(--text); border-color: #5b9ee6; box-shadow: 0 10px 24px #0007; }
 html[data-theme="dark"] .markdown a { color: #9dccff; background: #1d3349; }
 html[data-theme="dark"] .markdown a:hover { color: #c6e1ff; background: #254766; }
+html[data-theme="dark"] .markdown a.github-link { color: #b9dbff; background: color-mix(in srgb, var(--accent) 17%, var(--control)); border-color: color-mix(in srgb, var(--accent) 32%, var(--border)); }
+html[data-theme="dark"] .workspace-file-ref { color: #9dccff !important; background: color-mix(in srgb, var(--accent) 14%, var(--control)) !important; border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
 html[data-theme="dark"] .markdown blockquote { color: var(--text-soft); }
 html[data-theme="dark"] .error-banner,
 html[data-theme="dark"] .settings-status.failed { background: #3d2525; color: #e7a2a2; border-color: #613434; }

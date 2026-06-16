@@ -487,9 +487,11 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
     fs::create_dir_all(data_dir).map_err(|error| error.to_string())?;
     let store =
         SqliteStore::open(data_dir.join("lan-code.sqlite")).map_err(|error| error.to_string())?;
+    let context_window = active_context_window(settings) as usize;
     let core = if settings.api_key.trim().is_empty() && !is_local_provider(&settings.provider) {
         AgentCore::with_store(store)
             .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
+            .map(|core| core.with_model_context_tokens(context_window))
             .map_err(|error| error.to_string())?
     } else {
         let api_key = if settings.api_key.trim().is_empty() {
@@ -497,14 +499,16 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
         } else {
             settings.api_key.clone()
         };
-        let provider = OpenAiCompatibleProvider::new(
+        let provider = OpenAiCompatibleProvider::new_with_limits(
             settings.base_url.clone(),
             api_key,
             settings.model.clone(),
+            Some(active_max_output_tokens(settings)),
         )
         .map_err(|error| error.to_string())?;
         AgentCore::with_provider_and_store(Arc::new(provider), store)
             .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
+            .map(|core| core.with_model_context_tokens(context_window))
             .map_err(|error| error.to_string())?
     };
     if let Ok((base_url, api_key, model)) = resolved_route(
@@ -527,6 +531,34 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
         ));
     }
     Ok(core)
+}
+
+fn active_context_window(settings: &DesktopSettings) -> u64 {
+    settings
+        .provider_profiles
+        .iter()
+        .find(|profile| {
+            profile.enabled
+                && profile.provider == settings.provider
+                && profile.base_url == settings.base_url
+                && profile.model == settings.model
+        })
+        .map(|profile| profile.context_window)
+        .unwrap_or_else(default_context_window)
+}
+
+fn active_max_output_tokens(settings: &DesktopSettings) -> u64 {
+    settings
+        .provider_profiles
+        .iter()
+        .find(|profile| {
+            profile.enabled
+                && profile.provider == settings.provider
+                && profile.base_url == settings.base_url
+                && profile.model == settings.model
+        })
+        .map(|profile| profile.max_output_tokens)
+        .unwrap_or_else(default_max_output_tokens)
 }
 
 async fn core(state: &State<'_, AppState>) -> Arc<AgentCore> {

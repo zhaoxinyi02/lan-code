@@ -91,10 +91,20 @@ pub struct OpenAiCompatibleProvider {
     base_url: String,
     api_key: String,
     model: String,
+    max_output_tokens: Option<u64>,
 }
 
 impl OpenAiCompatibleProvider {
     pub fn new(base_url: String, api_key: String, model: String) -> Result<Self> {
+        Self::new_with_limits(base_url, api_key, model, None)
+    }
+
+    pub fn new_with_limits(
+        base_url: String,
+        api_key: String,
+        model: String,
+        max_output_tokens: Option<u64>,
+    ) -> Result<Self> {
         if api_key.trim().is_empty() {
             bail!("API key cannot be empty");
         }
@@ -105,6 +115,7 @@ impl OpenAiCompatibleProvider {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            max_output_tokens,
         })
     }
 }
@@ -115,6 +126,8 @@ struct ChatRequest<'a> {
     messages: &'a [ModelMessage],
     tools: Vec<ChatTool<'a>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +202,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 messages: &request.messages,
                 tools,
                 stream: false,
+                max_tokens: self.max_output_tokens,
             })
             .send()
             .await
@@ -196,7 +210,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            bail!("model request returned {status}: {body}");
+            bail!("{}", provider_error_hint(status.as_u16(), &body));
         }
         let response: ChatResponse =
             serde_json::from_str(&body).context("invalid model response JSON")?;
@@ -256,16 +270,15 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 messages: &request.messages,
                 tools,
                 stream: true,
+                max_tokens: self.max_output_tokens,
             })
             .send()
             .await
             .context("streaming model request failed")?;
         let status = response.status();
         if !status.is_success() {
-            bail!(
-                "streaming model request returned {status}: {}",
-                response.text().await.unwrap_or_default()
-            );
+            let body = response.text().await.unwrap_or_default();
+            bail!("{}", provider_error_hint(status.as_u16(), &body));
         }
 
         let mut buffer = String::new();
@@ -374,6 +387,31 @@ fn token_usage(value: ChatUsage) -> TokenUsage {
     }
 }
 
+fn provider_error_hint(status: u16, body: &str) -> String {
+    let lower = body.to_lowercase();
+    let hint = if lower.contains("context")
+        || lower.contains("maximum")
+        || lower.contains("token")
+        || lower.contains("too long")
+        || lower.contains("length")
+    {
+        "模型上下文可能已超限。建议切回更大上下文模型，或让 Lan Code 压缩旧上下文后继续。"
+    } else if status == 401
+        || status == 403
+        || lower.contains("api key")
+        || lower.contains("unauthorized")
+    {
+        "模型鉴权失败。请检查 API Key、Base URL、供应商区域和账号额度。"
+    } else if status == 404 || lower.contains("model") && lower.contains("not found") {
+        "模型 ID 可能不可用。请在模型设置里重新获取模型列表，或手动确认模型名称。"
+    } else if status == 429 || lower.contains("rate limit") {
+        "模型服务限流或额度不足。可以稍后重试，或切换到其他已启用模型。"
+    } else {
+        "模型服务返回错误。请检查供应商配置和网络状态。"
+    };
+    format!("model request returned {status}: {body}\n\n{hint}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +430,12 @@ mod tests {
         .expect("null usage should be accepted");
 
         assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn provider_error_mentions_context_overflow() {
+        let error = provider_error_hint(400, "maximum context length exceeded");
+        assert!(error.contains("上下文"));
+        assert!(error.contains("压缩"));
     }
 }

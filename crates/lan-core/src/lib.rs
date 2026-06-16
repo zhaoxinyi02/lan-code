@@ -34,6 +34,9 @@ pub use tools::{
 };
 
 const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
+const DEFAULT_MODEL_CONTEXT_TOKENS: usize = 128_000;
+const CONTEXT_COMPACT_RATIO: f64 = 0.82;
+const CONTEXT_KEEP_RECENT_MESSAGES: usize = 10;
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
@@ -61,6 +64,7 @@ pub struct AgentCore {
     pending_approvals: RwLock<HashMap<Uuid, PendingApproval>>,
     events: broadcast::Sender<CoreEvent>,
     max_provider_rounds: usize,
+    model_context_tokens: usize,
 }
 
 impl AgentCore {
@@ -86,11 +90,17 @@ impl AgentCore {
             pending_approvals: RwLock::new(HashMap::new()),
             events,
             max_provider_rounds: DEFAULT_MAX_PROVIDER_ROUNDS,
+            model_context_tokens: DEFAULT_MODEL_CONTEXT_TOKENS,
         }
     }
 
     pub fn with_max_provider_rounds(mut self, max_provider_rounds: usize) -> Self {
         self.max_provider_rounds = max_provider_rounds.clamp(4, 256);
+        self
+    }
+
+    pub fn with_model_context_tokens(mut self, model_context_tokens: usize) -> Self {
+        self.model_context_tokens = model_context_tokens.clamp(8_000, 2_000_000);
         self
     }
 
@@ -150,7 +160,7 @@ impl AgentCore {
                 session: session.clone(),
                 messages: vec![ModelMessage::text(
                     ModelRole::System,
-                    "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering. Never invent file contents. Keep the final answer concise.",
+                    "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering. Never invent file contents. Prefer small, reviewable edits. When a model has limited context, summarize older conversation state before continuing. Keep the final answer concise and list changed files when relevant.",
                 )],
             });
         self.persist_session(session.id).await;
@@ -525,14 +535,15 @@ impl AgentCore {
         let mut repeated_calls = HashMap::<String, usize>::new();
         let mut usage = TokenUsage::default();
         for round in 1..=self.max_provider_rounds {
-            let messages = self
-                .sessions
-                .read()
-                .await
-                .get(&session_id)
-                .context("session not found")?
-                .messages
-                .clone();
+            let messages = self.prepare_messages_for_provider(
+                self.sessions
+                    .read()
+                    .await
+                    .get(&session_id)
+                    .context("session not found")?
+                    .messages
+                    .clone(),
+            );
             let response = tokio::select! {
                 _ = cancel.cancelled() => bail!("turn interrupted"),
                 response = provider.complete_stream(ModelRequest {
@@ -637,14 +648,15 @@ impl AgentCore {
                 ));
         }
         self.persist_session(session_id).await;
-        let messages = self
-            .sessions
-            .read()
-            .await
-            .get(&session_id)
-            .context("session not found")?
-            .messages
-            .clone();
+        let messages = self.prepare_messages_for_provider(
+            self.sessions
+                .read()
+                .await
+                .get(&session_id)
+                .context("session not found")?
+                .messages
+                .clone(),
+        );
         let response = tokio::select! {
             _ = cancel.cancelled() => bail!("turn interrupted"),
             response = provider.complete_stream(ModelRequest {
@@ -695,6 +707,92 @@ impl AgentCore {
             usage,
         })
     }
+
+    fn prepare_messages_for_provider(&self, messages: Vec<ModelMessage>) -> Vec<ModelMessage> {
+        compact_messages_for_context(messages, self.model_context_tokens)
+    }
+}
+
+fn compact_messages_for_context(
+    messages: Vec<ModelMessage>,
+    model_context_tokens: usize,
+) -> Vec<ModelMessage> {
+    let budget = ((model_context_tokens as f64) * CONTEXT_COMPACT_RATIO) as usize;
+    if estimate_messages_tokens(&messages) <= budget
+        || messages.len() <= CONTEXT_KEEP_RECENT_MESSAGES + 2
+    {
+        return messages;
+    }
+
+    let mut compacted = Vec::new();
+    let mut iter = messages.into_iter();
+    if let Some(first) = iter.next() {
+        if first.role == ModelRole::System {
+            compacted.push(first);
+        } else {
+            compacted.push(ModelMessage::text(
+                ModelRole::System,
+                "Conversation context was compacted before this request.",
+            ));
+            compacted.push(first);
+        }
+    }
+    let remaining = iter.collect::<Vec<_>>();
+    let keep_count = CONTEXT_KEEP_RECENT_MESSAGES.min(remaining.len());
+    let split_at = remaining.len().saturating_sub(keep_count);
+    let omitted = &remaining[..split_at];
+    let recent = &remaining[split_at..];
+    let omitted_tokens = estimate_messages_tokens(omitted);
+    if !omitted.is_empty() {
+        compacted.push(ModelMessage::text(
+            ModelRole::System,
+            format!(
+                "Lan Code compacted {} older messages (~{} tokens estimated) because the active model context window is {} tokens. Preserve the user's current goal, rely on recent messages and tools, and ask for missing details only when necessary.",
+                omitted.len(),
+                omitted_tokens,
+                model_context_tokens
+            ),
+        ));
+    }
+    compacted.extend(recent.iter().cloned());
+    while estimate_messages_tokens(&compacted) > budget && compacted.len() > 3 {
+        compacted.remove(2);
+    }
+    compacted
+}
+
+fn estimate_messages_tokens(messages: &[ModelMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            let mut chars = 12;
+            chars += message
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count();
+            chars += message
+                .reasoning_content
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count();
+            chars += message
+                .tool_calls
+                .as_ref()
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .map(|call| {
+                            call.function.arguments.chars().count() + call.function.name.len()
+                        })
+                        .sum::<usize>()
+                })
+                .unwrap_or_default();
+            (chars / 4).max(1)
+        })
+        .sum()
 }
 
 fn accumulate_usage(total: &mut TokenUsage, value: TokenUsage) {
@@ -920,6 +1018,43 @@ mod tests {
             }],
             usage: TokenUsage::default(),
         }
+    }
+
+    #[test]
+    fn compacts_old_messages_for_small_context_windows() {
+        let mut messages = vec![ModelMessage::text(ModelRole::System, "system prompt")];
+        for index in 0..40 {
+            messages.push(ModelMessage::text(
+                if index % 2 == 0 {
+                    ModelRole::User
+                } else {
+                    ModelRole::Assistant
+                },
+                format!("message-{index} {}", "x".repeat(900)),
+            ));
+        }
+        messages.push(ModelMessage::text(ModelRole::User, "current request"));
+
+        let compacted = super::compact_messages_for_context(messages, 8_000);
+
+        assert!(compacted.len() < 20);
+        assert_eq!(compacted.first().unwrap().role, ModelRole::System);
+        assert!(compacted.iter().any(|message| {
+            message
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("compacted")
+        }));
+        assert!(
+            compacted
+                .last()
+                .unwrap()
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("current request")
+        );
     }
 
     #[tokio::test]
