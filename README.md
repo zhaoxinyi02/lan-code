@@ -85,7 +85,6 @@ Office Mode 是 Lan Code 的新工作台：让 AI 像处理代码一样处理 `.
 
 ## 截图
 
-![Lan Code 桌面端](docs/screenshots/desktop-functional.png)
 
 ## 架构
 
