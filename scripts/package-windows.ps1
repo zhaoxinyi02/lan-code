@@ -1,3 +1,7 @@
+param(
+    [switch]$CleanInstall
+)
+
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
 
@@ -16,7 +20,9 @@ cargo build --release --workspace --manifest-path (Join-Path $repo "Cargo.toml")
 $desktop = Join-Path $repo "apps\desktop"
 Push-Location $desktop
 try {
-    npm ci
+    if ($CleanInstall -or -not (Test-Path (Join-Path $desktop "node_modules"))) {
+        npm ci
+    }
     npm run tauri build -- --no-bundle
 }
 finally {

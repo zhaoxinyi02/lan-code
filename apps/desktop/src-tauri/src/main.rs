@@ -3,7 +3,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -26,6 +26,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 use walkdir::WalkDir;
+use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
 fn hidden_command(program: &str) -> Command {
     let mut command = Command::new(program);
@@ -230,6 +231,85 @@ struct WorkspaceSearchMatch {
     path: String,
     line: usize,
     text: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeFile {
+    path: String,
+    name: String,
+    kind: String,
+    size: u64,
+    modified: u64,
+    dirty: bool,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeSection {
+    id: String,
+    title: String,
+    kind: String,
+    index: usize,
+    text: String,
+    children: Vec<OfficeSection>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeDocument {
+    path: String,
+    name: String,
+    kind: String,
+    text: String,
+    sections: Vec<OfficeSection>,
+    word_count: usize,
+    object_count: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeAction {
+    id: String,
+    action_type: String,
+    path: String,
+    target_id: Option<String>,
+    old_text: Option<String>,
+    new_text: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeDiffItem {
+    id: String,
+    title: String,
+    description: String,
+    change_type: String,
+    before: String,
+    after: String,
+    status: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficePatchPreview {
+    patch_id: String,
+    path: String,
+    backup_path: String,
+    summary: String,
+    actions: Vec<OfficeAction>,
+    diff: Vec<OfficeDiffItem>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeQualityIssue {
+    severity: String,
+    title: String,
+    detail: String,
+    target: String,
 }
 
 #[derive(Serialize)]
@@ -437,6 +517,520 @@ fn mutable_workspace_path(settings: &DesktopSettings, relative: &str) -> Result<
         return Err("拒绝修改工作区根目录".into());
     }
     Ok(resolved)
+}
+
+fn office_kind(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "docx" => Some("docx"),
+        "xlsx" => Some("xlsx"),
+        "pptx" => Some("pptx"),
+        "pdf" => Some("pdf"),
+        "md" => Some("markdown"),
+        "csv" => Some("csv"),
+        _ => None,
+    }
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn plain_text_from_xml(xml: &str) -> String {
+    let xml = xml
+        .replace("</w:p>", "\n")
+        .replace("</a:p>", "\n")
+        .replace("</row>", "\n")
+        .replace("</si>", "\n")
+        .replace("</c>", "\t");
+    let mut out = String::with_capacity(xml.len() / 2);
+    let mut inside_tag = false;
+    for ch in xml.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' => inside_tag = false,
+            _ if !inside_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    xml_unescape(&out)
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn zip_text_entries(
+    path: &Path,
+    predicate: impl Fn(&str) -> bool,
+) -> Result<Vec<(String, String)>, String> {
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| format!("Office 文件包损坏：{error}"))?;
+    let mut entries = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        let name = entry.name().to_string();
+        if predicate(&name) {
+            let mut text = String::new();
+            entry
+                .read_to_string(&mut text)
+                .map_err(|error| error.to_string())?;
+            entries.push((name, text));
+        }
+    }
+    Ok(entries)
+}
+
+fn build_office_section(
+    id: String,
+    title: String,
+    kind: String,
+    index: usize,
+    text: String,
+) -> OfficeSection {
+    OfficeSection {
+        id,
+        title,
+        kind,
+        index,
+        text,
+        children: Vec::new(),
+    }
+}
+
+fn read_ooxml_document(path: &Path, relative: &str, kind: &str) -> Result<OfficeDocument, String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(relative)
+        .to_string();
+    let mut sections = Vec::new();
+    let mut warnings = Vec::new();
+    match kind {
+        "docx" => {
+            let entries = zip_text_entries(path, |name| name == "word/document.xml")?;
+            let text = entries
+                .first()
+                .map(|(_, xml)| plain_text_from_xml(xml))
+                .unwrap_or_default();
+            for (index, paragraph) in text.lines().enumerate() {
+                let trimmed = paragraph.trim();
+                if trimmed.chars().count() < 4 {
+                    continue;
+                }
+                let title = if trimmed.chars().count() > 42 {
+                    format!(
+                        "第 {} 段：{}...",
+                        index + 1,
+                        trimmed.chars().take(42).collect::<String>()
+                    )
+                } else {
+                    format!("第 {} 段：{}", index + 1, trimmed)
+                };
+                sections.push(build_office_section(
+                    format!("paragraph-{index}"),
+                    title,
+                    "paragraph".into(),
+                    index,
+                    trimmed.to_string(),
+                ));
+                if sections.len() >= 80 {
+                    warnings.push("文档段落较多，当前只显示前 80 个大纲节点。".into());
+                    break;
+                }
+            }
+            Ok(OfficeDocument {
+                path: relative.into(),
+                name,
+                kind: kind.into(),
+                word_count: text.split_whitespace().count(),
+                object_count: sections.len(),
+                text,
+                sections,
+                warnings,
+            })
+        }
+        "pptx" => {
+            let mut entries = zip_text_entries(path, |name| {
+                name.starts_with("ppt/slides/slide") && name.ends_with(".xml")
+            })?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut all = Vec::new();
+            for (index, (entry, xml)) in entries.iter().enumerate() {
+                let text = plain_text_from_xml(xml);
+                let title = text
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or("空白页");
+                sections.push(build_office_section(
+                    entry.clone(),
+                    format!(
+                        "第 {} 页：{}",
+                        index + 1,
+                        title.chars().take(34).collect::<String>()
+                    ),
+                    "slide".into(),
+                    index,
+                    text.clone(),
+                ));
+                all.push(format!("## 第 {} 页\n{}", index + 1, text));
+            }
+            let text = all.join("\n\n");
+            Ok(OfficeDocument {
+                path: relative.into(),
+                name,
+                kind: kind.into(),
+                word_count: text.split_whitespace().count(),
+                object_count: sections.len(),
+                text,
+                sections,
+                warnings,
+            })
+        }
+        "xlsx" => {
+            let mut entries = zip_text_entries(path, |name| {
+                name == "xl/sharedStrings.xml"
+                    || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
+            })?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut all = Vec::new();
+            for (index, (entry, xml)) in entries.iter().enumerate() {
+                let text = plain_text_from_xml(xml);
+                let title = if entry == "xl/sharedStrings.xml" {
+                    "共享文本".into()
+                } else {
+                    format!("Sheet {}", index)
+                };
+                sections.push(build_office_section(
+                    entry.clone(),
+                    title,
+                    "sheet".into(),
+                    index,
+                    text.clone(),
+                ));
+                all.push(format!("## {}\n{}", entry, text));
+            }
+            let text = all.join("\n\n");
+            Ok(OfficeDocument {
+                path: relative.into(),
+                name,
+                kind: kind.into(),
+                word_count: text.split_whitespace().count(),
+                object_count: sections.len(),
+                text,
+                sections,
+                warnings,
+            })
+        }
+        _ => Err("暂不支持该 Office 类型的结构化读取".into()),
+    }
+}
+
+fn read_plain_office_document(
+    path: &Path,
+    relative: &str,
+    kind: &str,
+) -> Result<OfficeDocument, String> {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(relative)
+        .to_string();
+    let text = if kind == "pdf" {
+        let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+        format!(
+            "PDF 文件已识别。\n大小：{} KB\n\n当前版本先支持 PDF 作为上下文文件加入 Office Mode，后续会接入 PDF 文本抽取、页面渲染和标注编辑。",
+            metadata.len() / 1024
+        )
+    } else {
+        fs::read_to_string(path).map_err(|_| "该文件无法作为文本读取")?
+    };
+    Ok(OfficeDocument {
+        path: relative.into(),
+        name,
+        kind: kind.into(),
+        word_count: text.split_whitespace().count(),
+        object_count: 1,
+        sections: vec![build_office_section(
+            "body".into(),
+            "正文".into(),
+            "text".into(),
+            0,
+            text.clone(),
+        )],
+        text,
+        warnings: if kind == "pdf" {
+            vec!["PDF 编辑引擎尚未启用，本版本先作为只读上下文。".into()]
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+fn target_xml_for_kind(kind: &str, entry: &str) -> bool {
+    match kind {
+        "docx" => entry == "word/document.xml",
+        "pptx" => entry.starts_with("ppt/slides/slide") && entry.ends_with(".xml"),
+        "xlsx" => {
+            entry == "xl/sharedStrings.xml"
+                || (entry.starts_with("xl/worksheets/sheet") && entry.ends_with(".xml"))
+        }
+        _ => false,
+    }
+}
+
+fn replace_in_office_package(
+    source: &Path,
+    target: &Path,
+    kind: &str,
+    old_text: &str,
+    new_text: &str,
+) -> Result<usize, String> {
+    let bytes = fs::read(source).map_err(|error| error.to_string())?;
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).map_err(|error| error.to_string())?;
+    let output = fs::File::create(target).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(output);
+    let mut replacements = 0;
+    let escaped_old = xml_escape(old_text);
+    let escaped_new = xml_escape(new_text);
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| error.to_string())?;
+        let name = file.name().to_string();
+        let options = SimpleFileOptions::default().compression_method(file.compression());
+        writer
+            .start_file(name.clone(), options)
+            .map_err(|error| error.to_string())?;
+        if target_xml_for_kind(kind, &name) {
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .map_err(|error| error.to_string())?;
+            let before = text.clone();
+            text = text.replace(&escaped_old, &escaped_new);
+            if text == before {
+                text = text.replace(old_text, new_text);
+            }
+            if text != before {
+                replacements += before
+                    .matches(&escaped_old)
+                    .count()
+                    .max(before.matches(old_text).count())
+                    .max(1);
+            }
+            writer
+                .write_all(text.as_bytes())
+                .map_err(|error| error.to_string())?;
+        } else {
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            writer
+                .write_all(&buffer)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(replacements)
+}
+
+fn append_to_office_package(
+    source: &Path,
+    target: &Path,
+    kind: &str,
+    new_text: &str,
+) -> Result<usize, String> {
+    let bytes = fs::read(source).map_err(|error| error.to_string())?;
+    let reader = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(reader).map_err(|error| error.to_string())?;
+    let output = fs::File::create(target).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(output);
+    let mut applied = 0;
+    let escaped = xml_escape(new_text);
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| error.to_string())?;
+        let name = file.name().to_string();
+        let options = SimpleFileOptions::default().compression_method(file.compression());
+        writer
+            .start_file(name.clone(), options)
+            .map_err(|error| error.to_string())?;
+        if applied == 0 && target_xml_for_kind(kind, &name) {
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .map_err(|error| error.to_string())?;
+            let patched = match kind {
+                "docx" => text.replace(
+                    "</w:body>",
+                    &format!("<w:p><w:r><w:t>{escaped}</w:t></w:r></w:p></w:body>"),
+                ),
+                "pptx" => text.replace(
+                    "</p:spTree>",
+                    &format!(r#"<p:sp><p:nvSpPr/><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{escaped}</a:t></a:r></a:p></p:txBody></p:sp></p:spTree>"#),
+                ),
+                "xlsx" => text.replace(
+                    "</sheetData>",
+                    &format!(r#"<row><c t="inlineStr"><is><t>{escaped}</t></is></c></row></sheetData>"#),
+                ),
+                _ => text.clone(),
+            };
+            if patched != text {
+                applied = 1;
+            }
+            writer
+                .write_all(patched.as_bytes())
+                .map_err(|error| error.to_string())?;
+        } else {
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            writer
+                .write_all(&buffer)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(applied)
+}
+
+fn office_backup_path(path: &Path) -> PathBuf {
+    let stamp = chrono_like_stamp();
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("office-file");
+    path.with_file_name(format!("{name}.lancode-backup-{stamp}"))
+}
+
+fn chrono_like_stamp() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    millis.to_string()
+}
+
+fn write_zip_text(writer: &mut ZipWriter<fs::File>, name: &str, text: &str) -> Result<(), String> {
+    writer
+        .start_file(
+            name,
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated),
+        )
+        .map_err(|error| error.to_string())?;
+    writer
+        .write_all(text.as_bytes())
+        .map_err(|error| error.to_string())
+}
+
+fn create_minimal_docx(path: &Path, title: &str) -> Result<(), String> {
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(file);
+    write_zip_text(
+        &mut writer,
+        "[Content_Types].xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "_rels/.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "word/document.xml",
+        &format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p><w:p><w:r><w:t>从 Lan Code Office Mode 开始编辑。</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+            xml_escape(title)
+        ),
+    )?;
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn create_minimal_pptx(path: &Path, title: &str) -> Result<(), String> {
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(file);
+    write_zip_text(
+        &mut writer,
+        "[Content_Types].xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/><Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/></Types>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "_rels/.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/></Relationships>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "ppt/presentation.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldIdLst><p:sldId id="256" r:id="rId1"/></p:sldIdLst><p:sldSz cx="12192000" cy="6858000"/></p:presentation>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "ppt/_rels/presentation.xml.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "ppt/slides/slide1.xml",
+        &format!(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr/><p:grpSpPr/><p:sp><p:nvSpPr/><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{}</a:t></a:r></a:p><a:p><a:r><a:t>从 Lan Code Office Mode 开始编辑。</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+            xml_escape(title)
+        ),
+    )?;
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn create_minimal_xlsx(path: &Path) -> Result<(), String> {
+    let file = fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(file);
+    write_zip_text(
+        &mut writer,
+        "[Content_Types].xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "_rels/.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "xl/workbook.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "xl/_rels/workbook.xml.rels",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+    )?;
+    write_zip_text(
+        &mut writer,
+        "xl/worksheets/sheet1.xml",
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Lan Code Office Mode</t></is></c></row></sheetData></worksheet>"#,
+    )?;
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn resolved_route(
@@ -850,6 +1444,372 @@ async fn read_workspace_file(
     Ok(WorkspaceFile {
         path,
         content: fs::read_to_string(resolved).map_err(|_| "该文件不是可编辑文本文件")?,
+    })
+}
+
+#[tauri::command]
+async fn office_list_files(state: State<'_, AppState>) -> Result<Vec<OfficeFile>, String> {
+    let settings = state.settings.read().await;
+    let root = PathBuf::from(&settings.workspace)
+        .canonicalize()
+        .map_err(|error| format!("工作区不可用：{error}"))?;
+    let ignored = [".git", "node_modules", "target", "dist", ".idea", ".vscode"];
+    let git_status = hidden_command("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| line.len() >= 4)
+                .map(|line| {
+                    line[3..]
+                        .rsplit_once(" -> ")
+                        .map(|(_, target)| target)
+                        .unwrap_or(&line[3..])
+                        .trim_matches('"')
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let mut files = Vec::new();
+    for entry in WalkDir::new(&root)
+        .max_depth(8)
+        .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() == 0 || !ignored.contains(&entry.file_name().to_string_lossy().as_ref())
+        })
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let Some(kind) = office_kind(entry.path()) else {
+            continue;
+        };
+        let metadata = entry.metadata().map_err(|error| error.to_string())?;
+        let relative = entry
+            .path()
+            .strip_prefix(&root)
+            .map_err(|error| error.to_string())?
+            .display()
+            .to_string();
+        files.push(OfficeFile {
+            name: entry.file_name().to_string_lossy().to_string(),
+            dirty: git_status.contains(&relative),
+            path: relative,
+            kind: kind.into(),
+            size: metadata.len(),
+            modified: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default(),
+        });
+    }
+    files.sort_by(|a, b| b.modified.cmp(&a.modified).then(a.path.cmp(&b.path)));
+    Ok(files)
+}
+
+#[tauri::command]
+async fn office_read_file(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<OfficeDocument, String> {
+    let settings = state.settings.read().await;
+    let resolved = workspace_path(&settings, &path)?;
+    let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
+    if matches!(kind, "docx" | "pptx" | "xlsx") {
+        read_ooxml_document(&resolved, &path, kind)
+    } else {
+        read_plain_office_document(&resolved, &path, kind)
+    }
+}
+
+#[tauri::command]
+async fn office_create_file(
+    path: String,
+    kind: String,
+    state: State<'_, AppState>,
+) -> Result<OfficeDocument, String> {
+    let settings = state.settings.read().await;
+    let resolved = mutable_workspace_path(&settings, &path)?;
+    if resolved.exists() {
+        return Err("同名 Office 文件已存在".into());
+    }
+    if let Some(parent) = resolved.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    match kind.as_str() {
+        "docx" => create_minimal_docx(&resolved, "Lan Code 新文档")?,
+        "pptx" => create_minimal_pptx(&resolved, "Lan Code 新演示")?,
+        "xlsx" => create_minimal_xlsx(&resolved)?,
+        "markdown" | "md" => {
+            fs::write(&resolved, "# 新文档\n").map_err(|error| error.to_string())?
+        }
+        _ => return Err("暂不支持创建该类型".into()),
+    }
+    let actual_kind = office_kind(&resolved).unwrap_or(kind.as_str());
+    if matches!(actual_kind, "docx" | "pptx" | "xlsx") {
+        read_ooxml_document(&resolved, &path, actual_kind)
+    } else {
+        read_plain_office_document(&resolved, &path, actual_kind)
+    }
+}
+
+#[tauri::command]
+async fn office_preview_patch(
+    actions: Vec<OfficeAction>,
+    state: State<'_, AppState>,
+) -> Result<OfficePatchPreview, String> {
+    let settings = state.settings.read().await;
+    let first = actions.first().ok_or("没有可预览的 Office 操作")?;
+    let resolved = mutable_workspace_path(&settings, &first.path)?;
+    let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
+    let backup = office_backup_path(&resolved);
+    let mut diff = Vec::new();
+    for (index, action) in actions.iter().enumerate() {
+        let before = action.old_text.clone().unwrap_or_default();
+        let after = action.new_text.clone().unwrap_or_default();
+        diff.push(OfficeDiffItem {
+            id: action.id.clone(),
+            title: match action.action_type.as_str() {
+                "replace_text" => "替换文字".into(),
+                "insert_text" => "插入文字".into(),
+                "set_style" => "调整样式".into(),
+                other => format!("Office 操作：{other}"),
+            },
+            description: action.note.clone().unwrap_or_else(|| {
+                format!(
+                    "目标：{}",
+                    action
+                        .target_id
+                        .clone()
+                        .unwrap_or_else(|| "当前文档".into())
+                )
+            }),
+            change_type: if before.is_empty() {
+                "insert".into()
+            } else {
+                "content".into()
+            },
+            before,
+            after,
+            status: if matches!(kind, "docx" | "pptx" | "xlsx") {
+                "ready".into()
+            } else {
+                "readonly".into()
+            },
+        });
+        if index > 50 {
+            break;
+        }
+    }
+    Ok(OfficePatchPreview {
+        patch_id: Uuid::new_v4().to_string(),
+        path: first.path.clone(),
+        backup_path: backup.display().to_string(),
+        summary: format!(
+            "准备对 {} 执行 {} 个结构化 Office 操作",
+            first.path,
+            actions.len()
+        ),
+        actions,
+        diff,
+    })
+}
+
+#[tauri::command]
+async fn office_apply_patch(
+    actions: Vec<OfficeAction>,
+    state: State<'_, AppState>,
+) -> Result<OfficePatchPreview, String> {
+    let settings = state.settings.read().await;
+    let first = actions.first().ok_or("没有可应用的 Office 操作")?;
+    let resolved = mutable_workspace_path(&settings, &first.path)?;
+    let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
+    if !matches!(kind, "docx" | "pptx" | "xlsx" | "markdown" | "csv") {
+        return Err("该文件类型当前只支持只读上下文，不支持写回".into());
+    }
+    let backup = office_backup_path(&resolved);
+    fs::copy(&resolved, &backup).map_err(|error| error.to_string())?;
+    let mut diff = Vec::new();
+    if matches!(kind, "docx" | "pptx" | "xlsx") {
+        let mut current = resolved.clone();
+        let mut temp_paths = Vec::new();
+        for action in actions.iter() {
+            let old_text = action.old_text.as_deref().unwrap_or_default();
+            let new_text = action.new_text.as_deref().unwrap_or_default();
+            if old_text.is_empty() && action.action_type != "insert_text" {
+                continue;
+            }
+            let temp = resolved.with_extension(format!("{}.lancode-tmp", Uuid::new_v4()));
+            let replacements = if action.action_type == "insert_text" && old_text.is_empty() {
+                append_to_office_package(&current, &temp, kind, new_text)?
+            } else {
+                replace_in_office_package(&current, &temp, kind, old_text, new_text)?
+            };
+            temp_paths.push(temp.clone());
+            current = temp;
+            diff.push(OfficeDiffItem {
+                id: action.id.clone(),
+                title: if replacements == 0 {
+                    "未找到目标文本".into()
+                } else {
+                    "已应用文本替换".into()
+                },
+                description: action
+                    .note
+                    .clone()
+                    .unwrap_or_else(|| format!("命中 {replacements} 处")),
+                change_type: "content".into(),
+                before: old_text.into(),
+                after: new_text.into(),
+                status: if replacements == 0 {
+                    "skipped".into()
+                } else {
+                    "applied".into()
+                },
+            });
+        }
+        if current != resolved {
+            fs::copy(&current, &resolved).map_err(|error| error.to_string())?;
+        }
+        for temp in temp_paths {
+            let _ = fs::remove_file(temp);
+        }
+    } else {
+        let mut content = fs::read_to_string(&resolved).map_err(|_| "文本文件读取失败")?;
+        for action in actions.iter() {
+            let old_text = action.old_text.as_deref().unwrap_or_default();
+            let new_text = action.new_text.as_deref().unwrap_or_default();
+            if old_text.is_empty() {
+                content.push_str(new_text);
+            } else {
+                content = content.replace(old_text, new_text);
+            }
+            diff.push(OfficeDiffItem {
+                id: action.id.clone(),
+                title: "已应用文本操作".into(),
+                description: action.note.clone().unwrap_or_default(),
+                change_type: "content".into(),
+                before: old_text.into(),
+                after: new_text.into(),
+                status: "applied".into(),
+            });
+        }
+        fs::write(&resolved, content).map_err(|error| error.to_string())?;
+    }
+    Ok(OfficePatchPreview {
+        patch_id: Uuid::new_v4().to_string(),
+        path: first.path.clone(),
+        backup_path: backup.display().to_string(),
+        summary: format!("已写入 {}，原文件备份为 {}", first.path, backup.display()),
+        actions,
+        diff,
+    })
+}
+
+#[tauri::command]
+async fn office_rollback(
+    backup_path: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<OfficeDocument, String> {
+    let settings = state.settings.read().await;
+    let target = mutable_workspace_path(&settings, &path)?;
+    let backup = PathBuf::from(&backup_path);
+    if !backup.exists() {
+        return Err("备份文件不存在".into());
+    }
+    fs::copy(&backup, &target).map_err(|error| error.to_string())?;
+    let kind = office_kind(&target).ok_or("不是 Office Mode 支持的文件类型")?;
+    if matches!(kind, "docx" | "pptx" | "xlsx") {
+        read_ooxml_document(&target, &path, kind)
+    } else {
+        read_plain_office_document(&target, &path, kind)
+    }
+}
+
+#[tauri::command]
+async fn office_check_file(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<OfficeQualityIssue>, String> {
+    let document = office_read_file(path, state).await?;
+    let mut issues = Vec::new();
+    if document.text.trim().is_empty() {
+        issues.push(OfficeQualityIssue {
+            severity: "warning".into(),
+            title: "内容为空".into(),
+            detail: "当前文件没有可读取的文本内容，可能是图片型文档或复杂对象。".into(),
+            target: document.name.clone(),
+        });
+    }
+    if document.text.lines().any(|line| line.chars().count() > 120) {
+        issues.push(OfficeQualityIssue {
+            severity: "info".into(),
+            title: "存在较长段落".into(),
+            detail: "建议检查页面换行、表格宽度或幻灯片文本溢出。".into(),
+            target: document.name.clone(),
+        });
+    }
+    if document.warnings.is_empty() && issues.is_empty() {
+        issues.push(OfficeQualityIssue {
+            severity: "ok".into(),
+            title: "基础结构检查通过".into(),
+            detail: "文件可读取，未发现明显空内容或长行风险。".into(),
+            target: document.name,
+        });
+    }
+    Ok(issues)
+}
+
+#[tauri::command]
+async fn office_export_markdown(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<WorkspaceFile, String> {
+    let document = office_read_file(path.clone(), state.clone()).await?;
+    let settings = state.settings.read().await;
+    let source = workspace_path(&settings, &path)?;
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("office-export");
+    let export_name = format!("{stem}.office.md");
+    let export_path = source.with_file_name(&export_name);
+    let relative = export_path
+        .strip_prefix(
+            PathBuf::from(&settings.workspace)
+                .canonicalize()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?
+        .display()
+        .to_string();
+    let mut markdown = format!(
+        "# {}\n\n- 来源文件：`{}`\n- 类型：{}\n- 对象数量：{}\n\n",
+        document.name,
+        document.path,
+        document.kind.to_uppercase(),
+        document.object_count
+    );
+    if document.sections.is_empty() {
+        markdown.push_str(&document.text);
+    } else {
+        for section in document.sections {
+            markdown.push_str(&format!("## {}\n\n{}\n\n", section.title, section.text));
+        }
+    }
+    fs::write(&export_path, markdown.as_bytes()).map_err(|error| error.to_string())?;
+    Ok(WorkspaceFile {
+        path: relative,
+        content: markdown,
     })
 }
 
@@ -1641,6 +2601,14 @@ fn main() {
             list_workspace_files,
             search_workspace,
             read_workspace_file,
+            office_list_files,
+            office_read_file,
+            office_create_file,
+            office_preview_patch,
+            office_apply_patch,
+            office_rollback,
+            office_check_file,
+            office_export_markdown,
             write_workspace_file,
             create_workspace_entry,
             rename_workspace_entry,
@@ -1680,7 +2648,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopSettings, build_core, infer_model_capabilities};
+    use super::{
+        DesktopSettings, build_core, create_minimal_docx, infer_model_capabilities,
+        plain_text_from_xml, read_ooxml_document,
+    };
 
     #[test]
     fn infers_common_multimodal_model_capabilities() {
@@ -1709,5 +2680,24 @@ mod tests {
         assert!(tools.contains(&"analyze_image".to_string()));
         assert!(tools.contains(&"generate_image".to_string()));
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn office_xml_text_extraction_preserves_paragraphs() {
+        let text = plain_text_from_xml(
+            r#"<w:p><w:r><w:t>第一段</w:t></w:r></w:p><w:p><w:r><w:t>第二段 &amp; 符号</w:t></w:r></w:p>"#,
+        );
+        assert!(text.contains("第一段"));
+        assert!(text.contains("第二段 & 符号"));
+    }
+
+    #[test]
+    fn office_minimal_docx_can_be_created_and_read() {
+        let path = std::env::temp_dir().join(format!("lan-office-{}.docx", uuid::Uuid::new_v4()));
+        create_minimal_docx(&path, "测试文档").unwrap();
+        let document = read_ooxml_document(&path, "测试文档.docx", "docx").unwrap();
+        assert_eq!(document.kind, "docx");
+        assert!(document.text.contains("测试文档"));
+        let _ = std::fs::remove_file(path);
     }
 }

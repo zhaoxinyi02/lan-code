@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Lan Code",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "identifier": "dev.lancode.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -21,7 +21,7 @@
         "center": true,
         "decorations": false,
         "shadow": true,
-        "windowClassname": "LanCodeDesktopV023ModelManager"
+        "windowClassname": "LanCodeDesktopV027OfficeMode"
       }
     ],
     "security": { "csp": null }

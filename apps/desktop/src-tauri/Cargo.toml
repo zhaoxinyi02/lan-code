@@ -24,3 +24,4 @@ semver = "1"
 sha2 = "0.10"
 walkdir.workspace = true
 portable-pty = "0.9"
+zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -13,10 +13,10 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import materialTheme from "./assets/material-icons.json";
 import {
-  Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, Code2, File, FileDiff, FilePlus, Folder, FolderGit2, Image,
+  Bot, BookOpen, CheckCircle2, ChevronDown, ChevronRight, CircleStop, ClipboardCheck, Code2, File, FileDiff, FilePlus, FileText, Folder, FolderGit2, Image,
   FolderOpen, FolderPlus, GitBranch, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
   Download, MessageSquare, RefreshCw, RotateCcw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
-  XCircle, Zap, Sun, Moon, Monitor, Check, Menu, GitCommitHorizontal, Eye, ExternalLink, Github,
+  XCircle, Zap, Sun, Moon, Monitor, Check, Menu, GitCommitHorizontal, Eye, ExternalLink, Github, History,
   ArrowLeft, ArrowRight, Minus, Square, X,
 } from "lucide-react";
 import "./styles.css";
@@ -76,6 +76,15 @@ type TerminalKind = "powershell" | "cmd" | "wsl";
 type TerminalTab = { id: string; title: string; shell: TerminalKind };
 type TerminalPayload = { id: string; data: string };
 type ContextMeterProps = { used: number; limit: number; compact?: boolean };
+type WorkbenchMode = "agent" | "code" | "office";
+type OfficeFile = { path: string; name: string; kind: string; size: number; modified: number; dirty: boolean };
+type OfficeSection = { id: string; title: string; kind: string; index: number; text: string; children: OfficeSection[] };
+type OfficeDocument = { path: string; name: string; kind: string; text: string; sections: OfficeSection[]; wordCount: number; objectCount: number; warnings: string[] };
+type OfficeAction = { id: string; actionType: string; path: string; targetId?: string; oldText?: string; newText?: string; note?: string };
+type OfficeDiffItem = { id: string; title: string; description: string; changeType: string; before: string; after: string; status: string };
+type OfficePatchPreview = { patchId: string; path: string; backupPath: string; summary: string; actions: OfficeAction[]; diff: OfficeDiffItem[] };
+type OfficeQualityIssue = { severity: string; title: string; detail: string; target: string };
+type OfficeLeftTab = "files" | "outline" | "changes" | "history" | "check";
 
 const DEFAULT_SETTINGS: SettingsData = {
   provider: "deepseek",
@@ -97,7 +106,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.6";
+const CURRENT_VERSION = "0.2.7";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -194,6 +203,14 @@ function resolveMaterialIcon(path: string, light: boolean): string {
 
 function FileTypeIcon({ path, size = 16, light = false }: { path: string; size?: number; light?: boolean }) {
   return <img className="material-file-icon" src={resolveMaterialIcon(path, light)} width={size} height={size} alt="" />;
+}
+
+function OfficeKindIcon({ kind, path, size = 16 }: { kind: string; path?: string; size?: number }) {
+  if (path) return <FileTypeIcon path={path} size={size} />;
+  if (kind === "docx") return <FileText size={size} className="office-kind-docx" />;
+  if (kind === "xlsx") return <ClipboardCheck size={size} className="office-kind-xlsx" />;
+  if (kind === "pptx") return <BookOpen size={size} className="office-kind-pptx" />;
+  return <File size={size} />;
 }
 
 function activeContextWindowFromSettings(settings: SettingsData) {
@@ -561,7 +578,7 @@ function App() {
   const [updateInfo, setUpdateInfo] = React.useState<UpdateInfo>(DEFAULT_UPDATE_INFO);
   const [updateStatus, setUpdateStatus] = React.useState("");
   const [downloadedUpdate, setDownloadedUpdate] = React.useState("");
-  const [workbench, setWorkbench] = React.useState<"agent" | "code">("agent");
+  const [workbench, setWorkbench] = React.useState<WorkbenchMode>("agent");
   const [workspaceFiles, setWorkspaceFiles] = React.useState<WorkspaceEntry[]>([]);
   const [activeFile, setActiveFile] = React.useState("");
   const [openFiles, setOpenFiles] = React.useState<OpenFile[]>([]);
@@ -581,6 +598,15 @@ function App() {
   const [inspectorWidth, setInspectorWidth] = React.useState(() => storedSize("lan-code-inspector-width", 252));
   const [activityHeight, setActivityHeight] = React.useState(() => storedSize("lan-code-activity-height", 190, 120, 320));
   const [codePanelsHeight, setCodePanelsHeight] = React.useState(() => storedSize("lan-code-panels-height", 320, 310, 460));
+  const [officeFiles, setOfficeFiles] = React.useState<OfficeFile[]>([]);
+  const [officeTab, setOfficeTab] = React.useState<OfficeLeftTab>("files");
+  const [activeOfficePath, setActiveOfficePath] = React.useState("");
+  const [openOfficeDocs, setOpenOfficeDocs] = React.useState<OfficeDocument[]>([]);
+  const [officePreview, setOfficePreview] = React.useState<OfficePatchPreview>();
+  const [officeIssues, setOfficeIssues] = React.useState<OfficeQualityIssue[]>([]);
+  const [officeHistory, setOfficeHistory] = React.useState<OfficePatchPreview[]>([]);
+  const [officeInstruction, setOfficeInstruction] = React.useState("");
+  const [officeStatus, setOfficeStatus] = React.useState("");
   const [showScrollBottom, setShowScrollBottom] = React.useState(false);
   const [fileContextMenu, setFileContextMenu] = React.useState<FileContextMenu>();
   const [appDialog, setAppDialog] = React.useState<AppDialog>();
@@ -593,6 +619,7 @@ function App() {
   const completionEnabledRef = React.useRef(completionEnabled);
   const conversationRef = React.useRef<HTMLElement | null>(null);
   const activeDocument = openFiles.find((file) => file.path === activeFile);
+  const activeOfficeDoc = openOfficeDocs.find((file) => file.path === activeOfficePath);
   const providerReady = Boolean(settings.apiKey) || ["ollama", "lmstudio"].includes(settings.provider);
   const darkTheme = themeMode === "dark" || (themeMode === "system" && systemDark);
   const workingTreeDirty = Boolean(gitOverview?.isRepository && gitOverview.changedFiles > 0);
@@ -769,6 +796,11 @@ function App() {
     invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles).catch((error) => setCodeStatus(String(error)));
     invoke<GitChange[]>("workspace_git_changes").then(setGitChanges).catch(() => {});
     invoke<GitOverview>("workspace_git_overview").then(setGitOverview).catch(() => setGitOverview(undefined));
+  }, [workbench, settings.workspace]);
+
+  React.useEffect(() => {
+    if (workbench !== "office" || !settings.workspace) return;
+    void refreshOfficeFiles();
   }, [workbench, settings.workspace]);
 
   React.useEffect(() => {
@@ -1026,6 +1058,16 @@ function App() {
       `【Lan Code 上下文守门】当前对话约 ${currentUsage.totalTokens.toLocaleString()} / ${contextWindow.toLocaleString()} Token。请先在内部压缩旧上下文，只保留用户目标、关键文件、已执行操作、未完成事项和风险，再处理下面的新请求。不要把压缩过程冗长展示给用户，最终回答保持清楚。`,
       );
     }
+    if (workbench === "office" && activeOfficeDoc) {
+      hints.push([
+        "【Lan Code Office Mode】当前用户正在处理 Office 文件。",
+        `文件：${activeOfficeDoc.path}`,
+        `类型：${activeOfficeDoc.kind}`,
+        `对象数：${activeOfficeDoc.objectCount}`,
+        "原则：不要直接输出 OOXML；如果要修改文件，请先说明结构化 OfficeAction（replace_text / insert_text / set_style / update_table / update_slide），由 Lan Code Office Engine 执行。",
+        `当前文件摘要：\n${activeOfficeDoc.text.slice(0, 2400)}`,
+      ].join("\n"));
+    }
     return hints.length ? [...hints, "", text].join("\n") : text;
   }
 
@@ -1127,6 +1169,156 @@ function App() {
 
   async function refreshWorkspaceFiles() {
     setWorkspaceFiles(await invoke<WorkspaceEntry[]>("list_workspace_files"));
+  }
+
+  async function refreshOfficeFiles() {
+    try {
+      const files = await invoke<OfficeFile[]>("office_list_files");
+      setOfficeFiles(files);
+      if (!activeOfficePath && files[0]) await openOfficeFile(files[0].path);
+      setOfficeStatus("");
+    } catch (error) {
+      setOfficeStatus(`Office 文件加载失败：${String(error)}`);
+    }
+  }
+
+  async function openOfficeFile(path: string) {
+    const existing = openOfficeDocs.find((doc) => doc.path === path);
+    if (existing) {
+      setActiveOfficePath(path);
+      return;
+    }
+    try {
+      const document = await invoke<OfficeDocument>("office_read_file", { path });
+      setOpenOfficeDocs((items) => [...items, document]);
+      setActiveOfficePath(document.path);
+      setOfficeTab("outline");
+      setOfficeStatus("");
+      const issues = await invoke<OfficeQualityIssue[]>("office_check_file", { path }).catch(() => [] as OfficeQualityIssue[]);
+      setOfficeIssues(issues);
+    } catch (error) {
+      setOfficeStatus(`Office 打开失败：${String(error)}`);
+    }
+  }
+
+  async function closeOfficeFile(path: string) {
+    const index = openOfficeDocs.findIndex((doc) => doc.path === path);
+    const remaining = openOfficeDocs.filter((doc) => doc.path !== path);
+    setOpenOfficeDocs(remaining);
+    if (activeOfficePath === path) setActiveOfficePath(remaining[Math.min(index, remaining.length - 1)]?.path || "");
+  }
+
+  async function createOfficeFile(kind: "docx" | "xlsx" | "pptx") {
+    const defaultName = kind === "docx" ? "新文档.docx" : kind === "xlsx" ? "新表格.xlsx" : "新演示.pptx";
+    const path = (await askInput("新建 Office 文件", "输入相对路径", defaultName))?.trim();
+    if (!path) return;
+    try {
+      const document = await invoke<OfficeDocument>("office_create_file", { path, kind });
+      await refreshOfficeFiles();
+      setOpenOfficeDocs((items) => [...items.filter((item) => item.path !== document.path), document]);
+      setActiveOfficePath(document.path);
+      setOfficeStatus(`已创建 ${document.name}`);
+    } catch (error) {
+      setOfficeStatus(`创建失败：${String(error)}`);
+    }
+  }
+
+  async function previewOfficeInstruction() {
+    if (!activeOfficeDoc || !officeInstruction.trim()) return;
+    const selection = activeOfficeDoc.sections[0]?.text || activeOfficeDoc.text.slice(0, 240);
+    const action: OfficeAction = {
+      id: crypto.randomUUID(),
+      actionType: "replace_text",
+      path: activeOfficeDoc.path,
+      targetId: activeOfficeDoc.sections[0]?.id || "document",
+      oldText: selection,
+      newText: `${selection}\n\n[Lan Code 待生成] ${officeInstruction.trim()}`,
+      note: "当前版本先生成可审阅的结构化操作；你可以在应用前检查 Office Diff。",
+    };
+    try {
+      const preview = await invoke<OfficePatchPreview>("office_preview_patch", { actions: [action] });
+      setOfficePreview(preview);
+      setOfficeTab("changes");
+      setOfficeStatus(preview.summary);
+    } catch (error) {
+      setOfficeStatus(`生成预览失败：${String(error)}`);
+    }
+  }
+
+  async function applyOfficePreview() {
+    if (!officePreview) return;
+    try {
+      const applied = await invoke<OfficePatchPreview>("office_apply_patch", { actions: officePreview.actions });
+      setOfficeHistory((items) => [applied, ...items].slice(0, 30));
+      setOfficePreview(applied);
+      const document = await invoke<OfficeDocument>("office_read_file", { path: applied.path });
+      setOpenOfficeDocs((items) => items.map((item) => item.path === document.path ? document : item));
+      await refreshOfficeFiles();
+      await refreshGitChanges();
+      setOfficeStatus(applied.summary);
+    } catch (error) {
+      setOfficeStatus(`应用失败：${String(error)}`);
+    }
+  }
+
+  async function exportOfficeMarkdown() {
+    if (!activeOfficeDoc) return;
+    try {
+      const exported = await invoke<{ path: string; content: string }>("office_export_markdown", { path: activeOfficeDoc.path });
+      setOfficeStatus(`已导出 Markdown：${exported.path}`);
+      await refreshOfficeFiles();
+      await refreshWorkspaceFiles().catch(() => {});
+    } catch (error) {
+      setOfficeStatus(`导出失败：${String(error)}`);
+    }
+  }
+
+  async function sendOfficeInstructionToAgent() {
+    if (!activeOfficeDoc || !officeInstruction.trim() || busy) return;
+    const text = [
+      `请在 Office Mode 中处理文件 ${activeOfficeDoc.path}。`,
+      `用户需求：${officeInstruction.trim()}`,
+      "",
+      "请先理解当前 Office 文件上下文，给出清晰总结和建议的结构化 OfficeAction。不要直接输出 OOXML。",
+      "如果能安全修改，请说明 oldText/newText/actionType/targetId；如果需要用户确认，也要说清楚。",
+    ].join("\n");
+    setPrompt(text);
+    setWorkbench("agent");
+    requestAnimationFrame(() => void sendWithText(text));
+  }
+
+  async function sendWithText(text: string) {
+    if (!text.trim() || busy) return;
+    try {
+      let sessionId = activeId;
+      if (!sessionId) sessionId = await newSession(text.slice(0, 32));
+      if (!sessionId) return;
+      setMessages((items) => [...items, { role: "user", text }]);
+      setPrompt("");
+      setBusy(true);
+      const result = await invoke<{ text: string }>("start_turn", {
+        sessionId, prompt: contextAwarePrompt(text), mode: settings.approvalMode,
+      });
+      setMessages((items) => [...items, { role: "assistant", text: result.text }]);
+    } catch (error) {
+      setMessages((items) => [...items, { role: "assistant", text: `执行失败：${String(error)}` }]);
+    } finally {
+      setBusy(false);
+      await refreshSessions();
+    }
+  }
+
+  async function rollbackOfficePatch(patch: OfficePatchPreview) {
+    if (!await askConfirm("回滚 Office 修改", `确定用备份恢复 ${patch.path} 吗？`, true)) return;
+    try {
+      const document = await invoke<OfficeDocument>("office_rollback", { backupPath: patch.backupPath, path: patch.path });
+      setOpenOfficeDocs((items) => items.map((item) => item.path === document.path ? document : item));
+      setOfficeStatus(`已回滚 ${document.name}`);
+      await refreshOfficeFiles();
+      await refreshGitChanges();
+    } catch (error) {
+      setOfficeStatus(`回滚失败：${String(error)}`);
+    }
   }
 
   async function refreshGitChanges() {
@@ -1287,24 +1479,7 @@ function App() {
 
   async function send() {
     const text = prompt.trim();
-    if (!text || busy) return;
-    try {
-      let sessionId = activeId;
-      if (!sessionId) sessionId = await newSession(text.slice(0, 32));
-      if (!sessionId) return;
-      setMessages((items) => [...items, { role: "user", text }]);
-      setPrompt("");
-      setBusy(true);
-      const result = await invoke<{ text: string }>("start_turn", {
-        sessionId, prompt: contextAwarePrompt(text), mode: settings.approvalMode,
-      });
-      setMessages((items) => [...items, { role: "assistant", text: result.text }]);
-    } catch (error) {
-      setMessages((items) => [...items, { role: "assistant", text: `执行失败：${String(error)}` }]);
-    } finally {
-      setBusy(false);
-      await refreshSessions();
-    }
+    await sendWithText(text);
   }
 
   async function interrupt() {
@@ -1420,7 +1595,7 @@ function App() {
             {appMenu === menu && <div className="app-menu-popover">
               {menu === "file" && <><button onClick={() => { setAppMenu(undefined); void newSession(); }}><MessageSquare size={14} />新建对话<kbd>Ctrl+N</kbd></button><button onClick={() => { setAppMenu(undefined); void addProject(); }}><FolderPlus size={14} />添加项目</button><i /><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={14} />设置</button></>}
               {menu === "edit" && <><button onClick={() => { setAppMenu(undefined); setPaletteOpen(true); }}><Sparkles size={14} />快速任务<kbd>Ctrl+K</kbd></button><i /><button disabled={!activeFile} onClick={() => { setAppMenu(undefined); void saveWorkspaceFile(); }}><Save size={14} />保存文件<kbd>Ctrl+S</kbd></button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(false); }}><FilePlus size={14} />新建文件</button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(true); }}><FolderPlus size={14} />新建文件夹</button></>}
-              {menu === "view" && <><button onClick={() => { setAppMenu(undefined); setWorkbench("agent"); }}><MessageSquare size={14} />Agent 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("code"); }}><Code2 size={14} />Code 工作台</button><i /><button onClick={() => { setAppMenu(undefined); setSidebarOpen((value) => !value); }}><PanelLeftOpen size={14} />切换侧栏</button><button onClick={() => { setAppMenu(undefined); setInspectorOpen((value) => !value); }}><Eye size={14} />切换观察面板</button></>}
+              {menu === "view" && <><button onClick={() => { setAppMenu(undefined); setWorkbench("agent"); }}><MessageSquare size={14} />Agent 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("code"); }}><Code2 size={14} />Code 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("office"); }}><FileText size={14} />Office 工作台</button><i /><button onClick={() => { setAppMenu(undefined); setSidebarOpen((value) => !value); }}><PanelLeftOpen size={14} />切换侧栏</button><button onClick={() => { setAppMenu(undefined); setInspectorOpen((value) => !value); }}><Eye size={14} />切换观察面板</button></>}
               {menu === "help" && <><button onClick={() => { setAppMenu(undefined); window.open("https://github.com/zhaoxinyi02/lan-code", "_blank"); }}><ExternalLink size={14} />GitHub 仓库</button><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("updates"); setSettingsOpen(true); }}><Download size={14} />检查更新</button></>}
             </div>}
           </div>)}
@@ -1435,8 +1610,38 @@ function App() {
       <aside className={`sidebar ${sidebarOpen ? "" : "collapsed"}`} style={{ width: sidebarWidth }}>
         <div className="brand"><img src="/lan-code-logo.png" alt="Lan Code" /><strong>Lan Code</strong>
         </div>
-        <div className="mode-switch"><button className={workbench === "agent" ? "active" : ""} onClick={() => setWorkbench("agent")}><MessageSquare size={14} /> Agent</button><button className={workbench === "code" ? "active" : ""} onClick={() => setWorkbench("code")}><Code2 size={14} /> Code</button></div>
-        {workbench === "code" ? <>
+        <div className="mode-switch three"><button className={workbench === "agent" ? "active" : ""} onClick={() => setWorkbench("agent")}><MessageSquare size={14} /> Agent</button><button className={workbench === "code" ? "active" : ""} onClick={() => setWorkbench("code")}><Code2 size={14} /> Code</button><button className={workbench === "office" ? "active" : ""} onClick={() => setWorkbench("office")}><FileText size={14} /> Office</button></div>
+        {workbench === "office" ? <>
+          <div className="code-side-controls">
+            <Dropdown value={settings.workspace} title="切换当前项目" icon={<GitBranch size={15} />} options={settings.projects.map((project) => ({ id: project.path, label: project.name }))} onChange={(path) => { const project = settings.projects.find((item) => item.path === path); if (project) void selectProject(project); }} />
+          </div>
+          <div className="office-left-tabs">
+            {([["files", "文件", File], ["outline", "大纲", BookOpen], ["changes", "变更", FileDiff], ["history", "历史", History], ["check", "检查", ClipboardCheck]] as [OfficeLeftTab, string, typeof File][]).map(([id, label, Icon]) => <button key={id} className={officeTab === id ? "active" : ""} onClick={() => setOfficeTab(id)}><Icon size={13} />{label}</button>)}
+          </div>
+          {officeTab === "files" && <div className="office-side-list">
+            <div className="section-label code-label"><span>Office 文件</span><div><button title="刷新" onClick={() => void refreshOfficeFiles()}><RefreshCw size={13} /></button></div></div>
+            <div className="office-create-row"><button onClick={() => void createOfficeFile("docx")}>DOCX</button><button onClick={() => void createOfficeFile("xlsx")}>XLSX</button><button onClick={() => void createOfficeFile("pptx")}>PPTX</button></div>
+            {officeFiles.length === 0 ? <div className="empty-small">当前项目还没有 Office 文件。</div> : officeFiles.map((file) => <button key={file.path} className={activeOfficePath === file.path ? "active" : ""} title={file.path} onClick={() => void openOfficeFile(file.path)}><OfficeKindIcon kind={file.kind} path={file.path} /><span>{file.name}</span>{file.dirty && <i />}</button>)}
+          </div>}
+          {officeTab === "outline" && <div className="office-side-list">
+            <div className="section-label">文件大纲</div>
+            {!activeOfficeDoc ? <div className="empty-small">先打开一个 Office 文件。</div> : activeOfficeDoc.sections.length === 0 ? <div className="empty-small">没有读取到结构节点。</div> : activeOfficeDoc.sections.map((section) => <button key={section.id} title={section.text}><BookOpen size={13} /><span>{section.title}</span></button>)}
+          </div>}
+          {officeTab === "changes" && <div className="office-side-list">
+            <div className="section-label">Office Diff</div>
+            {!officePreview ? <div className="empty-small">AI 生成预览修改后会显示可审阅 Diff。</div> : officePreview.diff.map((item) => <div className="office-diff-card" key={item.id}><strong>{item.title}</strong><span>{item.description}</span><del>{item.before}</del><ins>{item.after}</ins></div>)}
+          </div>}
+          {officeTab === "history" && <div className="office-side-list">
+            <div className="section-label">操作历史</div>
+            {officeHistory.length === 0 ? <div className="empty-small">应用过的 Office 修改会出现在这里。</div> : officeHistory.map((item) => <button key={item.patchId} onClick={() => setOfficePreview(item)}><History size={13} /><span>{item.summary}</span></button>)}
+          </div>}
+          {officeTab === "check" && <div className="office-side-list">
+            <div className="section-label">质量检查</div>
+            {officeIssues.length === 0 ? <div className="empty-small">打开文件后会自动检查基础结构。</div> : officeIssues.map((issue, index) => <div className={`office-issue ${issue.severity}`} key={index}><strong>{issue.title}</strong><span>{issue.detail}</span></div>)}
+          </div>}
+          <button className="new-chat add-project-code" onClick={() => void addProject()}><FolderPlus size={14} /> 添加项目</button>
+          <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+        </> : workbench === "code" ? <>
           <div className="code-side-controls">
             <Dropdown value={settings.workspace} title="切换当前项目" icon={<GitBranch size={15} />} options={settings.projects.map((project) => ({ id: project.path, label: project.name }))} onChange={(path) => { const project = settings.projects.find((item) => item.path === path); if (project) void selectProject(project); }} />
           </div>
@@ -1542,6 +1747,39 @@ function App() {
             <ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} />
           </div><div className="send-area"><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact />{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!providerReady} onClick={send}><Send size={17} /></button>}</div></div>
         </div></div>
+      </main> : workbench === "office" ? <main className="office-main mode-panel mode-office">
+        <header>
+          <div className="title-row"><div><h1>{activeOfficeDoc?.name || "Office 工作台"}</h1><span className="subtle">{activeOfficeDoc ? `${activeOfficeDoc.kind.toUpperCase()} · ${activeOfficeDoc.wordCount.toLocaleString()} 词 · ${activeOfficeDoc.objectCount} 个对象` : settings.workspace}</span></div></div>
+          <div className="header-actions">
+            <button className="pill" onClick={() => void refreshOfficeFiles()}><RefreshCw size={15} /> 刷新</button>
+            <button className="pill" disabled={!activeOfficeDoc} onClick={() => void exportOfficeMarkdown()}><FileText size={15} /> 导出 MD</button>
+            <button className="pill" onClick={() => setOfficeTab("changes")}><FileDiff size={15} /> Office Diff</button>
+            <button className="pill" onClick={() => setInspectorOpen((value) => !value)}><PanelLeftOpen size={15} /> {inspectorOpen ? "隐藏助手" : "显示助手"}</button>
+          </div>
+        </header>
+        {officeStatus && <div className="code-status">{officeStatus}</div>}
+        <div className="editor-tabs office-tabs">{openOfficeDocs.length ? openOfficeDocs.map((doc) => <button key={doc.path} title={doc.path} className={doc.path === activeOfficePath ? "active" : ""} onClick={() => setActiveOfficePath(doc.path)}><OfficeKindIcon kind={doc.kind} path={doc.path} size={14} /><span>{doc.name}</span>{officePreview?.path === doc.path && <i />}<b title="关闭" onClick={(event) => { event.stopPropagation(); void closeOfficeFile(doc.path); }}>×</b></button>) : <span>从左侧打开或新建 Office 文件</span>}</div>
+        <section className={`office-workspace office-kind-${activeOfficeDoc?.kind || "empty"}`}>
+          {!activeOfficeDoc ? <div className="office-welcome"><FileText size={50} /><h2>Lan Code Office Mode</h2><p>像 IDE 一样管理、审阅和回滚 Office 文件，让 AI 按结构化操作修改文档。</p></div> : <>
+            <div className="office-document-toolbar">
+              <span>{activeOfficeDoc.kind === "docx" ? "Word 页面视图" : activeOfficeDoc.kind === "xlsx" ? "Excel 表格视图" : activeOfficeDoc.kind === "pptx" ? "PowerPoint 幻灯片视图" : "文件上下文"}</span>
+              <button onClick={() => setOfficeTab("outline")}><BookOpen size={13} /> 大纲</button>
+              <button onClick={() => setOfficeTab("check")}><ClipboardCheck size={13} /> 检查</button>
+            </div>
+            {activeOfficeDoc.kind === "xlsx" ? <div className="office-sheet">
+              {activeOfficeDoc.text.split(/\n+/).slice(0, 80).map((line, index) => <div key={index} className="office-row"><b>{index + 1}</b><span>{line || " "}</span></div>)}
+            </div> : activeOfficeDoc.kind === "pptx" ? <div className="office-slides">
+              {activeOfficeDoc.sections.map((section) => <article key={section.id} className="office-slide"><small>{section.title}</small><pre>{section.text}</pre></article>)}
+            </div> : <article className="office-page">
+              {activeOfficeDoc.text.split(/\n{2,}|\n/).slice(0, 120).map((paragraph, index) => <p key={index}>{paragraph}</p>)}
+            </article>}
+            {officePreview?.path === activeOfficeDoc.path && <aside className="office-ghost-edit">
+              <strong>AI Ghost Edit</strong>
+              <span>{officePreview.summary}</span>
+              <div>{officePreview.diff.slice(0, 3).map((item) => <p key={item.id}><b>{item.title}</b>{item.description}</p>)}</div>
+            </aside>}
+          </>}
+        </section>
       </main> : <main className="code-main mode-panel mode-code">
         <header>
           <div className="title-row"><div><h1>{activeFile || "Code 工作台"}</h1><span className="subtle">{activeDocument && activeDocument.content !== activeDocument.savedContent ? "有未保存修改" : settings.workspace}</span></div></div>
@@ -1587,7 +1825,35 @@ function App() {
 
       {inspectorOpen && <aside className={`inspector ${workbench === "code" ? "code-inspector" : ""}`} style={{ width: inspectorWidth }}>
         <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(252)} />
-        {workbench === "code" ? <>
+        {workbench === "office" ? <>
+          <div className="assistant-head"><div><h3>Office AI 助手</h3><p>理解当前文件、结构、选区和预览修改，默认先生成可审阅操作。</p></div></div>
+          <div className="office-context-card">
+            <strong>当前上下文</strong>
+            <div><span>文件</span><b>{activeOfficeDoc?.name || "未打开"}</b></div>
+            <div><span>类型</span><b>{activeOfficeDoc?.kind?.toUpperCase() || "-"}</b></div>
+            <div><span>对象</span><b>{activeOfficeDoc?.objectCount || 0}</b></div>
+            <div><span>策略</span><b>预览后应用</b></div>
+          </div>
+          <div className="office-context-card">
+            <strong>AI 可见范围</strong>
+            <label><input type="checkbox" checked readOnly /> 当前文件全文</label>
+            <label><input type="checkbox" checked readOnly /> 当前大纲节点</label>
+            <label><input type="checkbox" checked readOnly /> Office Diff 和历史</label>
+          </div>
+          <div className="office-plan-card">
+            <strong>操作计划</strong>
+            {!officePreview ? <p>输入指令后先生成结构化操作计划，不直接破坏原文件。</p> : <>
+              <p>{officePreview.summary}</p>
+              {officePreview.diff.map((item) => <div key={item.id} className={`office-plan-step ${item.status}`}><CheckCircle2 size={13} /><span>{item.title}</span><small>{item.status}</small></div>)}
+              <div className="office-apply-row"><button onClick={() => void applyOfficePreview()} className="primary-inline">应用修改</button><button onClick={() => setOfficePreview(undefined)}>丢弃</button></div>
+            </>}
+          </div>
+          {officeHistory.length > 0 && <div className="office-plan-card">
+            <strong>回滚点</strong>
+            {officeHistory.slice(0, 4).map((patch) => <button className="office-history-row" key={patch.patchId} onClick={() => void rollbackOfficePatch(patch)}><RotateCcw size={13} /><span>{patch.path}</span></button>)}
+          </div>}
+          <div className="code-chat-composer office-composer"><textarea value={officeInstruction} onChange={(event) => setOfficeInstruction(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void previewOfficeInstruction(); } }} placeholder="例如：把当前位置补一段课程设计小结，先给我预览 diff" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /></div><div className="office-send-actions"><button title="生成本地可审阅 Patch" onClick={() => void previewOfficeInstruction()} disabled={!activeOfficeDoc || !officeInstruction.trim()}><FileDiff size={14} /></button><button title="带 Office 上下文交给 Agent" onClick={() => void sendOfficeInstructionToAgent()} disabled={!activeOfficeDoc || !officeInstruction.trim() || busy}><Send size={14} /></button></div></div></div>
+        </> : workbench === "code" ? <>
           <div className="assistant-head"><div><h3>AI 助手</h3><p>针对当前项目提问，Agent 会使用同一套工具、权限和会话。</p></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><select value={activeId || ""} onChange={(event) => setActiveId(event.target.value || undefined)}><option value="">选择当前项目对话</option>{currentProjectSessions.map((session) => <option key={session.id} value={session.id}>{session.title || "未命名对话"}</option>)}</select></div></div>
           <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <UserMessageText text={message.text} />}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
           <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="询问代码或要求修改项目" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /><Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} /></div><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={14} /></button></div></div>

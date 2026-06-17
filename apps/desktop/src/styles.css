@@ -101,6 +101,7 @@ body, button, textarea, input, select { -webkit-font-smoothing: antialiased; tex
 .brand img { width: 22px; height: 22px; object-fit: contain; }
 .brand strong { font-size: 13px; }
 .mode-switch { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; padding: 2px; margin-bottom: 9px; border: 1px solid #dedfdb; border-radius: 8px; background: #e9eae7; }
+.mode-switch.three { grid-template-columns: 1fr 1fr 1fr; }
 .mode-switch button { display: flex; align-items: center; justify-content: center; gap: 5px; border: 0; border-radius: 6px; padding: 5px; color: #666; background: transparent; font-size: 10px; }
 .mode-switch button.active { color: #222; background: #fff; box-shadow: 0 1px 3px #0001; transform: translateY(-1px); }
 .icon-button { margin-left: auto; border: 0; background: transparent; color: #777; padding: 6px; }
@@ -198,6 +199,57 @@ main { position: relative; display: flex; flex-direction: column; min-width: 0; 
 .code-welcome h2 { color: #333; margin: 16px 0 3px; }
 .code-welcome p { margin: 0; font-size: 12px; }
 .code-status { padding: 6px 12px; border-bottom: 1px solid #e8e8e5; background: #f5f9ff; color: #55708f; font-size: 11px; }
+.office-left-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; padding: 2px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 9px; background: var(--control-hover); }
+.office-left-tabs button { display: grid; place-items: center; gap: 2px; border: 0; border-radius: 7px; padding: 5px 2px; background: transparent; color: var(--text-soft); font-size: 10px; }
+.office-left-tabs button.active { background: var(--panel); color: var(--accent); box-shadow: 0 1px 5px #00000012; }
+.office-side-list { display: grid; align-content: start; gap: 5px; min-height: 0; overflow: auto; }
+.office-side-list > button { display: flex; align-items: center; gap: 7px; min-width: 0; border: 0; border-radius: 8px; padding: 7px 8px; background: transparent; color: var(--text-soft); text-align: left; }
+.office-side-list > button:hover, .office-side-list > button.active { background: color-mix(in srgb, var(--accent) 10%, var(--panel)); color: var(--text); }
+.office-side-list > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.office-side-list > button i { width: 7px; height: 7px; margin-left: auto; border-radius: 999px; background: var(--accent); }
+.office-create-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 0 2px 8px; }
+.office-create-row button { border: 1px solid var(--border); border-radius: 8px; padding: 6px 4px; background: var(--control); color: var(--text-soft); font-size: 10px; }
+.office-diff-card, .office-issue { display: grid; gap: 4px; padding: 9px; border: 1px solid var(--border); border-radius: 11px; background: var(--panel); box-shadow: var(--soft-shadow); }
+.office-diff-card strong, .office-issue strong { font-size: 12px; }
+.office-diff-card span, .office-issue span { color: var(--muted); font-size: 11px; }
+.office-diff-card del, .office-diff-card ins { display: block; overflow: hidden; max-height: 70px; border-radius: 7px; padding: 6px; text-decoration: none; font-size: 10px; white-space: pre-wrap; }
+.office-diff-card del { color: #a03d3d; background: #fff1f1; }
+.office-diff-card ins { color: #2f7a49; background: #effaf2; }
+.office-issue.ok { border-color: #cfe9d8; }
+.office-issue.warning { border-color: #f0d5a3; }
+.office-main { background: radial-gradient(circle at 50% 0, color-mix(in srgb, var(--accent) 6%, transparent), transparent 340px), var(--app-bg); }
+.office-tabs button.active { border-top-color: #8b5cf6; }
+.office-workspace { position: relative; flex: 1; min-height: 0; overflow: auto; padding: 22px 26px 56px; }
+.office-welcome { min-height: 100%; display: grid; place-content: center; justify-items: center; color: var(--muted); text-align: center; }
+.office-welcome h2 { margin: 14px 0 4px; color: var(--text); }
+.office-document-toolbar { position: sticky; top: 0; z-index: 3; display: flex; align-items: center; gap: 8px; max-width: 860px; margin: 0 auto 12px; border: 1px solid var(--glass-border); border-radius: 14px; padding: 7px 9px; background: var(--glass-strong); backdrop-filter: blur(16px); box-shadow: var(--soft-shadow); }
+.office-document-toolbar span { margin-right: auto; color: var(--text-soft); font-size: 12px; }
+.office-document-toolbar button { display: inline-flex; align-items: center; gap: 5px; border: 0; border-radius: 999px; padding: 5px 9px; background: color-mix(in srgb, var(--control-hover) 70%, transparent); color: var(--text-soft); }
+.office-page { max-width: 780px; min-height: 1040px; margin: 0 auto; padding: 72px 82px; border: 1px solid #e5e2dc; border-radius: 4px; background: #fff; box-shadow: 0 22px 70px #22324a1a; color: #202124; }
+.office-page p { margin: 0 0 13px; line-height: 1.75; font-size: 14px; }
+.office-slides { display: grid; gap: 18px; max-width: 840px; margin: 0 auto; }
+.office-slide { aspect-ratio: 16 / 9; display: grid; align-content: start; gap: 12px; padding: 34px 42px; border: 1px solid var(--border); border-radius: 18px; background: linear-gradient(135deg, #fff, #f5f7fb); box-shadow: var(--elevated-shadow); }
+.office-slide small { color: var(--accent); font-weight: 600; }
+.office-slide pre { margin: 0; white-space: pre-wrap; font: inherit; line-height: 1.6; }
+.office-sheet { max-width: 920px; margin: 0 auto; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; background: var(--panel); box-shadow: var(--elevated-shadow); }
+.office-row { display: grid; grid-template-columns: 48px 1fr; min-height: 30px; border-bottom: 1px solid var(--border); }
+.office-row b { display: grid; place-items: center; background: var(--panel-soft); color: var(--muted); font-size: 11px; }
+.office-row span { padding: 7px 10px; white-space: pre-wrap; }
+.office-ghost-edit { position: sticky; bottom: 18px; display: grid; gap: 5px; max-width: 780px; margin: 18px auto 0; border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border)); border-radius: 16px; padding: 12px 14px; background: color-mix(in srgb, var(--panel) 88%, transparent); backdrop-filter: blur(16px); box-shadow: var(--elevated-shadow); }
+.office-ghost-edit span, .office-ghost-edit p { margin: 0; color: var(--text-soft); font-size: 12px; }
+.office-context-card, .office-plan-card { display: grid; gap: 8px; border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: var(--panel); box-shadow: var(--soft-shadow); }
+.office-context-card strong, .office-plan-card strong { font-size: 13px; }
+.office-context-card div { display: flex; justify-content: space-between; gap: 10px; color: var(--text-soft); font-size: 12px; }
+.office-context-card b { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.office-context-card label { display: flex; align-items: center; gap: 7px; color: var(--text-soft); font-size: 12px; }
+.office-plan-card p { margin: 0; color: var(--text-soft); font-size: 12px; line-height: 1.5; }
+.office-plan-step { display: grid; grid-template-columns: 16px 1fr auto; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 10px; padding: 7px; color: var(--text-soft); }
+.office-plan-step small { color: var(--muted); }
+.office-apply-row { display: flex; gap: 7px; }
+.office-apply-row button, .office-history-row { border: 1px solid var(--border); border-radius: 9px; padding: 7px 9px; background: var(--control); color: var(--text-soft); }
+.office-history-row { display: flex; align-items: center; gap: 7px; width: 100%; text-align: left; }
+.office-composer { margin-top: auto; }
+.office-kind-docx { color: #2b72d6; }.office-kind-xlsx { color: #248a52; }.office-kind-pptx { color: #d7672e; }
 header {
   min-height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 0 16px; border-bottom: 1px solid #ececea;
