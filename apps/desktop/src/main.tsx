@@ -57,6 +57,7 @@ type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: numb
 type CoreEvent = {
   type: string; eventId?: string; turnId?: string; toolCallId?: string; toolName?: string; error?: string; text?: string;
   arguments?: unknown; output?: unknown; usage?: TokenUsage; model?: string;
+  sessionId?: string; session_id?: string; session?: Session;
   event_id?: string; turn_id?: string; tool_call_id?: string; tool_name?: string;
 };
 type ToolStep = {
@@ -96,7 +97,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.5";
+const CURRENT_VERSION = "0.2.6";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -106,8 +107,7 @@ const DEFAULT_UPDATE_INFO: UpdateInfo = {
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
-const CONTEXT_WARN_RATIO = 0.72;
-const CONTEXT_HARD_RATIO = 0.92;
+const CONTEXT_WARN_RATIO = 0.80;
 
 const PROVIDERS = [
   { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", inputPrice: 0.27, outputPrice: 1.10 },
@@ -391,6 +391,16 @@ function MessageBody({ message, changes, overview, latest, workspaceFiles }: { m
   </>;
 }
 
+function UserMessageText({ text }: { text: string }) {
+  const lines = text.split(/\r?\n/);
+  const shouldCollapse = lines.length > 10;
+  const [expanded, setExpanded] = React.useState(false);
+  if (!shouldCollapse || expanded) {
+    return <><p>{text}</p>{shouldCollapse && <button className="message-collapse" onClick={() => setExpanded(false)}>收起长消息</button>}</>;
+  }
+  return <><p>{lines.slice(0, 10).join("\n")}</p><button className="message-collapse" onClick={() => setExpanded(true)}>展开完整消息（{lines.length} 行）</button></>;
+}
+
 function buildChatMessages(rows: ModelMessage[]): ChatMessage[] {
   const result: ChatMessage[] = [];
   for (const row of rows) {
@@ -415,13 +425,18 @@ const normalizePath = (path: string) => path.replaceAll("\\", "/").replace(/\/+$
 const normalizeCoreEvent = (event: CoreEvent): CoreEvent => ({
   ...event,
   eventId: event.eventId || event.event_id,
+  sessionId: event.sessionId || event.session_id || event.session?.id,
   turnId: event.turnId || event.turn_id,
   toolCallId: event.toolCallId || event.tool_call_id,
   toolName: event.toolName || event.tool_name,
 });
-const storedSize = (key: string, fallback: number) => {
+const mergeCoreEvent = (items: CoreEvent[], event: CoreEvent) => {
+  if (event.eventId && items.some((item) => item.eventId === event.eventId)) return items;
+  return [...items, event];
+};
+const storedSize = (key: string, fallback: number, min = 1, max = Number.POSITIVE_INFINITY) => {
   const value = Number(localStorage.getItem(key));
-  return Number.isFinite(value) && value > 0 ? value : fallback;
+  return Number.isFinite(value) && value > 0 ? Math.min(max, Math.max(min, value)) : fallback;
 };
 
 function TerminalPane({ tab, workspace, visible, dark }: { tab: TerminalTab; workspace: string; visible: boolean; dark: boolean }) {
@@ -564,7 +579,8 @@ function App() {
   const [inspectorOpen, setInspectorOpen] = React.useState(true);
   const [sidebarWidth, setSidebarWidth] = React.useState(() => storedSize("lan-code-sidebar-width", 238));
   const [inspectorWidth, setInspectorWidth] = React.useState(() => storedSize("lan-code-inspector-width", 252));
-  const [activityHeight, setActivityHeight] = React.useState(() => storedSize("lan-code-activity-height", 260));
+  const [activityHeight, setActivityHeight] = React.useState(() => storedSize("lan-code-activity-height", 190, 120, 320));
+  const [codePanelsHeight, setCodePanelsHeight] = React.useState(() => storedSize("lan-code-panels-height", 320, 310, 460));
   const [showScrollBottom, setShowScrollBottom] = React.useState(false);
   const [fileContextMenu, setFileContextMenu] = React.useState<FileContextMenu>();
   const [appDialog, setAppDialog] = React.useState<AppDialog>();
@@ -605,14 +621,24 @@ function App() {
     requestAnimationFrame(() => conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight, behavior: "smooth" }));
   }
 
-  function startResize(panel: "sidebar" | "inspector" | "activity", event: React.PointerEvent) {
+  function startResize(panel: "sidebar" | "inspector" | "activity" | "codePanels", event: React.PointerEvent) {
     event.preventDefault();
     const startX = event.clientX;
     const startY = event.clientY;
-    const startSize = panel === "sidebar" ? sidebarWidth : panel === "inspector" ? inspectorWidth : activityHeight;
-    const move = (pointer: PointerEvent) => {
+    const startSize = panel === "sidebar" ? sidebarWidth : panel === "inspector" ? inspectorWidth : panel === "codePanels" ? codePanelsHeight : activityHeight;
+    const minGitHeight = 150;
+    let frame = 0;
+    let latestPointer: PointerEvent | undefined;
+    const applyResize = (pointer: PointerEvent) => {
       if (panel === "activity") {
-        setActivityHeight(Math.min(420, Math.max(120, startSize + pointer.clientY - startY)));
+        const maxActivityHeight = Math.max(120, codePanelsHeight - minGitHeight - 8);
+        setActivityHeight(Math.min(maxActivityHeight, Math.max(120, startSize + pointer.clientY - startY)));
+        return;
+      }
+      if (panel === "codePanels") {
+        const nextHeight = Math.min(460, Math.max(310, startSize - (pointer.clientY - startY)));
+        setCodePanelsHeight(nextHeight);
+        setActivityHeight((height) => Math.min(height, Math.max(120, nextHeight - minGitHeight - 8)));
         return;
       }
       const delta = pointer.clientX - startX;
@@ -620,15 +646,28 @@ function App() {
       if (panel === "sidebar") setSidebarWidth(Math.min(360, Math.max(190, width)));
       else setInspectorWidth(Math.min(440, Math.max(220, width)));
     };
+    const move = (pointer: PointerEvent) => {
+      latestPointer = pointer;
+      if (frame) return;
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        if (latestPointer) applyResize(latestPointer);
+      });
+    };
     const stop = () => {
+      if (frame) window.cancelAnimationFrame(frame);
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      window.removeEventListener("blur", stop);
       document.body.classList.remove("resizing-panels");
       document.body.classList.remove("resizing-rows");
     };
-    document.body.classList.add(panel === "activity" ? "resizing-rows" : "resizing-panels");
+    document.body.classList.add(panel === "activity" || panel === "codePanels" ? "resizing-rows" : "resizing-panels");
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    window.addEventListener("blur", stop);
   }
 
   const refreshSessions = React.useCallback(async () => {
@@ -653,7 +692,8 @@ function App() {
     localStorage.setItem("lan-code-sidebar-width", String(sidebarWidth));
     localStorage.setItem("lan-code-inspector-width", String(inspectorWidth));
     localStorage.setItem("lan-code-activity-height", String(activityHeight));
-  }, [sidebarWidth, inspectorWidth, activityHeight]);
+    localStorage.setItem("lan-code-panels-height", String(codePanelsHeight));
+  }, [sidebarWidth, inspectorWidth, activityHeight, codePanelsHeight]);
 
   React.useEffect(() => {
     localStorage.setItem("lan-code-completion-enabled", String(completionEnabled));
@@ -789,10 +829,33 @@ function App() {
     const timer = window.setInterval(() => {
       if (activeId) invoke<CoreEvent[]>("session_events", { sessionId: activeId }).then((rows) => setEvents(rows.map(normalizeCoreEvent))).catch(() => {});
       invoke<Approval[]>("pending_approvals").then(setApprovals).catch(() => {});
-      refreshSessions().catch(() => {});
-    }, busy ? 120 : 700);
+    }, busy ? 1400 : 3500);
     return () => window.clearInterval(timer);
-  }, [activeId, busy, refreshSessions]);
+  }, [activeId, busy]);
+
+  React.useEffect(() => {
+    let dispose: (() => void) | undefined;
+    listen<CoreEvent>("core-event", (event) => {
+      const normalized = normalizeCoreEvent(event.payload);
+      if (normalized.sessionId && normalized.sessionId === activeId) {
+        setEvents((items) => mergeCoreEvent(items, normalized));
+      }
+      if (["sessionCreated", "turnStarted", "turnCompleted", "turnFailed", "turnInterrupted"].includes(normalized.type)) {
+        refreshSessions().catch(() => {});
+      }
+      if (normalized.type === "approvalRequested") {
+        invoke<Approval[]>("pending_approvals").then(setApprovals).catch(() => {});
+      }
+    }).then((unlisten) => { dispose = unlisten; }).catch(() => {});
+    return () => dispose?.();
+  }, [activeId, refreshSessions]);
+
+  React.useEffect(() => {
+    const timer = window.setInterval(() => {
+      refreshSessions().catch(() => {});
+    }, busy ? 4000 : 8000);
+    return () => window.clearInterval(timer);
+  }, [busy, refreshSessions]);
 
   async function chooseWorkspace() {
     const path = await invoke<string | null>("pick_workspace");
@@ -919,13 +982,7 @@ function App() {
     const profile = settings.providerProfiles.find((item) => item.id === profileId);
     if (!profile) return;
     const currentUsage = currentTokenUsage();
-    if (currentUsage.totalTokens > profile.contextWindow * CONTEXT_HARD_RATIO) {
-      const proceed = await askConfirm(
-        "目标模型上下文较小",
-        `当前对话已使用约 ${currentUsage.totalTokens.toLocaleString()} Token，而“${profile.name} · ${profile.model}”上下文上限是 ${profile.contextWindow.toLocaleString()}。继续切换后，Lan Code 会先压缩历史再处理下一条消息。是否继续？`,
-      );
-      if (!proceed) return;
-    }
+    if (currentUsage.totalTokens > profile.contextWindow * CONTEXT_WARN_RATIO) setCodeStatus(`已切换到较小上下文模型；下一次发送时会自动压缩旧上下文。`);
     const next = {
       ...settings, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model,
       apiKey: profile.apiKey, inputPricePerMillion: profile.inputPricePerMillion,
@@ -1232,15 +1289,6 @@ function App() {
     const text = prompt.trim();
     if (!text || busy) return;
     try {
-      const currentUsage = currentTokenUsage();
-      const contextWindow = activeContextWindowFromSettings(settings);
-      if (currentUsage.totalTokens > contextWindow * CONTEXT_HARD_RATIO) {
-        const proceed = await askConfirm(
-          "上下文即将超限",
-          `当前对话已使用约 ${currentUsage.totalTokens.toLocaleString()} / ${contextWindow.toLocaleString()} Token。Lan Code 会先压缩旧上下文再处理这条消息，是否继续？`,
-        );
-        if (!proceed) return;
-      }
       let sessionId = activeId;
       if (!sessionId) sessionId = await newSession(text.slice(0, 32));
       if (!sessionId) return;
@@ -1417,11 +1465,12 @@ function App() {
           }} onDoubleClick={() => { if (!entry.isDir) void openWorkspaceFile(entry.path, undefined, true); }}>{entry.isDir ? collapsedDirs.has(entry.path) ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="tree-spacer" />} {entry.isDir ? collapsedDirs.has(entry.path) ? <Folder size={14} /> : <FolderOpen size={14} /> : <FileTypeIcon path={entry.path} />}<span>{entry.name}</span></button>)}</div>
             </>}
           </div>}</div>
-          <div className="code-left-panels" style={{ "--activity-height": `${activityHeight}px` } as React.CSSProperties}>
+          <div className="horizontal-resizer inline stack-resizer" title="拖动调整文件树 / Agent 区域高度，双击恢复默认" onPointerDown={(event) => startResize("codePanels", event)} onDoubleClick={() => setCodePanelsHeight(320)} />
+          <div className="code-left-panels" style={{ "--activity-height": `${activityHeight}px`, "--code-panels-height": `${codePanelsHeight}px` } as React.CSSProperties}>
             <section className="code-agent-panel"><div className="git-heading"><h3>Agent 执行过程</h3></div>
               <div className="code-tool-timeline">{groupedToolSteps.length === 0 ? <div className="empty-small">工具调用会显示在这里。</div> : groupedToolSteps.slice(0, 6).map((step) => <ToolStepCard key={step.id} step={step} />)}</div>
             </section>
-            <div className="horizontal-resizer inline" title="拖动调整 Agent / Git 区域高度，双击恢复默认" onPointerDown={(event) => startResize("activity", event)} onDoubleClick={() => setActivityHeight(220)} />
+            <div className="horizontal-resizer inline" title="拖动调整 Agent / Git 区域高度，双击恢复默认" onPointerDown={(event) => startResize("activity", event)} onDoubleClick={() => setActivityHeight(190)} />
             <section className="code-git-panel"><div className="git-heading"><h3>Git 改动</h3><button title="刷新" onClick={() => void refreshGitChanges()}><RefreshCw size={12} /></button></div>
               <div className="git-changes">{gitOverview?.isRepository && !workingTreeDirty ? <div className="git-clean-inline">当前工作区干净</div> : gitChanges.length === 0 ? <div className="empty-small">暂无已加载改动。</div> : gitChanges.map((change) => <div className={selectedGitPath === change.path ? "active" : ""} key={`${change.status}:${change.path}`}><button title={change.path} onClick={() => void openGitChange(change.path)}><i className={change.status === "??" ? "added" : change.status.includes("D") ? "removed" : "modified"}>{gitStatusLabel(change.status)}</i><FileTypeIcon path={change.path} size={14} /><span>{change.path}</span></button><button title="撤销未暂存改动" disabled={change.status === "??"} onClick={() => void discardGitChange(change)}><RotateCcw size={11} /></button></div>)}</div>
               {selectedGitPath && <pre className="diff-preview">{diffText}</pre>}
@@ -1481,7 +1530,7 @@ function App() {
               <button onClick={() => void createImage()}><Sparkles size={18} /> 生成图片</button>
             </div>
           </div> : <div className="messages">
-            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} workspaceFiles={workspaceFiles} /> : <p>{message.text}</p>}</article>)}
+            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} workspaceFiles={workspaceFiles} /> : <UserMessageText text={message.text} />}</article>)}
             {busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={16} /> 正在分析项目并准备下一步...</div>}</article>}
           </div>}
         </section>
@@ -1540,7 +1589,7 @@ function App() {
         <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(252)} />
         {workbench === "code" ? <>
           <div className="assistant-head"><div><h3>AI 助手</h3><p>针对当前项目提问，Agent 会使用同一套工具、权限和会话。</p></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><select value={activeId || ""} onChange={(event) => setActiveId(event.target.value || undefined)}><option value="">选择当前项目对话</option>{currentProjectSessions.map((session) => <option key={session.id} value={session.id}>{session.title || "未命名对话"}</option>)}</select></div></div>
-          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <p>{message.text}</p>}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
+          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <UserMessageText text={message.text} />}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
           <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="询问代码或要求修改项目" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /><Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} /></div><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={14} /></button></div></div>
         </> : <>
         <h3>环境信息</h3>
@@ -1548,7 +1597,7 @@ function App() {
         <div className="info-row"><KeyRound size={16} /><span>模型</span><strong>{providerReady ? settings.model : "未配置"}</strong></div>
         <div className="info-row"><ShieldCheck size={16} /><span>权限</span><strong>{APPROVAL_MODES.find((item) => item.id === settings.approvalMode)?.label}</strong></div>
         <div className="divider" /><h3>当前对话用量</h3>
-        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact /><strong>{usage.totalTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
+        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><strong><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact /><b>{usage.totalTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</b></strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
         <div className="divider" /><h3>任务步骤</h3>
         {toolSteps.length > 0 && <div className="tool-stats"><span>{toolSteps.length} 步</span><b>{toolStepStats.completed} 完成</b>{toolStepStats.running > 0 && <i>{toolStepStats.running} 执行中</i>}{toolStepStats.failed + toolStepStats.stale > 0 && <em>{toolStepStats.failed + toolStepStats.stale} 异常</em>}</div>}
         {groupedToolSteps.length === 0 ? <div className="empty-small">发送任务后在这里查看文件读取、搜索、修改和命令执行过程。</div> : <div className="tool-step-list">{groupedToolSteps.slice(0, 6).map((step) => <ToolStepCard key={step.id} step={step} />)}{groupedToolSteps.length > 6 && <div className="tool-more">另有 {groupedToolSteps.length - 6} 组较早步骤已收起</div>}</div>}
@@ -1665,8 +1714,8 @@ function App() {
           ] as const).map(([key, label, inherited]) => {
             const route = draft[key];
             return <div className="route-row" key={key}>
-              <label><input type="checkbox" checked={route.enabled} onChange={(event) => setDraft({ ...draft, [key]: { ...route, enabled: event.target.checked } })} /> {label}</label>
-              <span>{inherited && route.inheritMainModel ? "自动使用主模型" : route.enabled ? "使用专用模型" : "未启用"}</span>
+              <label className="enable-check route-enable"><input type="checkbox" checked={route.enabled} onChange={(event) => setDraft({ ...draft, [key]: { ...route, enabled: event.target.checked } })} /><span>{label}</span></label>
+              <span className="route-state">{inherited && route.inheritMainModel ? "自动使用主模型" : route.enabled ? "使用专用模型" : "未启用"}</span>
               {!inherited && route.enabled && <div className="route-fields"><input placeholder="API 地址，留空继承主模型" value={route.baseUrl} onChange={(event) => setDraft({ ...draft, [key]: { ...route, inheritMainModel: false, baseUrl: event.target.value } })} /><input placeholder="API Key，留空继承主模型" type="password" value={route.apiKey} onChange={(event) => setDraft({ ...draft, [key]: { ...route, inheritMainModel: false, apiKey: event.target.value } })} /><input placeholder="专用模型名称" value={route.model} onChange={(event) => setDraft({ ...draft, [key]: { ...route, inheritMainModel: false, model: event.target.value } })} /></div>}
             </div>;
           })}

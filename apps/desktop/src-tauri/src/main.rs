@@ -12,7 +12,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lan_core::{
-    AgentCore, ImageGenerationTool, ModelMessage, ModelProvider, ModelRequest,
+    AgentCore, AnthropicProvider, ImageGenerationTool, ModelMessage, ModelProvider, ModelRequest,
     OpenAiCompatibleProvider, SqliteStore, VisionTool,
 };
 use lan_protocol::{
@@ -21,6 +21,7 @@ use lan_protocol::{
 };
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -499,14 +500,14 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
         } else {
             settings.api_key.clone()
         };
-        let provider = OpenAiCompatibleProvider::new_with_limits(
+        let provider = build_model_provider(
+            &settings.provider,
             settings.base_url.clone(),
             api_key,
             settings.model.clone(),
             Some(active_max_output_tokens(settings)),
-        )
-        .map_err(|error| error.to_string())?;
-        AgentCore::with_provider_and_store(Arc::new(provider), store)
+        )?;
+        AgentCore::with_provider_and_store(Arc::from(provider), store)
             .map(|core| core.with_max_provider_rounds(settings.max_provider_rounds))
             .map(|core| core.with_model_context_tokens(context_window))
             .map_err(|error| error.to_string())?
@@ -531,6 +532,23 @@ fn build_core(settings: &DesktopSettings, data_dir: &Path) -> Result<AgentCore, 
         ));
     }
     Ok(core)
+}
+
+fn build_model_provider(
+    provider: &str,
+    base_url: String,
+    api_key: String,
+    model: String,
+    max_output_tokens: Option<u64>,
+) -> Result<Box<dyn ModelProvider>, String> {
+    if provider == "anthropic" {
+        return AnthropicProvider::new_with_limits(base_url, api_key, model, max_output_tokens)
+            .map(|provider| Box::new(provider) as Box<dyn ModelProvider>)
+            .map_err(|error| error.to_string());
+    }
+    OpenAiCompatibleProvider::new_with_limits(base_url, api_key, model, max_output_tokens)
+        .map(|provider| Box::new(provider) as Box<dyn ModelProvider>)
+        .map_err(|error| error.to_string())
 }
 
 fn active_context_window(settings: &DesktopSettings) -> u64 {
@@ -565,6 +583,21 @@ async fn core(state: &State<'_, AppState>) -> Arc<AgentCore> {
     state.core.read().await.clone()
 }
 
+fn spawn_core_event_forwarder(app: AppHandle, core: Arc<AgentCore>) {
+    tauri::async_runtime::spawn(async move {
+        let mut events = core.subscribe();
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let _ = app.emit("core-event", event);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 #[tauri::command]
 async fn get_settings(state: State<'_, AppState>) -> Result<DesktopSettings, String> {
     Ok(state.settings.read().await.clone())
@@ -574,6 +607,7 @@ async fn get_settings(state: State<'_, AppState>) -> Result<DesktopSettings, Str
 async fn save_settings(
     mut settings: DesktopSettings,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
     if settings.base_url.trim().is_empty() || settings.model.trim().is_empty() {
         return Err("API 地址和模型名称不能为空".into());
@@ -597,8 +631,9 @@ async fn save_settings(
     .map_err(|error| error.to_string())?;
     fs::write(location_file(), next_data_dir.display().to_string())
         .map_err(|error| error.to_string())?;
-    let next_core = build_core(&settings, &next_data_dir)?;
-    *state.core.write().await = Arc::new(next_core);
+    let next_core = Arc::new(build_core(&settings, &next_data_dir)?);
+    spawn_core_event_forwarder(app, next_core.clone());
+    *state.core.write().await = next_core;
     *state.settings.write().await = settings;
     *state.data_dir.write().await = next_data_dir;
     Ok(())
@@ -609,13 +644,19 @@ async fn test_provider(settings: DesktopSettings) -> Result<ProviderTestResult, 
     if settings.api_key.trim().is_empty() && !is_local_provider(&settings.provider) {
         return Err("请先填写 API Key".into());
     }
+    let max_output_tokens = active_max_output_tokens(&settings);
     let api_key = if settings.api_key.trim().is_empty() {
         "ollama".into()
     } else {
-        settings.api_key
+        settings.api_key.clone()
     };
-    let provider = OpenAiCompatibleProvider::new(settings.base_url, api_key, settings.model)
-        .map_err(|error| error.to_string())?;
+    let provider = build_model_provider(
+        &settings.provider,
+        settings.base_url.clone(),
+        api_key,
+        settings.model.clone(),
+        Some(max_output_tokens),
+    )?;
     let started = Instant::now();
     let response = provider
         .complete(ModelRequest {
@@ -1230,16 +1271,17 @@ async fn inline_completion(
     if settings.api_key.trim().is_empty() && !is_local_provider(&settings.provider) {
         return Err("请先配置 API Key".into());
     }
-    let provider = OpenAiCompatibleProvider::new(
-        settings.base_url,
+    let provider = build_model_provider(
+        &settings.provider,
+        settings.base_url.clone(),
         if settings.api_key.trim().is_empty() {
             "ollama".into()
         } else {
-            settings.api_key
+            settings.api_key.clone()
         },
-        settings.model,
-    )
-    .map_err(|error| error.to_string())?;
+        settings.model.clone(),
+        Some(active_max_output_tokens(&settings)),
+    )?;
     let response = provider
         .complete(ModelRequest {
             messages: vec![ModelMessage::text(
@@ -1301,7 +1343,25 @@ async fn download_update(
     {
         return Err("拒绝下载未经验证的更新地址".into());
     }
-    let bytes = reqwest::Client::new()
+    let client = reqwest::Client::new();
+    let checksum_url = format!("{installer_url}.sha256");
+    let checksum_text = client
+        .get(&checksum_url)
+        .header("User-Agent", "Lan-Code-Desktop")
+        .send()
+        .await
+        .map_err(|error| format!("下载更新校验文件失败：{error}"))?
+        .error_for_status()
+        .map_err(|_| "更新包缺少 SHA-256 校验文件，已拒绝下载。".to_string())?
+        .text()
+        .await
+        .map_err(|error| format!("读取更新校验文件失败：{error}"))?;
+    let expected_hash = checksum_text
+        .split_whitespace()
+        .find(|part| part.len() == 64 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .ok_or_else(|| "更新校验文件格式无效，未找到 SHA-256。".to_string())?
+        .to_ascii_lowercase();
+    let bytes = client
         .get(installer_url)
         .header("User-Agent", "Lan-Code-Desktop")
         .send()
@@ -1312,6 +1372,10 @@ async fn download_update(
         .bytes()
         .await
         .map_err(|error| format!("读取更新包失败：{error}"))?;
+    let actual_hash = format!("{:x}", Sha256::digest(&bytes));
+    if actual_hash != expected_hash {
+        return Err("更新包 SHA-256 校验失败，已拒绝安装。".into());
+    }
     let updates_dir = state.data_dir.read().await.join("updates");
     fs::create_dir_all(&updates_dir).map_err(|error| error.to_string())?;
     let path = updates_dir.join(installer_name);
@@ -1552,17 +1616,19 @@ fn main() {
     migrate_legacy_data_dir(&data_dir);
     let settings = load_settings(&data_dir);
     persist_bootstrap_settings(&data_dir, &settings);
-    let core = build_core(&settings, &data_dir).unwrap_or_else(|_| AgentCore::new());
+    let core = Arc::new(build_core(&settings, &data_dir).unwrap_or_else(|_| AgentCore::new()));
+    let event_core = core.clone();
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             if let Some(window) = app.get_webview_window("main") {
                 let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/taskbar.png"))?;
                 window.set_icon(icon)?;
             }
+            spawn_core_event_forwarder(app.handle().clone(), event_core.clone());
             Ok(())
         })
         .manage(AppState {
-            core: RwLock::new(Arc::new(core)),
+            core: RwLock::new(core),
             settings: RwLock::new(settings),
             data_dir: RwLock::new(data_dir),
             terminals: Mutex::new(HashMap::new()),

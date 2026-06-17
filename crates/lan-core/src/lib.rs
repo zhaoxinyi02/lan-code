@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 pub use config::{LanConfig, ProviderConfig};
 pub use model::{
-    ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelRole, OpenAiCompatibleProvider,
-    WireFunctionCall, WireToolCall,
+    AnthropicProvider, ModelMessage, ModelProvider, ModelRequest, ModelResponse, ModelRole,
+    OpenAiCompatibleProvider, WireFunctionCall, WireToolCall,
 };
 pub use policy::PermissionPolicy;
 pub use store::SqliteStore;
@@ -35,7 +35,7 @@ pub use tools::{
 
 const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
 const DEFAULT_MODEL_CONTEXT_TOKENS: usize = 128_000;
-const CONTEXT_COMPACT_RATIO: f64 = 0.82;
+const CONTEXT_COMPACT_RATIO: f64 = 0.80;
 const CONTEXT_KEEP_RECENT_MESSAGES: usize = 10;
 
 fn unix_timestamp() -> u64 {
@@ -544,13 +544,18 @@ impl AgentCore {
                     .messages
                     .clone(),
             );
-            let response = tokio::select! {
-                _ = cancel.cancelled() => bail!("turn interrupted"),
-                response = provider.complete_stream(ModelRequest {
-                    messages,
-                    tools: self.list_tools(),
-                }, self.text_emitter(session_id, turn_id)) => response?,
-            };
+            let response = self
+                .complete_model_request(
+                    provider.clone(),
+                    ModelRequest {
+                        messages,
+                        tools: self.list_tools(),
+                    },
+                    session_id,
+                    turn_id,
+                    cancel.clone(),
+                )
+                .await?;
             accumulate_usage(&mut usage, response.usage);
             {
                 let mut sessions = self.sessions.write().await;
@@ -657,13 +662,18 @@ impl AgentCore {
                 .messages
                 .clone(),
         );
-        let response = tokio::select! {
-            _ = cancel.cancelled() => bail!("turn interrupted"),
-            response = provider.complete_stream(ModelRequest {
-                messages,
-                tools: Vec::new(),
-            }, self.text_emitter(session_id, turn_id)) => response?,
-        };
+        let response = self
+            .complete_model_request(
+                provider.clone(),
+                ModelRequest {
+                    messages,
+                    tools: Vec::new(),
+                },
+                session_id,
+                turn_id,
+                cancel.clone(),
+            )
+            .await?;
         accumulate_usage(&mut usage, response.usage);
         let text = if response.text.trim().is_empty() {
             format!(
@@ -711,6 +721,44 @@ impl AgentCore {
     fn prepare_messages_for_provider(&self, messages: Vec<ModelMessage>) -> Vec<ModelMessage> {
         compact_messages_for_context(messages, self.model_context_tokens)
     }
+
+    async fn complete_model_request(
+        &self,
+        provider: Arc<dyn ModelProvider>,
+        request: ModelRequest,
+        session_id: SessionId,
+        turn_id: Uuid,
+        cancel: CancellationToken,
+    ) -> Result<ModelResponse> {
+        let emitter = self.text_emitter(session_id, turn_id);
+        let stream_result = tokio::select! {
+            _ = cancel.cancelled() => bail!("turn interrupted"),
+            response = provider.complete_stream(request.clone(), emitter) => response,
+        };
+        match stream_result {
+            Ok(response) => Ok(response),
+            Err(error) if is_recoverable_stream_error(&error) && !cancel.is_cancelled() => {
+                self.text_emitter(session_id, turn_id)(
+                    "\n\n模型流式连接中断，Lan Code 已自动切换为非流式重试。\n\n".into(),
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => bail!("turn interrupted"),
+                    response = provider.complete(request) => response,
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn is_recoverable_stream_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}").to_lowercase();
+    text.contains("failed reading model stream")
+        || text.contains("invalid streaming response json")
+        || text.contains("stream body")
+        || text.contains("connection reset")
+        || text.contains("connection closed")
+        || text.contains("incomplete message")
 }
 
 fn compact_messages_for_context(
@@ -765,34 +813,49 @@ fn estimate_messages_tokens(messages: &[ModelMessage]) -> usize {
     messages
         .iter()
         .map(|message| {
-            let mut chars = 12;
-            chars += message
-                .content
-                .as_deref()
-                .unwrap_or_default()
-                .chars()
-                .count();
-            chars += message
-                .reasoning_content
-                .as_deref()
-                .unwrap_or_default()
-                .chars()
-                .count();
-            chars += message
+            let content_tokens =
+                estimate_text_tokens(message.content.as_deref().unwrap_or_default());
+            let reasoning_tokens =
+                estimate_text_tokens(message.reasoning_content.as_deref().unwrap_or_default());
+            let tool_tokens = message
                 .tool_calls
                 .as_ref()
                 .map(|calls| {
                     calls
                         .iter()
                         .map(|call| {
-                            call.function.arguments.chars().count() + call.function.name.len()
+                            estimate_text_tokens(&call.function.arguments)
+                                + estimate_text_tokens(&call.function.name)
                         })
                         .sum::<usize>()
                 })
                 .unwrap_or_default();
-            (chars / 4).max(1)
+            12 + content_tokens + reasoning_tokens + tool_tokens
         })
         .sum()
+}
+
+fn estimate_text_tokens(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut ascii_run = 0usize;
+    let mut tokens = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation() || ch == ' ' || ch == '\n' {
+            ascii_run += 1;
+        } else {
+            if ascii_run > 0 {
+                tokens += ascii_run.div_ceil(4);
+                ascii_run = 0;
+            }
+            tokens += if ch.is_whitespace() { 0 } else { 1 };
+        }
+    }
+    if ascii_run > 0 {
+        tokens += ascii_run.div_ceil(4);
+    }
+    tokens.max(1)
 }
 
 fn accumulate_usage(total: &mut TokenUsage, value: TokenUsage) {

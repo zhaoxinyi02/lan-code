@@ -54,9 +54,10 @@ The current JSONL transport implements:
 - `tool/call`
 - `turn/start`
 
-The core currently has an OpenAI-compatible provider, a bounded 12-round agent
-loop, provider-native reasoning replay, read-only workspace tools, and one
-optimistic `replace_text` workspace-write tool.
+The core currently has an OpenAI-compatible provider, a configurable bounded
+agent loop, provider-native reasoning replay, conservative context compaction,
+read/write workspace tools, Git tools, and a full-access command tool gated by
+policy.
 
 SQLite persistence stores session snapshots, model-visible message history, and
 ordered durable core events. Sessions left running or waiting for approval when
@@ -71,5 +72,6 @@ The daemon concurrently serves long-running requests and implements:
 - `session/events`
 - live `event` notifications on the same JSONL connection
 
-The next protocol slice should add capability negotiation, schema export, and
-durable approval continuation across clients.
+The next protocol slice should add capability negotiation, schema export,
+native Anthropic/Gemini adapters, OS-level sandbox executors, and durable
+approval continuation across clients.

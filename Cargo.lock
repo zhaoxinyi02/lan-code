@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "lan-cli"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "lan-core",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "lan-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "lan-daemon"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "lan-core",
  "lan-protocol",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "lan-desktop"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2073,6 +2073,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tokio",
@@ -2082,7 +2083,7 @@ dependencies = [
 
 [[package]]
 name = "lan-protocol"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",

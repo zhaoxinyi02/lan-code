@@ -21,5 +21,6 @@ rfd = "0.15"
 keyring = { version = "3", features = ["windows-native"] }
 reqwest.workspace = true
 semver = "1"
+sha2 = "0.10"
 walkdir.workspace = true
 portable-pty = "0.9"

@@ -767,7 +767,7 @@ mod tests {
 
     use super::{
         ApplyEditsTool, ImageGenerationTool, ReplaceTextTool, RunCommandTool, Tool, ToolContext,
-        VisionTool,
+        VisionTool, workspace_path,
     };
 
     #[test]
@@ -882,6 +882,25 @@ mod tests {
         assert_eq!(fs::read_to_string(&first).unwrap(), "hello world");
         assert_eq!(fs::read_to_string(&second).unwrap(), "goodbye world");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_path_rejects_symlink_escape() {
+        let root = std::env::temp_dir().join(format!("lan-core-test-{}", Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("lan-core-outside-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "secret").unwrap();
+        let link = root.join("outside-link.txt");
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &link);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link);
+        if linked.is_ok() {
+            let error = workspace_path(root.to_str().unwrap(), "outside-link.txt").unwrap_err();
+            assert!(error.to_string().contains("path escapes workspace"));
+        }
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

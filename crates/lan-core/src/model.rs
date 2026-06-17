@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use lan_protocol::{TokenUsage, ToolCall, ToolDescriptor};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -94,7 +94,41 @@ pub struct OpenAiCompatibleProvider {
     max_output_tokens: Option<u64>,
 }
 
+pub struct AnthropicProvider {
+    client: Client,
+    base_url: String,
+    api_key: String,
+    model: String,
+    max_output_tokens: Option<u64>,
+}
+
 impl OpenAiCompatibleProvider {
+    pub fn new(base_url: String, api_key: String, model: String) -> Result<Self> {
+        Self::new_with_limits(base_url, api_key, model, None)
+    }
+
+    pub fn new_with_limits(
+        base_url: String,
+        api_key: String,
+        model: String,
+        max_output_tokens: Option<u64>,
+    ) -> Result<Self> {
+        if api_key.trim().is_empty() {
+            bail!("API key cannot be empty");
+        }
+        Ok(Self {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()?,
+            base_url: base_url.trim_end_matches('/').to_string(),
+            api_key,
+            model,
+            max_output_tokens,
+        })
+    }
+}
+
+impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String, model: String) -> Result<Self> {
         Self::new_with_limits(base_url, api_key, model, None)
     }
@@ -174,6 +208,79 @@ struct ChatChoice {
     message: ModelMessage,
 }
 
+#[derive(Serialize)]
+struct AnthropicRequest<'a> {
+    model: &'a str,
+    messages: Vec<AnthropicMessage>,
+    tools: Vec<AnthropicTool<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    max_tokens: u64,
+}
+
+#[derive(Serialize)]
+struct AnthropicTool<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a Value,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessage {
+    role: &'static str,
+    content: Vec<AnthropicContent>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicContent {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    #[serde(default)]
+    content: Vec<AnthropicResponseContent>,
+    #[serde(default)]
+    usage: AnthropicUsage,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AnthropicResponseContent {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Default, Deserialize)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleProvider {
     fn model_name(&self) -> &str {
@@ -222,7 +329,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
             .context("model response contained no choices")?
             .message;
         let text = message.content.clone().unwrap_or_default();
-        let tool_calls = message
+        let mut message = message;
+        let mut tool_calls = message
             .tool_calls
             .clone()
             .unwrap_or_default()
@@ -236,6 +344,18 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        if tool_calls.is_empty()
+            && let Some(parsed) = parse_raw_tool_call_text(&text)
+        {
+            message.content = None;
+            message.tool_calls = Some(tool_calls_to_wire(&parsed));
+            tool_calls = parsed;
+        }
+        let text = if tool_calls.is_empty() {
+            text
+        } else {
+            String::new()
+        };
         Ok(ModelResponse {
             message,
             text,
@@ -283,6 +403,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
 
         let mut buffer = String::new();
         let mut text = String::new();
+        let mut emitted_text_len = 0usize;
+        let mut suppress_raw_tool_text = false;
         let mut reasoning = String::new();
         let mut calls = BTreeMap::<usize, WireToolCall>::new();
         let mut usage = TokenUsage::default();
@@ -313,7 +435,14 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 };
                 if let Some(part) = delta.get("content").and_then(Value::as_str) {
                     text.push_str(part);
-                    on_text(part.to_string());
+                    let trimmed = text.trim_start();
+                    if trimmed.starts_with("<tool_call") {
+                        suppress_raw_tool_text = true;
+                    }
+                    if !suppress_raw_tool_text && !"<tool_call".starts_with(trimmed) {
+                        on_text(text[emitted_text_len..].to_string());
+                        emitted_text_len = text.len();
+                    }
                 }
                 if let Some(part) = delta.get("reasoning_content").and_then(Value::as_str) {
                     reasoning.push_str(part);
@@ -348,7 +477,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             }
         }
         let wire_calls = calls.into_values().collect::<Vec<_>>();
-        let tool_calls = wire_calls
+        let mut tool_calls = wire_calls
             .iter()
             .map(|call| {
                 Ok(ToolCall {
@@ -359,18 +488,240 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut message_tool_calls = (!wire_calls.is_empty()).then_some(wire_calls);
+        if tool_calls.is_empty()
+            && let Some(parsed) = parse_raw_tool_call_text(&text)
+        {
+            message_tool_calls = Some(tool_calls_to_wire(&parsed));
+            text.clear();
+            tool_calls = parsed;
+        }
         Ok(ModelResponse {
             message: ModelMessage {
                 role: ModelRole::Assistant,
                 content: (!text.is_empty()).then_some(text.clone()),
                 reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                 tool_call_id: None,
-                tool_calls: (!wire_calls.is_empty()).then_some(wire_calls),
+                tool_calls: message_tool_calls,
             },
             text,
             tool_calls,
             usage,
         })
+    }
+}
+
+#[async_trait]
+impl ModelProvider for AnthropicProvider {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn complete(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let (system, messages) = anthropic_messages(&request.messages)?;
+        let tools = request
+            .tools
+            .iter()
+            .map(|tool| AnthropicTool {
+                name: &tool.name,
+                description: &tool.description,
+                input_schema: &tool.input_schema,
+            })
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .post(format!("{}/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&AnthropicRequest {
+                model: &self.model,
+                messages,
+                tools,
+                system,
+                max_tokens: self.max_output_tokens.unwrap_or(8192),
+            })
+            .send()
+            .await
+            .context("anthropic model request failed")?;
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            bail!("{}", provider_error_hint(status.as_u16(), &body));
+        }
+        let response: AnthropicResponse =
+            serde_json::from_str(&body).context("invalid Anthropic model response JSON")?;
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for item in response.content {
+            match item {
+                AnthropicResponseContent::Text { text: part } => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&part);
+                }
+                AnthropicResponseContent::ToolUse { id, name, input } => {
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments: input,
+                    });
+                }
+                AnthropicResponseContent::Other => {}
+            }
+        }
+        let message = ModelMessage {
+            role: ModelRole::Assistant,
+            content: (!text.is_empty()).then_some(text.clone()),
+            reasoning_content: None,
+            tool_call_id: None,
+            tool_calls: (!tool_calls.is_empty()).then_some(tool_calls_to_wire(&tool_calls)),
+        };
+        Ok(ModelResponse {
+            message,
+            text,
+            tool_calls,
+            usage: TokenUsage {
+                input_tokens: response.usage.input_tokens,
+                output_tokens: response.usage.output_tokens,
+                total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+                cached_input_tokens: response.usage.cache_read_input_tokens,
+            },
+        })
+    }
+}
+
+fn tool_calls_to_wire(calls: &[ToolCall]) -> Vec<WireToolCall> {
+    calls
+        .iter()
+        .map(|call| WireToolCall {
+            id: call.id.clone(),
+            kind: "function".into(),
+            function: WireFunctionCall {
+                name: call.name.clone(),
+                arguments: call.arguments.to_string(),
+            },
+        })
+        .collect()
+}
+
+fn anthropic_messages(
+    messages: &[ModelMessage],
+) -> Result<(Option<String>, Vec<AnthropicMessage>)> {
+    let mut system = Vec::new();
+    let mut result = Vec::new();
+    for message in messages {
+        match message.role {
+            ModelRole::System => {
+                if let Some(content) = &message.content {
+                    system.push(content.clone());
+                }
+            }
+            ModelRole::User => {
+                result.push(AnthropicMessage {
+                    role: "user",
+                    content: vec![AnthropicContent::Text {
+                        text: message.content.clone().unwrap_or_default(),
+                    }],
+                });
+            }
+            ModelRole::Assistant => {
+                let mut content = Vec::new();
+                if let Some(text) = &message.content
+                    && !text.is_empty()
+                {
+                    content.push(AnthropicContent::Text { text: text.clone() });
+                }
+                for call in message.tool_calls.clone().unwrap_or_default() {
+                    content.push(AnthropicContent::ToolUse {
+                        id: call.id,
+                        name: call.function.name,
+                        input: serde_json::from_str(&call.function.arguments)
+                            .context("assistant tool call arguments were not valid JSON")?,
+                    });
+                }
+                if !content.is_empty() {
+                    result.push(AnthropicMessage {
+                        role: "assistant",
+                        content,
+                    });
+                }
+            }
+            ModelRole::Tool => {
+                result.push(AnthropicMessage {
+                    role: "user",
+                    content: vec![AnthropicContent::ToolResult {
+                        tool_use_id: message.tool_call_id.clone().unwrap_or_default(),
+                        content: message.content.clone().unwrap_or_default(),
+                    }],
+                });
+            }
+        }
+    }
+    Ok(((!system.is_empty()).then(|| system.join("\n\n")), result))
+}
+
+fn parse_raw_tool_call_text(text: &str) -> Option<Vec<ToolCall>> {
+    if !text.contains("<tool_call") || !text.contains("<function=") {
+        return None;
+    }
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(function_start) = rest.find("<function=") {
+        rest = &rest[function_start + "<function=".len()..];
+        let name_end = rest.find('>')?;
+        let name = rest[..name_end]
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_string();
+        if name.is_empty() {
+            return None;
+        }
+        rest = &rest[name_end + 1..];
+        let function_end = rest.find("</function>").unwrap_or(rest.len());
+        let function_body = &rest[..function_end];
+        let mut arguments = Map::new();
+        let mut body_rest = function_body;
+        while let Some(parameter_start) = body_rest.find("<parameter=") {
+            body_rest = &body_rest[parameter_start + "<parameter=".len()..];
+            let key_end = body_rest.find('>')?;
+            let key = body_rest[..key_end]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            body_rest = &body_rest[key_end + 1..];
+            let value_end = body_rest.find("</parameter>")?;
+            let raw_value = body_rest[..value_end].trim();
+            body_rest = &body_rest[value_end + "</parameter>".len()..];
+            let value = serde_json::from_str::<Value>(raw_value)
+                .unwrap_or_else(|_| Value::String(strip_outer_quotes(raw_value).to_string()));
+            arguments.insert(key, value);
+        }
+        calls.push(ToolCall {
+            id: format!("raw-tool-call-{}", calls.len() + 1),
+            name,
+            arguments: Value::Object(arguments),
+        });
+        rest = if function_end < rest.len() {
+            &rest[function_end + "</function>".len()..]
+        } else {
+            ""
+        };
+    }
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn strip_outer_quotes(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2
+        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
+    {
+        &value[1..value.len() - 1]
+    } else {
+        value
     }
 }
 
@@ -437,5 +788,23 @@ mod tests {
         let error = provider_error_hint(400, "maximum context length exceeded");
         assert!(error.contains("上下文"));
         assert!(error.contains("压缩"));
+    }
+
+    #[test]
+    fn parses_raw_xml_style_tool_call_text() {
+        let calls = parse_raw_tool_call_text(
+            r#"<tool_call>
+<function=replace_text>
+<parameter=path>crates/lan-core/src/lib.rs</parameter>
+<parameter=old_text>"before"</parameter>
+<parameter=new_text>"after"</parameter>
+</function>
+</tool_call>"#,
+        )
+        .unwrap();
+        assert_eq!(calls[0].name, "replace_text");
+        assert_eq!(calls[0].arguments["path"], "crates/lan-core/src/lib.rs");
+        assert_eq!(calls[0].arguments["old_text"], "before");
+        assert_eq!(calls[0].arguments["new_text"], "after");
     }
 }
