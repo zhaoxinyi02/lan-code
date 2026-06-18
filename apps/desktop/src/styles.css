@@ -235,6 +235,29 @@ main { position: relative; display: flex; flex-direction: column; min-width: 0; 
 .office-row { display: grid; grid-template-columns: 48px 1fr; min-height: 30px; border-bottom: 1px solid var(--border); }
 .office-row b { display: grid; place-items: center; background: var(--panel-soft); color: var(--muted); font-size: 11px; }
 .office-row span { padding: 7px 10px; white-space: pre-wrap; }
+.office-native-editor { width: min(1180px, 100%); min-height: 620px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: 0 22px 65px color-mix(in srgb, var(--shadow) 75%, transparent); }
+.office-format-toolbar, .office-editor-actions, .office-slide-controls { position: sticky; top: 0; z-index: 6; display: flex; min-height: 42px; align-items: center; gap: 7px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--panel) 94%, transparent); backdrop-filter: blur(18px); }
+.office-format-toolbar select { min-width: 110px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 28px 6px 8px; outline: 0; background: var(--control); color: var(--text); }
+.office-format-toolbar select:nth-child(2) { min-width: 72px; }
+.office-format-hint { margin-left: auto; color: var(--muted); font-size: 10px; }
+.office-format-toolbar button, .office-editor-actions button, .office-slide-controls button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid transparent; border-radius: 8px; padding: 6px 8px; background: transparent; color: var(--text-soft); }
+.office-format-toolbar button:hover, .office-editor-actions button:hover, .office-slide-controls button:hover { border-color: var(--border); background: var(--control-hover); color: var(--text); }
+.office-editor-actions span { margin-right: auto; color: var(--text-soft); font-size: 12px; }
+.office-editor-actions button { border-color: var(--border); background: var(--control); }
+.office-editor-actions button:disabled { opacity: .45; }
+.office-docx-editor { border: 0; overflow: visible; background: transparent; box-shadow: none; }
+.office-docx-canvas { min-height: 720px; outline: 0; color: #18191b; }
+.office-docx-canvas .docx-wrapper { padding: 28px 14px 64px; background: transparent; }
+.office-docx-canvas .docx { box-shadow: 0 22px 70px #16243a24; }
+.office-univer-host { height: min(72vh, 760px); min-height: 560px; background: #fff; }
+.office-slide-controls span { min-width: 110px; color: var(--text-soft); text-align: center; }
+.office-slide-controls i { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: #32835a; font-size: 11px; font-style: normal; }
+.office-pptx-stage { min-height: 620px; display: grid; place-items: center; padding: 28px; background: radial-gradient(circle at 50% 0, #ffffff 0, #eef2f8 72%); }
+.office-pptx-stage canvas { display: block; max-width: 100%; max-height: 68vh; border-radius: 3px; background: #fff; box-shadow: 0 28px 70px #18243a32; }
+.office-render-loading, .office-render-error { min-height: 420px; display: grid; place-content: center; justify-items: center; gap: 12px; color: var(--muted); text-align: center; }
+.office-render-loading span { width: 28px; height: 28px; border: 3px solid color-mix(in srgb, var(--accent) 18%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+.office-render-error strong { color: #b64e4e; }
+.office-render-error span { max-width: 560px; }
 .office-ghost-edit { position: sticky; bottom: 18px; display: grid; gap: 5px; max-width: 780px; margin: 18px auto 0; border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border)); border-radius: 16px; padding: 12px 14px; background: color-mix(in srgb, var(--panel) 88%, transparent); backdrop-filter: blur(16px); box-shadow: var(--elevated-shadow); }
 .office-ghost-edit span, .office-ghost-edit p { margin: 0; color: var(--text-soft); font-size: 12px; }
 .office-context-card, .office-plan-card { display: grid; gap: 8px; border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: var(--panel); box-shadow: var(--soft-shadow); }

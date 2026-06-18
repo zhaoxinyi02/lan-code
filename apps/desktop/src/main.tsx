@@ -21,6 +21,8 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
+const OfficeEditor = React.lazy(() => import("./office/OfficeEditor"));
+
 type Mode = "readOnly" | "ask" | "workspace" | "fullAccess";
 type Session = { id: string; cwd: string; title?: string; status: string; updatedAt: number };
 type Project = { name: string; path: string };
@@ -106,7 +108,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.7";
+const CURRENT_VERSION = "0.2.8";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -1766,13 +1768,21 @@ function App() {
               <button onClick={() => setOfficeTab("outline")}><BookOpen size={13} /> 大纲</button>
               <button onClick={() => setOfficeTab("check")}><ClipboardCheck size={13} /> 检查</button>
             </div>
-            {activeOfficeDoc.kind === "xlsx" ? <div className="office-sheet">
-              {activeOfficeDoc.text.split(/\n+/).slice(0, 80).map((line, index) => <div key={index} className="office-row"><b>{index + 1}</b><span>{line || " "}</span></div>)}
-            </div> : activeOfficeDoc.kind === "pptx" ? <div className="office-slides">
-              {activeOfficeDoc.sections.map((section) => <article key={section.id} className="office-slide"><small>{section.title}</small><pre>{section.text}</pre></article>)}
-            </div> : <article className="office-page">
-              {activeOfficeDoc.text.split(/\n{2,}|\n/).slice(0, 120).map((paragraph, index) => <p key={index}>{paragraph}</p>)}
-            </article>}
+            {["docx", "xlsx", "pptx"].includes(activeOfficeDoc.kind)
+              ? <React.Suspense fallback={<div className="office-render-loading"><span /><b>正在启动 Office 编辑内核...</b></div>}>
+                <OfficeEditor
+                  document={activeOfficeDoc}
+                  onStatus={setOfficeStatus}
+                  onSaved={(document) => {
+                    setOpenOfficeDocs((items) => items.map((item) => item.path === document.path ? document : item));
+                    void refreshOfficeFiles();
+                    void refreshGitChanges();
+                  }}
+                />
+              </React.Suspense>
+              : <article className="office-page">
+                {activeOfficeDoc.text.split(/\n{2,}|\n/).slice(0, 120).map((paragraph, index) => <p key={index}>{paragraph}</p>)}
+              </article>}
             {officePreview?.path === activeOfficeDoc.path && <aside className="office-ghost-edit">
               <strong>AI Ghost Edit</strong>
               <span>{officePreview.summary}</span>

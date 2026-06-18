@@ -13,6 +13,8 @@
   ·
   <a href="docs/office-mode.zh-CN.md">Office Mode</a>
   ·
+  <a href="docs/Office开源引擎与许可.md">Office 引擎</a>
+  ·
   <a href="docs/architecture.md">架构说明</a>
   ·
   <a href="docs/research-analysis.zh-CN.md">参考项目研究</a>
@@ -21,7 +23,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/lan-code-agent-demo.svg" alt="Lan Code Agent Demo">
+  <img src="docs/assets/lan-code-overview.gif" alt="Lan Code Agent、Code 和 Office 三种模式动态演示">
 </p>
 
 ## Lan Code 是什么
@@ -40,6 +42,10 @@ Lan Code 是一个正在快速迭代的 AI 工作台。它把 AI 编程 Agent、
 
 ### Agent 模式
 
+<p align="center">
+  <img src="docs/assets/lan-code-agent.gif" alt="Lan Code Agent 流式对话演示">
+</p>
+
 - 真实 Agent 循环：模型提出工具调用，Core 执行权限判断、工具运行和事件持久化。
 - 支持文件读取、搜索、创建、精确替换、多文件编辑、Git status、Git diff、命令执行。
 - `readOnly / ask / workspace / fullAccess` 四级权限。
@@ -47,6 +53,10 @@ Lan Code 是一个正在快速迭代的 AI 工作台。它把 AI 编程 Agent、
 - 支持任务中断、审批、重复调用保护、Token 用量和费用估算。
 
 ### Code 模式
+
+<p align="center">
+  <img src="docs/assets/lan-code-code.gif" alt="Lan Code 行内 AI 自动补全演示">
+</p>
 
 - Monaco 编辑器，多标签、预览标签、脏文件提示、`Ctrl+S` 保存。
 - 文件树、文件图标、目录折叠、新建、重命名、删除、项目切换。
@@ -58,7 +68,7 @@ Lan Code 是一个正在快速迭代的 AI 工作台。它把 AI 编程 Agent、
 ### Office Mode
 
 <p align="center">
-  <img src="docs/assets/lan-code-office-demo.svg" alt="Lan Code Office Mode Demo">
+  <img src="docs/assets/lan-code-office.gif" alt="Lan Code AI 生成 PPT 演示">
 </p>
 
 Office Mode 是 Lan Code 的新工作台：让 AI 像处理代码一样处理 `.docx`、`.xlsx`、`.pptx` 和后续更多办公文件。
@@ -66,7 +76,10 @@ Office Mode 是 Lan Code 的新工作台：让 AI 像处理代码一样处理 `.
 当前已经具备：
 
 - Office 文件扫描和多文件 Tab。
-- `.docx/.xlsx/.pptx` OOXML 文本结构解析。
+- DOCX 原始页面版式渲染、页眉页脚、批注和分页。
+- XLSX 内嵌 Univer 表格编辑器，支持单元格、公式和多工作表编辑保存。
+- PPTX 原始幻灯片 Canvas 渲染和翻页预览。
+- 文档字体、字号、粗体、斜体、下划线等基础格式工具。
 - 左侧文件、大纲、变更、历史、检查面板。
 - 中间文档/表格/幻灯片工作区。
 - 右侧 Office AI 助手和上下文卡片。

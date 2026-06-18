@@ -268,6 +268,14 @@ struct OfficeDocument {
     warnings: Vec<String>,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeBinary {
+    path: String,
+    mime: String,
+    base64: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OfficeAction {
@@ -852,6 +860,94 @@ fn replace_in_office_package(
     }
     writer.finish().map_err(|error| error.to_string())?;
     Ok(replacements)
+}
+
+fn style_docx_text(
+    source: &Path,
+    target: &Path,
+    selected_text: &str,
+    font_family: Option<&str>,
+    font_size_pt: Option<f64>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+) -> Result<usize, String> {
+    let bytes = fs::read(source).map_err(|error| error.to_string())?;
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
+    let output = fs::File::create(target).map_err(|error| error.to_string())?;
+    let mut writer = ZipWriter::new(output);
+    let needle = xml_escape(selected_text);
+    let mut applied = 0;
+    for index in 0..archive.len() {
+        let mut file = archive.by_index(index).map_err(|error| error.to_string())?;
+        let name = file.name().to_string();
+        let options = SimpleFileOptions::default().compression_method(file.compression());
+        writer
+            .start_file(name.clone(), options)
+            .map_err(|error| error.to_string())?;
+        if name == "word/document.xml" {
+            let mut xml = String::new();
+            file.read_to_string(&mut xml)
+                .map_err(|error| error.to_string())?;
+            if let Some(text_pos) = xml.find(&needle) {
+                if let Some(run_start) = xml[..text_pos].rfind("<w:r") {
+                    if let Some(run_end_offset) = xml[text_pos..].find("</w:r>") {
+                        let run_end = text_pos + run_end_offset + "</w:r>".len();
+                        let run = &xml[run_start..run_end];
+                        let mut properties = String::new();
+                        if let Some(family) = font_family {
+                            let family = xml_escape(family);
+                            properties.push_str(&format!(
+                                r#"<w:rFonts w:ascii="{family}" w:hAnsi="{family}" w:eastAsia="{family}"/>"#
+                            ));
+                        }
+                        if let Some(size) = font_size_pt {
+                            let half_points = (size * 2.0).round().clamp(2.0, 400.0) as u32;
+                            properties.push_str(&format!(
+                                r#"<w:sz w:val="{half_points}"/><w:szCs w:val="{half_points}"/>"#
+                            ));
+                        }
+                        if bold {
+                            properties.push_str("<w:b/>");
+                        }
+                        if italic {
+                            properties.push_str("<w:i/>");
+                        }
+                        if underline {
+                            properties.push_str(r#"<w:u w:val="single"/>"#);
+                        }
+                        let styled = if let Some(close) = run.find("</w:rPr>") {
+                            let insert = close;
+                            format!("{}{}{}", &run[..insert], properties, &run[insert..])
+                        } else if let Some(open_end) = run.find('>') {
+                            format!(
+                                "{}<w:rPr>{}</w:rPr>{}",
+                                &run[..=open_end],
+                                properties,
+                                &run[open_end + 1..]
+                            )
+                        } else {
+                            run.to_string()
+                        };
+                        xml.replace_range(run_start..run_end, &styled);
+                        applied = 1;
+                    }
+                }
+            }
+            writer
+                .write_all(xml.as_bytes())
+                .map_err(|error| error.to_string())?;
+        } else {
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            writer
+                .write_all(&buffer)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    writer.finish().map_err(|error| error.to_string())?;
+    Ok(applied)
 }
 
 fn append_to_office_package(
@@ -1528,6 +1624,109 @@ async fn office_read_file(
     } else {
         read_plain_office_document(&resolved, &path, kind)
     }
+}
+
+#[tauri::command]
+async fn office_read_binary(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<OfficeBinary, String> {
+    let settings = state.settings.read().await;
+    let resolved = workspace_path(&settings, &path)?;
+    let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
+    if !matches!(kind, "docx" | "xlsx" | "pptx") {
+        return Err("该文件类型不支持二进制 Office 编辑器".into());
+    }
+    let bytes = fs::read(&resolved).map_err(|error| format!("读取 Office 文件失败：{error}"))?;
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err("Office 文件超过 128MB，暂不在内置编辑器中打开".into());
+    }
+    let mime = match kind {
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        _ => "application/octet-stream",
+    };
+    Ok(OfficeBinary {
+        path,
+        mime: mime.into(),
+        base64: BASE64.encode(bytes),
+    })
+}
+
+#[tauri::command]
+async fn office_write_binary(
+    path: String,
+    base64: String,
+    state: State<'_, AppState>,
+) -> Result<OfficeDocument, String> {
+    let settings = state.settings.read().await;
+    let resolved = mutable_workspace_path(&settings, &path)?;
+    let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
+    if !matches!(kind, "docx" | "xlsx" | "pptx") {
+        return Err("该文件类型不支持二进制写回".into());
+    }
+    let bytes = BASE64
+        .decode(base64.as_bytes())
+        .map_err(|error| format!("Office 文件数据无效：{error}"))?;
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err("Office 文件超过 128MB，拒绝写入".into());
+    }
+    let backup = office_backup_path(&resolved);
+    if resolved.exists() {
+        fs::copy(&resolved, &backup).map_err(|error| format!("创建 Office 备份失败：{error}"))?;
+    }
+    let temp = resolved.with_extension(format!("{kind}.lancode-write"));
+    fs::write(&temp, bytes).map_err(|error| format!("写入 Office 临时文件失败：{error}"))?;
+    fs::rename(&temp, &resolved)
+        .or_else(|_| {
+            fs::copy(&temp, &resolved)?;
+            fs::remove_file(&temp)
+        })
+        .map_err(|error| format!("替换 Office 文件失败：{error}"))?;
+    read_ooxml_document(&resolved, &path, kind)
+}
+
+#[tauri::command]
+async fn office_style_text(
+    path: String,
+    text: String,
+    font_family: Option<String>,
+    font_size_pt: Option<f64>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    state: State<'_, AppState>,
+) -> Result<OfficeDocument, String> {
+    if text.trim().is_empty() {
+        return Err("请先在文档中选中要调整格式的文字".into());
+    }
+    let settings = state.settings.read().await;
+    let resolved = mutable_workspace_path(&settings, &path)?;
+    let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
+    if kind != "docx" {
+        return Err("当前格式工具仅对 DOCX 原文件写回；表格请使用内嵌编辑器".into());
+    }
+    let backup = office_backup_path(&resolved);
+    fs::copy(&resolved, &backup).map_err(|error| format!("创建 Office 备份失败：{error}"))?;
+    let temp = resolved.with_extension("docx.lancode-style");
+    let applied = style_docx_text(
+        &resolved,
+        &temp,
+        &text,
+        font_family.as_deref(),
+        font_size_pt,
+        bold,
+        italic,
+        underline,
+    )?;
+    if applied == 0 {
+        let _ = fs::remove_file(&temp);
+        return Err("没有在 DOCX 文本节点中找到该选区，请缩小选区后重试".into());
+    }
+    fs::copy(&temp, &resolved).map_err(|error| format!("写回 DOCX 样式失败：{error}"))?;
+    let _ = fs::remove_file(temp);
+    read_ooxml_document(&resolved, &path, kind)
 }
 
 #[tauri::command]
@@ -2603,6 +2802,9 @@ fn main() {
             read_workspace_file,
             office_list_files,
             office_read_file,
+            office_read_binary,
+            office_write_binary,
+            office_style_text,
             office_create_file,
             office_preview_patch,
             office_apply_patch,
@@ -2649,8 +2851,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopSettings, build_core, create_minimal_docx, infer_model_capabilities,
-        plain_text_from_xml, read_ooxml_document,
+        DesktopSettings, build_core, create_minimal_docx, create_minimal_pptx, create_minimal_xlsx,
+        infer_model_capabilities, plain_text_from_xml, read_ooxml_document, style_docx_text,
+        zip_text_entries,
     };
 
     #[test]
@@ -2699,5 +2902,52 @@ mod tests {
         assert_eq!(document.kind, "docx");
         assert!(document.text.contains("测试文档"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn office_docx_style_write_keeps_package_readable() {
+        let source =
+            std::env::temp_dir().join(format!("lan-office-source-{}.docx", uuid::Uuid::new_v4()));
+        let styled =
+            std::env::temp_dir().join(format!("lan-office-styled-{}.docx", uuid::Uuid::new_v4()));
+        create_minimal_docx(&source, "格式测试").unwrap();
+        let applied = style_docx_text(
+            &source,
+            &styled,
+            "格式测试",
+            Some("Microsoft YaHei"),
+            Some(18.0),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(applied, 1);
+        let document = read_ooxml_document(&styled, "格式测试.docx", "docx").unwrap();
+        assert!(document.text.contains("格式测试"));
+        let xml = zip_text_entries(&styled, |name| name == "word/document.xml")
+            .unwrap()
+            .remove(0)
+            .1;
+        assert!(xml.contains("<w:b/>"));
+        assert!(xml.contains(r#"<w:u w:val="single"/>"#));
+        assert!(xml.contains("Microsoft YaHei"));
+        let _ = std::fs::remove_file(source);
+        let _ = std::fs::remove_file(styled);
+    }
+
+    #[test]
+    fn office_minimal_spreadsheet_and_presentation_are_readable() {
+        let xlsx = std::env::temp_dir().join(format!("lan-office-{}.xlsx", uuid::Uuid::new_v4()));
+        let pptx = std::env::temp_dir().join(format!("lan-office-{}.pptx", uuid::Uuid::new_v4()));
+        create_minimal_xlsx(&xlsx).unwrap();
+        create_minimal_pptx(&pptx, "演示测试").unwrap();
+        let sheet = read_ooxml_document(&xlsx, "测试.xlsx", "xlsx").unwrap();
+        let slides = read_ooxml_document(&pptx, "测试.pptx", "pptx").unwrap();
+        assert_eq!(sheet.kind, "xlsx");
+        assert_eq!(slides.kind, "pptx");
+        assert!(slides.text.contains("演示测试"));
+        let _ = std::fs::remove_file(xlsx);
+        let _ = std::fs::remove_file(pptx);
     }
 }
