@@ -1,9 +1,13 @@
 /target/
+**/target/
 /dist/
 /research/repos/
 **/node_modules/
 /apps/desktop/dist/
+/apps/desktop/installer-dist/
+/target/installer/
 /apps/desktop/src-tauri/gen/
+**/src-tauri/gen/
 /.idea/
 /.vscode/
 *.log

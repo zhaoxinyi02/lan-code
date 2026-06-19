@@ -363,6 +363,44 @@ struct UpdateInfo {
     notes: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupTarget {
+    workspace: String,
+    file: Option<String>,
+}
+
+#[tauri::command]
+fn startup_target() -> Option<StartupTarget> {
+    let args = std::env::args().collect::<Vec<_>>();
+    let index = args.iter().position(|arg| arg == "--open")?;
+    let target = PathBuf::from(args.get(index + 1)?);
+    let target = target.canonicalize().unwrap_or(target);
+    if target.is_file() {
+        Some(StartupTarget {
+            workspace: target.parent()?.to_string_lossy().to_string(),
+            file: Some(target.to_string_lossy().to_string()),
+        })
+    } else {
+        Some(StartupTarget {
+            workspace: target.to_string_lossy().to_string(),
+            file: None,
+        })
+    }
+}
+
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://github.com/zhaoxinyi02/lan-code") {
+        return Err("只允许打开 Lan Code 官方 GitHub 链接。".to_string());
+    }
+    hidden_command("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", &url])
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("无法调用系统浏览器：{error}"))
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -1054,7 +1092,7 @@ fn create_minimal_docx(path: &Path, title: &str) -> Result<(), String> {
         &mut writer,
         "word/document.xml",
         &format!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{}</w:t></w:r></w:p><w:p><w:r><w:t>从 Lan Code Office Mode 开始编辑。</w:t></w:r></w:p><w:sectPr/></w:body></w:document>"#,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:pPr><w:spacing w:after="240"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Microsoft YaHei" w:eastAsia="Microsoft YaHei"/><w:b/><w:color w:val="1E4F91"/><w:sz w:val="36"/></w:rPr><w:t>{}</w:t></w:r></w:p><w:p><w:pPr><w:spacing w:after="160"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Microsoft YaHei" w:eastAsia="Microsoft YaHei"/><w:color w:val="5F6B7A"/><w:sz w:val="22"/></w:rPr><w:t>从 Lan Code Office Mode 开始编辑。</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/></w:sectPr></w:body></w:document>"#,
             xml_escape(title)
         ),
     )?;
@@ -1089,7 +1127,7 @@ fn create_minimal_pptx(path: &Path, title: &str) -> Result<(), String> {
         &mut writer,
         "ppt/slides/slide1.xml",
         &format!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree><p:nvGrpSpPr/><p:grpSpPr/><p:sp><p:nvSpPr/><p:spPr/><p:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{}</a:t></a:r></a:p><a:p><a:r><a:t>从 Lan Code Office Mode 开始编辑。</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>"#,
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld name="Lan Code Slide"><p:bg><p:bgPr><a:solidFill><a:srgbClr val="F7F9FC"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr><p:sp><p:nvSpPr><p:cNvPr id="2" name="Accent"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1371600" y="1097280"/><a:ext cx="1219200" cy="91440"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="2F80ED"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp><p:sp><p:nvSpPr><p:cNvPr id="3" name="Lan Code Content"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1371600" y="1371600"/><a:ext cx="9144000" cy="3657600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr><p:txBody><a:bodyPr wrap="square" anchor="t"><a:spAutoFit/></a:bodyPr><a:lstStyle/><a:p><a:pPr algn="l"/><a:r><a:rPr lang="zh-CN" sz="3200" b="1"/><a:t>{}</a:t></a:r><a:endParaRPr lang="zh-CN" sz="3200"/></a:p><a:p><a:pPr marT="360000"/><a:r><a:rPr lang="zh-CN" sz="1800"/><a:t>从 Lan Code Office Mode 开始编辑。</a:t></a:r><a:endParaRPr lang="zh-CN" sz="1800"/></a:p></p:txBody></p:sp></p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:sld>"#,
             xml_escape(title)
         ),
     )?;
@@ -2827,6 +2865,8 @@ fn main() {
             terminal_stop_one,
             inline_completion,
             check_for_updates,
+            startup_target,
+            open_external_url,
             download_update,
             install_downloaded_update,
             pick_workspace,
@@ -2901,6 +2941,12 @@ mod tests {
         let document = read_ooxml_document(&path, "测试文档.docx", "docx").unwrap();
         assert_eq!(document.kind, "docx");
         assert!(document.text.contains("测试文档"));
+        let xml = zip_text_entries(&path, |name| name == "word/document.xml")
+            .unwrap()
+            .remove(0)
+            .1;
+        assert!(xml.contains(r#"<w:pgSz w:w="11906" w:h="16838"/>"#));
+        assert!(xml.contains(r#"<w:color w:val="1E4F91"/>"#));
         let _ = std::fs::remove_file(path);
     }
 
@@ -2947,6 +2993,13 @@ mod tests {
         assert_eq!(sheet.kind, "xlsx");
         assert_eq!(slides.kind, "pptx");
         assert!(slides.text.contains("演示测试"));
+        let slide_xml = zip_text_entries(&pptx, |name| name == "ppt/slides/slide1.xml")
+            .unwrap()
+            .remove(0)
+            .1;
+        assert!(slide_xml.contains(r#"<a:xfrm>"#));
+        assert!(slide_xml.contains(r#"<a:srgbClr val="2F80ED"/>"#));
+        assert!(slide_xml.contains(r#"sz="3200""#));
         let _ = std::fs::remove_file(xlsx);
         let _ = std::fs::remove_file(pptx);
     }

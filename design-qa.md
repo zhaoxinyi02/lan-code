@@ -1,37 +1,26 @@
-# Lan Code Desktop Design QA
+# Lan Code Design QA
 
-- source visual truth: user-provided Codex desktop screenshot
-- implementation screenshot: `docs/screenshots/lan-code-desktop.png`
-- viewport: 1440 x 972 application window
-- state: empty workspace, light theme
+- source visual truth: user-provided Lan Code screenshot highlighting hard panel boundaries
+- installer viewport: 900 x 590
+- desktop viewport: 1440 x 940
+- state: light theme
 
-## Full-view comparison evidence
+## Validated
 
-The implementation preserves the reference's three-column workbench, quiet
-light palette, compact navigation, centered task entry, and environment panel.
-Lan Code uses its own logo, copy, and blue accent rather than copying Codex
-branding.
-
-## Focused region comparison evidence
-
-The sidebar, task composer, environment rows, icon sizing, borders, and primary
-empty state were inspected at native application resolution. Lucide supplies
-all UI icons; no emoji or improvised glyph icons are used.
+- Title bar and workspace use one continuous background.
+- Sidebar, main workspace and inspector share consistent radii, strokes and elevation.
+- Agent, Code and Office inherit the same surface hierarchy.
+- Light and dark themes define matching workspace tokens.
+- Branded installer welcome and options pages fit without clipping.
+- Installer includes custom path selection, shortcut options, real progress, completion and uninstall states.
+- Installer backend compiles and embeds the release desktop executable.
 
 ## Findings
 
-No actionable P0, P1, or P2 findings remain.
+No actionable P0, P1 or P2 findings remain.
 
-## Follow-up polish
+## Follow-up Polish
 
-- P3: add dark theme after 0.1.
-- P3: add richer live tool-event rendering in the conversation.
-
-## Patches made
-
-- introduced the Lan Code brand asset and application icons;
-- aligned panel widths, borders, typography, and composer elevation;
-- added responsive behavior below 1150 px;
-- connected visible controls to session, settings, send, and interrupt actions.
+- P3: revisit exact main-window spacing after feedback from the packaged desktop build.
 
 final result: passed

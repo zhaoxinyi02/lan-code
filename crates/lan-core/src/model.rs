@@ -161,7 +161,14 @@ struct ChatRequest<'a> {
     tools: Vec<ChatTool<'a>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<ChatStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct ChatStreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -309,6 +316,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 messages: &request.messages,
                 tools,
                 stream: false,
+                stream_options: None,
                 max_tokens: self.max_output_tokens,
             })
             .send()
@@ -321,7 +329,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
         }
         let response: ChatResponse =
             serde_json::from_str(&body).context("invalid model response JSON")?;
-        let usage = token_usage(response.usage.unwrap_or_default());
+        let input_tokens = estimate_messages_tokens(&request.messages);
+        let mut usage = token_usage(response.usage.unwrap_or_default());
         let message = response
             .choices
             .into_iter()
@@ -356,6 +365,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         } else {
             String::new()
         };
+        fill_missing_usage(&mut usage, input_tokens, &message);
         Ok(ModelResponse {
             message,
             text,
@@ -369,6 +379,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
         request: ModelRequest,
         on_text: Arc<dyn Fn(String) + Send + Sync>,
     ) -> Result<ModelResponse> {
+        let input_tokens = estimate_messages_tokens(&request.messages);
         let tools = request
             .tools
             .iter()
@@ -390,6 +401,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 messages: &request.messages,
                 tools,
                 stream: true,
+                stream_options: Some(ChatStreamOptions {
+                    include_usage: true,
+                }),
                 max_tokens: self.max_output_tokens,
             })
             .send()
@@ -496,14 +510,16 @@ impl ModelProvider for OpenAiCompatibleProvider {
             text.clear();
             tool_calls = parsed;
         }
+        let message = ModelMessage {
+            role: ModelRole::Assistant,
+            content: (!text.is_empty()).then_some(text.clone()),
+            reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+            tool_call_id: None,
+            tool_calls: message_tool_calls,
+        };
+        fill_missing_usage(&mut usage, input_tokens, &message);
         Ok(ModelResponse {
-            message: ModelMessage {
-                role: ModelRole::Assistant,
-                content: (!text.is_empty()).then_some(text.clone()),
-                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
-                tool_call_id: None,
-                tool_calls: message_tool_calls,
-            },
+            message,
             text,
             tool_calls,
             usage,
@@ -738,6 +754,63 @@ fn token_usage(value: ChatUsage) -> TokenUsage {
     }
 }
 
+fn fill_missing_usage(usage: &mut TokenUsage, input_tokens: u64, message: &ModelMessage) {
+    if usage.input_tokens == 0 {
+        usage.input_tokens = input_tokens;
+    }
+    if usage.output_tokens == 0 {
+        usage.output_tokens = estimate_message_tokens(message);
+    }
+    if usage.total_tokens == 0 {
+        usage.total_tokens = usage.input_tokens + usage.output_tokens;
+    }
+}
+
+fn estimate_messages_tokens(messages: &[ModelMessage]) -> u64 {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+fn estimate_message_tokens(message: &ModelMessage) -> u64 {
+    let content = estimate_text_tokens(message.content.as_deref().unwrap_or_default());
+    let reasoning = estimate_text_tokens(message.reasoning_content.as_deref().unwrap_or_default());
+    let tools = message
+        .tool_calls
+        .as_ref()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|call| {
+                    estimate_text_tokens(&call.function.name)
+                        + estimate_text_tokens(&call.function.arguments)
+                })
+                .sum::<u64>()
+        })
+        .unwrap_or_default();
+    12 + content + reasoning + tools
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        return 0;
+    }
+    let mut ascii_run = 0u64;
+    let mut tokens = 0u64;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() || ch.is_ascii_punctuation() || ch == ' ' || ch == '\n' {
+            ascii_run += 1;
+        } else {
+            if ascii_run > 0 {
+                tokens += ascii_run.div_ceil(4);
+                ascii_run = 0;
+            }
+            if !ch.is_whitespace() {
+                tokens += 1;
+            }
+        }
+    }
+    tokens + ascii_run.div_ceil(4)
+}
+
 fn provider_error_hint(status: u16, body: &str) -> String {
     let lower = body.to_lowercase();
     let hint = if lower.contains("context")
@@ -781,6 +854,17 @@ mod tests {
         .expect("null usage should be accepted");
 
         assert!(response.usage.is_none());
+    }
+
+    #[test]
+    fn estimates_usage_when_compatible_provider_omits_it() {
+        let message = ModelMessage::text(ModelRole::Assistant, "这是一个 GLM 返回的中文回复。");
+        let mut usage = TokenUsage::default();
+        fill_missing_usage(&mut usage, 128, &message);
+
+        assert_eq!(usage.input_tokens, 128);
+        assert!(usage.output_tokens > 0);
+        assert_eq!(usage.total_tokens, usage.input_tokens + usage.output_tokens);
     }
 
     #[test]

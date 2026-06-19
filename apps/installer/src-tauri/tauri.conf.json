@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Lan Code Setup",
+  "version": "0.2.9",
+  "identifier": "dev.lancode.installer",
+  "build": {
+    "frontendDist": "../../desktop/installer-dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Lan Code Setup",
+        "width": 900,
+        "height": 590,
+        "minWidth": 900,
+        "minHeight": 590,
+        "maxWidth": 900,
+        "maxHeight": 590,
+        "resizable": false,
+        "center": true,
+        "decorations": false,
+        "shadow": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": [
+      "../../desktop/src-tauri/icons/32x32.png",
+      "../../desktop/src-tauri/icons/128x128.png",
+      "../../desktop/src-tauri/icons/128x128@2x.png",
+      "../../desktop/src-tauri/icons/icon.ico"
+    ]
+  }
+}

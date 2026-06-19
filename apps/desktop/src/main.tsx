@@ -12,6 +12,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import materialTheme from "./assets/material-icons.json";
+import SelectMenu from "./components/SelectMenu";
 import {
   Bot, BookOpen, CheckCircle2, ChevronDown, ChevronRight, CircleStop, ClipboardCheck, Code2, File, FileDiff, FilePlus, FileText, Folder, FolderGit2, Image,
   FolderOpen, FolderPlus, GitBranch, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
@@ -72,6 +73,7 @@ type UpdateInfo = {
   currentVersion: string; latestVersion: string; available: boolean; releaseUrl: string;
   installerUrl?: string; installerName?: string; publishedAt?: string; notes?: string;
 };
+type StartupTarget = { workspace: string; file?: string };
 type FileContextMenu = { x: number; y: number; path: string; isDir: boolean };
 type AppDialog = { kind: "confirm" | "input"; title: string; message: string; value?: string; danger?: boolean };
 type TerminalKind = "powershell" | "cmd" | "wsl";
@@ -108,7 +110,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.8";
+const CURRENT_VERSION = "0.2.9";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -309,27 +311,48 @@ function ModelSwitcher<T extends string>({ value, options, onChange }: {
   const [open, setOpen] = React.useState(false);
   const [menuStyle, setMenuStyle] = React.useState<React.CSSProperties>({});
   const host = React.useRef<HTMLDivElement>(null);
+  const menu = React.useRef<HTMLDivElement>(null);
+  const updatePosition = React.useCallback(() => {
+    if (!host.current) return;
+    const rect = host.current.getBoundingClientRect();
+    const width = Math.min(Math.max(310, rect.width), window.innerWidth - 16);
+    setMenuStyle({
+      top: undefined,
+      right: undefined,
+      bottom: window.innerHeight - rect.top + 7,
+      left: Math.max(8, Math.min(rect.left, window.innerWidth - width - 8)),
+      width,
+      maxHeight: Math.max(150, Math.min(360, rect.top - 15)),
+    });
+  }, []);
   React.useEffect(() => {
     const close = (event: PointerEvent) => {
-      if (!host.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (!host.current?.contains(target) && !menu.current?.contains(target)) setOpen(false);
+    };
+    const reposition = () => {
+      if (open) requestAnimationFrame(updatePosition);
     };
     window.addEventListener("pointerdown", close);
-    return () => window.removeEventListener("pointerdown", close);
-  }, []);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open, updatePosition]);
   const selected = options.find((option) => option.id === value);
   const toggle = () => {
-    if (!open && host.current) {
-      const rect = host.current.getBoundingClientRect();
-      setMenuStyle({ bottom: window.innerHeight - rect.top + 7, left: Math.max(8, rect.left), minWidth: Math.max(310, rect.width) });
-    }
+    if (!open) updatePosition();
     setOpen((current) => !current);
   };
   return <div className="dropdown model-switcher" ref={host}>
     <button className={`dropdown-trigger ${open ? "open" : ""}`} title="切换模型" onClick={toggle}>
-      <TerminalSquare size={15} /><span>{selected?.model || selected?.label || "选择模型"}</span><ChevronDown size={13} />
+      <TerminalSquare size={15} /><span>{selected?.provider || selected?.label || "选择模型"}</span><ChevronDown size={13} />
     </button>
-    {open && createPortal(<div className="model-menu dropdown-portal" style={menuStyle} onPointerDown={(event) => event.stopPropagation()}>
-      {options.map((option) => <button key={option.id} className={option.id === value ? "active" : ""} onClick={() => { onChange(option.id); setOpen(false); }}>
+    {open && createPortal(<div ref={menu} className="model-menu dropdown-portal" style={menuStyle} onPointerDown={(event) => event.stopPropagation()}>
+      {options.map((option) => <button key={option.id} className={option.id === value ? "active" : ""} onPointerDown={(event) => { event.preventDefault(); onChange(option.id); setOpen(false); }}>
         {option.id === "__manage" ? <><Settings size={15} /><span><strong>{option.label}</strong><small>添加、测试或获取模型 ID</small></span></> : <><TerminalSquare size={15} /><span><strong>{option.provider || option.label}</strong><small>{option.model || option.label}{option.meta ? ` · ${option.meta}` : ""}</small></span>{option.id === value && <Check size={14} />}</>}
       </button>)}
     </div>, document.body)}
@@ -614,7 +637,9 @@ function App() {
   const [appDialog, setAppDialog] = React.useState<AppDialog>();
   const [dialogValue, setDialogValue] = React.useState("");
   const [paletteOpen, setPaletteOpen] = React.useState(false);
+  const [startupFile, setStartupFile] = React.useState("");
   const dialogResolver = React.useRef<((value: string | boolean | undefined) => void) | undefined>(undefined);
+  const settingsLoaded = React.useRef(false);
   const editorRef = React.useRef<Parameters<OnMount>[0] | null>(null);
   const completionTimer = React.useRef<number | undefined>(undefined);
   const completionDisposable = React.useRef<monaco.IDisposable | null>(null);
@@ -622,7 +647,9 @@ function App() {
   const conversationRef = React.useRef<HTMLElement | null>(null);
   const activeDocument = openFiles.find((file) => file.path === activeFile);
   const activeOfficeDoc = openOfficeDocs.find((file) => file.path === activeOfficePath);
-  const providerReady = Boolean(settings.apiKey) || ["ollama", "lmstudio"].includes(settings.provider);
+  const providerReady = Boolean(settings.apiKey)
+    || ["ollama", "lmstudio"].includes(settings.provider)
+    || settings.providerProfiles.some((profile) => profile.enabled !== false && (Boolean(profile.apiKey) || ["ollama", "lmstudio"].includes(profile.provider)));
   const darkTheme = themeMode === "dark" || (themeMode === "system" && systemDark);
   const workingTreeDirty = Boolean(gitOverview?.isRepository && gitOverview.changedFiles > 0);
 
@@ -761,8 +788,8 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    Promise.all([invoke<SettingsData>("get_settings"), invoke<Session[]>("list_sessions")])
-      .then(([loaded, rows]) => {
+    Promise.all([invoke<SettingsData>("get_settings"), invoke<Session[]>("list_sessions"), invoke<StartupTarget | null>("startup_target")])
+      .then(([loaded, rows, startup]) => {
         const currentProfile = {
           id: crypto.randomUUID(), name: PROVIDERS.find((item) => item.id === loaded.provider)?.name || loaded.provider,
           enabled: true, provider: loaded.provider, baseUrl: loaded.baseUrl, model: loaded.model, apiKey: loaded.apiKey,
@@ -777,14 +804,25 @@ function App() {
         const profiles = hydratedProfiles.some((profile) => profile.provider === loaded.provider && profile.baseUrl === loaded.baseUrl && profile.model === loaded.model)
           ? hydratedProfiles
           : [currentProfile, ...hydratedProfiles];
-        const normalized = { ...loaded, providerProfiles: profiles };
+        const startupProject = startup?.workspace
+          ? { name: startup.workspace.split(/[\\/]/).filter(Boolean).at(-1) || startup.workspace, path: startup.workspace }
+          : undefined;
+        const normalized = {
+          ...loaded,
+          workspace: startupProject?.path || loaded.workspace,
+          projects: startupProject && !loaded.projects.some((project) => normalizePath(project.path) === normalizePath(startupProject.path))
+            ? [...loaded.projects, startupProject]
+            : loaded.projects,
+          providerProfiles: profiles,
+        };
         setSettings(normalized);
         setDraft(normalized);
         setSessions(rows);
-        if (!loaded.apiKey && !["ollama", "lmstudio"].includes(loaded.provider)) {
-          setSettingsSection("model");
-          setSettingsOpen(true);
+        if (startup?.file) {
+          setStartupFile(startup.file);
+          setWorkbench("code");
         }
+        settingsLoaded.current = true;
       })
       .catch((error) => setFatal(String(error)));
   }, []);
@@ -794,11 +832,30 @@ function App() {
   }, []);
 
   React.useEffect(() => {
+    if (!settingsLoaded.current) return;
+    const timer = window.setTimeout(() => {
+      invoke("save_settings", { settings: draft }).then(() => {
+        setSettings(draft);
+        setSettingsStatus("");
+      }).catch((error) => setSettingsStatus(`自动保存失败：${String(error)}`));
+    }, 550);
+    return () => window.clearTimeout(timer);
+  }, [draft]);
+
+  React.useEffect(() => {
     if (workbench !== "code" || !settings.workspace) return;
     invoke<WorkspaceEntry[]>("list_workspace_files").then(setWorkspaceFiles).catch((error) => setCodeStatus(String(error)));
     invoke<GitChange[]>("workspace_git_changes").then(setGitChanges).catch(() => {});
     invoke<GitOverview>("workspace_git_overview").then(setGitOverview).catch(() => setGitOverview(undefined));
   }, [workbench, settings.workspace]);
+
+  React.useEffect(() => {
+    if (!startupFile || workbench !== "code" || !settings.workspace) return;
+    refreshWorkspaceFiles()
+      .then(() => openWorkspaceFile(startupFile, undefined, true))
+      .then(() => setStartupFile(""))
+      .catch((error) => setCodeStatus(`打开启动文件失败：${String(error)}`));
+  }, [startupFile, workbench, settings.workspace]);
 
   React.useEffect(() => {
     if (workbench !== "office" || !settings.workspace) return;
@@ -989,7 +1046,23 @@ function App() {
   }
 
   function updateProviderProfile(id: string, patch: Partial<ProviderProfile>) {
-    setDraft((value) => ({ ...value, providerProfiles: value.providerProfiles.map((item) => item.id === id ? { ...item, ...patch } : item) }));
+    setDraft((value) => {
+      const current = value.providerProfiles.find((item) => item.id === id);
+      const updated = current ? { ...current, ...patch, enabled: patch.apiKey !== undefined ? true : current.enabled } : undefined;
+      const shouldUseAsCurrent = Boolean(updated?.apiKey) && !value.apiKey;
+      return {
+        ...value,
+        ...(shouldUseAsCurrent && updated ? {
+          provider: updated.provider,
+          baseUrl: updated.baseUrl,
+          model: updated.model,
+          apiKey: updated.apiKey,
+          inputPricePerMillion: updated.inputPricePerMillion,
+          outputPricePerMillion: updated.outputPricePerMillion,
+        } : {}),
+        providerProfiles: value.providerProfiles.map((item) => item.id === id && updated ? updated : item),
+      };
+    });
   }
 
   function makeProviderProfileCurrent(profile: ProviderProfile) {
@@ -997,7 +1070,7 @@ function App() {
       ...value, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model, apiKey: profile.apiKey,
       inputPricePerMillion: profile.inputPricePerMillion, outputPricePerMillion: profile.outputPricePerMillion,
     }));
-    setSettingsStatus(`保存后将使用“${profile.name} · ${profile.model}”。`);
+    setSettingsStatus(`正在切换到“${profile.name} · ${profile.model}”...`);
   }
 
   function selectProfileProvider(profile: ProviderProfile, providerId: string) {
@@ -1194,7 +1267,6 @@ function App() {
       const document = await invoke<OfficeDocument>("office_read_file", { path });
       setOpenOfficeDocs((items) => [...items, document]);
       setActiveOfficePath(document.path);
-      setOfficeTab("outline");
       setOfficeStatus("");
       const issues = await invoke<OfficeQualityIssue[]>("office_check_file", { path }).catch(() => [] as OfficeQualityIssue[]);
       setOfficeIssues(issues);
@@ -1285,7 +1357,7 @@ function App() {
       "如果能安全修改，请说明 oldText/newText/actionType/targetId；如果需要用户确认，也要说清楚。",
     ].join("\n");
     setPrompt(text);
-    setWorkbench("agent");
+    setOfficeInstruction("");
     requestAnimationFrame(() => void sendWithText(text));
   }
 
@@ -1417,6 +1489,14 @@ function App() {
     }
   }
 
+  async function openExternalUrl(url: string) {
+    try {
+      await invoke("open_external_url", { url });
+    } catch (error) {
+      setFatal(`无法打开链接：${String(error)}`);
+    }
+  }
+
   async function downloadUpdate() {
     if (!updateInfo?.installerUrl || !updateInfo.installerName) return;
     setUpdateStatus("正在下载最新安装包，请稍候...");
@@ -1465,12 +1545,6 @@ function App() {
   }
 
   async function newSession(title = "新对话") {
-    if (!providerReady) {
-      setSettingsSection("model");
-      setSettingsOpen(true);
-      setSettingsStatus("请先配置并测试 API");
-      return undefined;
-    }
     const session = await invoke<Session>("create_session", { cwd: settings.workspace, title });
     await refreshSessions();
     setActiveId(session.id);
@@ -1586,7 +1660,7 @@ function App() {
   );
 
   return (
-    <div className={`app-shell ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`} style={{ "--sidebar-width": `${sidebarWidth}px`, "--inspector-width": `${inspectorWidth}px` } as React.CSSProperties}>
+    <div className={`app-shell workbench-${workbench} ${sidebarOpen ? "" : "sidebar-collapsed"} ${inspectorOpen ? "" : "inspector-collapsed"}`} style={{ "--sidebar-width": `${sidebarWidth}px`, "--inspector-width": `${inspectorWidth}px` } as React.CSSProperties}>
       <div className="window-titlebar" data-tauri-drag-region onDoubleClick={() => void appWindow.toggleMaximize().catch(() => undefined)}>
         <div className="titlebar-left">
           <button title={sidebarOpen ? "收起侧栏" : "展开侧栏"} className="titlebar-icon" onClick={() => setSidebarOpen((value) => !value)}>{sidebarOpen ? <PanelLeftClose size={15} /> : <PanelLeftOpen size={15} />}</button>
@@ -1598,7 +1672,7 @@ function App() {
               {menu === "file" && <><button onClick={() => { setAppMenu(undefined); void newSession(); }}><MessageSquare size={14} />新建对话<kbd>Ctrl+N</kbd></button><button onClick={() => { setAppMenu(undefined); void addProject(); }}><FolderPlus size={14} />添加项目</button><i /><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={14} />设置</button></>}
               {menu === "edit" && <><button onClick={() => { setAppMenu(undefined); setPaletteOpen(true); }}><Sparkles size={14} />快速任务<kbd>Ctrl+K</kbd></button><i /><button disabled={!activeFile} onClick={() => { setAppMenu(undefined); void saveWorkspaceFile(); }}><Save size={14} />保存文件<kbd>Ctrl+S</kbd></button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(false); }}><FilePlus size={14} />新建文件</button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(true); }}><FolderPlus size={14} />新建文件夹</button></>}
               {menu === "view" && <><button onClick={() => { setAppMenu(undefined); setWorkbench("agent"); }}><MessageSquare size={14} />Agent 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("code"); }}><Code2 size={14} />Code 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("office"); }}><FileText size={14} />Office 工作台</button><i /><button onClick={() => { setAppMenu(undefined); setSidebarOpen((value) => !value); }}><PanelLeftOpen size={14} />切换侧栏</button><button onClick={() => { setAppMenu(undefined); setInspectorOpen((value) => !value); }}><Eye size={14} />切换观察面板</button></>}
-              {menu === "help" && <><button onClick={() => { setAppMenu(undefined); window.open("https://github.com/zhaoxinyi02/lan-code", "_blank"); }}><ExternalLink size={14} />GitHub 仓库</button><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("updates"); setSettingsOpen(true); }}><Download size={14} />检查更新</button></>}
+              {menu === "help" && <><button onClick={() => { setAppMenu(undefined); void openExternalUrl("https://github.com/zhaoxinyi02/lan-code"); }}><ExternalLink size={14} />GitHub 仓库</button><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("updates"); setSettingsOpen(true); }}><Download size={14} />检查更新{updateInfo.available && <span className="notification-dot">1</span>}</button></>}
             </div>}
           </div>)}
         </div>
@@ -1641,8 +1715,31 @@ function App() {
             <div className="section-label">质量检查</div>
             {officeIssues.length === 0 ? <div className="empty-small">打开文件后会自动检查基础结构。</div> : officeIssues.map((issue, index) => <div className={`office-issue ${issue.severity}`} key={index}><strong>{issue.title}</strong><span>{issue.detail}</span></div>)}
           </div>}
+          <div className="office-sidebar-details">
+            <div className="office-context-card">
+              <strong>当前上下文</strong>
+              <div><span>文件</span><b>{activeOfficeDoc?.name || "未打开"}</b></div>
+              <div><span>类型</span><b>{activeOfficeDoc?.kind?.toUpperCase() || "-"}</b></div>
+              <div><span>对象</span><b>{activeOfficeDoc?.objectCount || 0}</b></div>
+              <div><span>策略</span><b>预览后应用</b></div>
+            </div>
+            <div className="office-context-card">
+              <strong>AI 可见范围</strong>
+              <label><input type="checkbox" checked readOnly /> 当前文件全文</label>
+              <label><input type="checkbox" checked readOnly /> 当前大纲节点</label>
+              <label><input type="checkbox" checked readOnly /> Office Diff 和历史</label>
+            </div>
+            <div className="office-plan-card">
+              <strong>操作计划</strong>
+              {officePreview && <>
+                <p>{officePreview.summary}</p>
+                {officePreview.diff.map((item) => <div key={item.id} className={`office-plan-step ${item.status}`}><CheckCircle2 size={13} /><span>{item.title}</span><small>{item.status}</small></div>)}
+                <div className="office-apply-row"><button onClick={() => void applyOfficePreview()} className="primary-inline">应用修改</button><button onClick={() => setOfficePreview(undefined)}>丢弃</button></div>
+              </>}
+            </div>
+          </div>
           <button className="new-chat add-project-code" onClick={() => void addProject()}><FolderPlus size={14} /> 添加项目</button>
-          <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+          <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置{updateInfo.available && <span className="notification-dot">1</span>}</button>
         </> : workbench === "code" ? <>
           <div className="code-side-controls">
             <Dropdown value={settings.workspace} title="切换当前项目" icon={<GitBranch size={15} />} options={settings.projects.map((project) => ({ id: project.path, label: project.name }))} onChange={(path) => { const project = settings.projects.find((item) => item.path === path); if (project) void selectProject(project); }} />
@@ -1684,7 +1781,7 @@ function App() {
             </section>
           </div>
           <button className="new-chat add-project-code" onClick={() => void addProject()}><FolderPlus size={14} /> 添加项目</button>
-          <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+          <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置{updateInfo.available && <span className="notification-dot">1</span>}</button>
         </> : <>
         <button className="new-chat" onClick={() => void newSession()}><Plus size={16} /> 新对话</button>
         <nav>
@@ -1704,7 +1801,7 @@ function App() {
             {!collapsedProjects.has(project.path) && (projectSessions(project).length ? projectSessions(project).map(renderSession) : <div className="empty-project">暂无对话</div>)}
           </div>
         ))}{orphanSessions.length > 0 && <div className="project-group"><div className="orphan-heading">未归档对话</div>{orphanSessions.map(renderSession)}</div>}</div>
-        <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置</button>
+        <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置{updateInfo.available && <span className="notification-dot">1</span>}</button>
         </>}
         <div className="panel-resizer sidebar-resizer" title="拖动调整侧栏宽度，双击恢复默认" onPointerDown={(event) => startResize("sidebar", event)} onDoubleClick={() => setSidebarWidth(238)} />
       </aside>
@@ -1833,39 +1930,15 @@ function App() {
         {terminalStarted && <IntegratedTerminal workspace={settings.workspace} visible={terminalOpen} dark={darkTheme} onClose={() => setTerminalOpen(false)} />}
       </main>}
 
-      {inspectorOpen && <aside className={`inspector ${workbench === "code" ? "code-inspector" : ""}`} style={{ width: inspectorWidth }}>
+      {inspectorOpen && <aside className={`inspector ${workbench === "code" || workbench === "office" ? "code-inspector" : workbench === "agent" ? "agent-inspector" : ""}`} style={{ width: inspectorWidth }}>
         <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(252)} />
         {workbench === "office" ? <>
-          <div className="assistant-head"><div><h3>Office AI 助手</h3><p>理解当前文件、结构、选区和预览修改，默认先生成可审阅操作。</p></div></div>
-          <div className="office-context-card">
-            <strong>当前上下文</strong>
-            <div><span>文件</span><b>{activeOfficeDoc?.name || "未打开"}</b></div>
-            <div><span>类型</span><b>{activeOfficeDoc?.kind?.toUpperCase() || "-"}</b></div>
-            <div><span>对象</span><b>{activeOfficeDoc?.objectCount || 0}</b></div>
-            <div><span>策略</span><b>预览后应用</b></div>
-          </div>
-          <div className="office-context-card">
-            <strong>AI 可见范围</strong>
-            <label><input type="checkbox" checked readOnly /> 当前文件全文</label>
-            <label><input type="checkbox" checked readOnly /> 当前大纲节点</label>
-            <label><input type="checkbox" checked readOnly /> Office Diff 和历史</label>
-          </div>
-          <div className="office-plan-card">
-            <strong>操作计划</strong>
-            {!officePreview ? <p>输入指令后先生成结构化操作计划，不直接破坏原文件。</p> : <>
-              <p>{officePreview.summary}</p>
-              {officePreview.diff.map((item) => <div key={item.id} className={`office-plan-step ${item.status}`}><CheckCircle2 size={13} /><span>{item.title}</span><small>{item.status}</small></div>)}
-              <div className="office-apply-row"><button onClick={() => void applyOfficePreview()} className="primary-inline">应用修改</button><button onClick={() => setOfficePreview(undefined)}>丢弃</button></div>
-            </>}
-          </div>
-          {officeHistory.length > 0 && <div className="office-plan-card">
-            <strong>回滚点</strong>
-            {officeHistory.slice(0, 4).map((patch) => <button className="office-history-row" key={patch.patchId} onClick={() => void rollbackOfficePatch(patch)}><RotateCcw size={13} /><span>{patch.path}</span></button>)}
-          </div>}
-          <div className="code-chat-composer office-composer"><textarea value={officeInstruction} onChange={(event) => setOfficeInstruction(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void previewOfficeInstruction(); } }} placeholder="例如：把当前位置补一段课程设计小结，先给我预览 diff" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /></div><div className="office-send-actions"><button title="生成本地可审阅 Patch" onClick={() => void previewOfficeInstruction()} disabled={!activeOfficeDoc || !officeInstruction.trim()}><FileDiff size={14} /></button><button title="带 Office 上下文交给 Agent" onClick={() => void sendOfficeInstructionToAgent()} disabled={!activeOfficeDoc || !officeInstruction.trim() || busy}><Send size={14} /></button></div></div></div>
+          <div className="assistant-head"><div><h3>Lan Code</h3></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><SelectMenu value={activeId || ""} placeholder="选择当前项目对话" ariaLabel="选择当前项目对话" options={currentProjectSessions.map((session) => ({ id: session.id, label: session.title || "未命名对话" }))} onChange={(id) => setActiveId(id || undefined)} /></div></div>
+          <div className="code-chat">{messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <UserMessageText text={message.text} />}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
+          <div className="code-chat-composer office-composer"><textarea value={officeInstruction} onChange={(event) => setOfficeInstruction(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendOfficeInstructionToAgent(); } }} placeholder="询问文档或要求修改当前 Office 文件" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /><Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} /></div><div className="office-send-actions"><button title="生成可审阅 Office Diff" onClick={() => void previewOfficeInstruction()} disabled={!activeOfficeDoc || !officeInstruction.trim()}><FileDiff size={14} /></button><button title="发送" onClick={() => void sendOfficeInstructionToAgent()} disabled={!activeOfficeDoc || !officeInstruction.trim() || busy}><Send size={14} /></button></div></div></div>
         </> : workbench === "code" ? <>
-          <div className="assistant-head"><div><h3>AI 助手</h3><p>针对当前项目提问，Agent 会使用同一套工具、权限和会话。</p></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><select value={activeId || ""} onChange={(event) => setActiveId(event.target.value || undefined)}><option value="">选择当前项目对话</option>{currentProjectSessions.map((session) => <option key={session.id} value={session.id}>{session.title || "未命名对话"}</option>)}</select></div></div>
-          <div className="code-chat">{messages.length === 0 ? <div className="empty-small">选择一个对话，或新建对话后向当前仓库提问。</div> : messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <UserMessageText text={message.text} />}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
+          <div className="assistant-head"><div><h3>Lan Code</h3></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><SelectMenu value={activeId || ""} placeholder="选择当前项目对话" ariaLabel="选择当前项目对话" options={currentProjectSessions.map((session) => ({ id: session.id, label: session.title || "未命名对话" }))} onChange={(id) => setActiveId(id || undefined)} /></div></div>
+          <div className="code-chat">{messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <UserMessageText text={message.text} />}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
           <div className="code-chat-composer"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void send(); } }} placeholder="询问代码或要求修改项目" /><div className="code-composer-footer"><div><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} /><Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} /></div><button onClick={() => void send()} disabled={busy || !prompt.trim()}><Send size={14} /></button></div></div>
         </> : <>
         <h3>环境信息</h3>
@@ -1930,12 +2003,12 @@ function App() {
           <button className="settings-back" onClick={() => setSettingsOpen(false)}><ArrowLeft size={15} /> 返回应用</button>
           <div className="settings-search"><Search size={14} /><span>搜索设置...</span></div>
           <div className="settings-category-label">Lan Code</div>
-          {([["appearance", "外观"], ["model", "模型服务"], ["capabilities", "能力路由"], ["workspace", "项目与数据"], ["agent", "Agent 与权限"], ["updates", "软件更新"]] as [SettingsSection, string][]).map(([id, label]) => <button key={id} className={settingsSection === id ? "active" : ""} onClick={() => setSettingsSection(id)}>{label}</button>)}
+          {([["appearance", "外观"], ["model", "模型服务"], ["capabilities", "能力路由"], ["workspace", "项目与数据"], ["agent", "Agent 与权限"], ["updates", "软件更新"]] as [SettingsSection, string][]).map(([id, label]) => <button key={id} className={settingsSection === id ? "active" : ""} onClick={() => setSettingsSection(id)}>{label}{id === "updates" && updateInfo.available && <span className="notification-dot">1</span>}</button>)}
         </aside><main className="settings-page-main"><div className="settings-page-inner">
         <div className="settings-page-title"><div><h2>Lan Code 设置</h2><p>按类别管理模型、能力、项目、Agent 和更新。</p></div><button className="primary-inline" onClick={saveSettings}>保存并启用</button></div>
         {settingsSection === "appearance" && <><div className="settings-section-title"><h3>外观</h3><p>选择浅色、深色，或跟随 Windows 系统主题。</p></div><div className="theme-options">
           {([{ id: "system", label: "跟随系统", icon: <Monitor size={18} /> }, { id: "light", label: "浅色", icon: <Sun size={18} /> }, { id: "dark", label: "深色", icon: <Moon size={18} /> }] as { id: ThemeMode; label: string; icon: React.ReactNode }[]).map((theme) => <button key={theme.id} className={themeMode === theme.id ? "active" : ""} onClick={() => setThemeMode(theme.id)}>{theme.icon}<strong>{theme.label}</strong>{themeMode === theme.id && <Check size={14} />}</button>)}
-        </div><div className="settings-note">主题偏好保存在本机，代码编辑器和集成终端会同步切换。</div></>}
+        </div></>}
         {settingsSection === "model" && <><div className="settings-section-title model-title"><div><h3>模型管理</h3><p>配置并同时启用多个模型，随后可从对话输入框直接切换。</p></div><button className="primary-inline" onClick={addProviderProfile}><Plus size={14} /> 添加模型配置</button></div>
           <div className="provider-list">
             {draft.providerProfiles.map((profile) => {
@@ -1958,8 +2031,8 @@ function App() {
                 </div>
                 {expanded && <><div className="provider-fields">
                   <label>配置名称<input value={profile.name} onChange={(event) => updateProviderProfile(profile.id, { name: event.target.value })} /></label>
-                  <label>供应商<select value={profile.provider} onChange={(event) => selectProfileProvider(profile, event.target.value)}>{PROVIDERS.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label>
-                  <label className="span-2">模型 ID<div className="model-input"><input placeholder="可手动填写模型 ID" value={profile.model} onChange={(event) => updateProviderProfile(profile.id, { model: event.target.value })} /><select value={models.includes(profile.model) ? profile.model : ""} onChange={(event) => event.target.value && updateProviderProfile(profile.id, { model: event.target.value })}><option value="">从已获取模型中选择...</option>{models.map((model) => <option value={model} key={model}>{model}</option>)}</select><button onClick={() => void fetchProviderModels(profile)}><RefreshCw size={13} /> 获取模型</button></div></label>
+                  <label>供应商<SelectMenu value={profile.provider} ariaLabel="选择供应商" options={PROVIDERS.map((provider) => ({ id: provider.id, label: provider.name }))} onChange={(provider) => selectProfileProvider(profile, provider)} /></label>
+                  <label className="span-2">模型 ID<div className="model-input"><input placeholder="可手动填写模型 ID" value={profile.model} onChange={(event) => updateProviderProfile(profile.id, { model: event.target.value })} /><SelectMenu value={models.includes(profile.model) ? profile.model : ""} placeholder="从已获取模型中选择..." ariaLabel="选择模型 ID" options={models.map((model) => ({ id: model, label: model }))} onChange={(model) => model && updateProviderProfile(profile.id, { model })} /><button onClick={() => void fetchProviderModels(profile)}><RefreshCw size={13} /> 获取模型</button></div></label>
                   <label className="span-2">API 地址<input value={profile.baseUrl} onChange={(event) => updateProviderProfile(profile.id, { baseUrl: event.target.value })} /></label>
                   <label className="span-2">API Key<input type="password" placeholder="sk-..." value={profile.apiKey} onChange={(event) => updateProviderProfile(profile.id, { apiKey: event.target.value })} /></label>
                   <label>输入上下文 / Token<input type="number" min="1024" step="1024" value={profile.contextWindow || DEFAULT_CONTEXT_WINDOW} onChange={(event) => updateProviderProfile(profile.id, { contextWindow: Number(event.target.value) })} /></label>
@@ -1971,9 +2044,9 @@ function App() {
               </section>;
             })}
           </div>
-          <div className="settings-note">模型列表通过供应商的兼容 `/models` 接口获取；不支持该接口时仍可手动填写模型 ID。价格因模型和渠道变化，请按实际账单填写。</div></>}
+          </>}
         {settingsSection === "capabilities" && <><div className="settings-section-title"><h3>能力路由</h3><p>主模型缺少多模态能力时，将任务路由到专用模型。</p></div><div className="capability-section">
-          <div className="profile-heading"><strong>模型能力路由</strong><span>测试 API 后会自动识别</span></div>
+          <div className="profile-heading"><strong>模型能力路由</strong><span>根据当前模型能力自动选择路由</span></div>
           <div className="capability-badges">
             <i className={draft.modelCapabilities.toolCalling ? "on" : ""}>工具调用</i>
             <i className={draft.modelCapabilities.imageInput ? "on" : ""}>图片理解</i>
@@ -2008,9 +2081,9 @@ function App() {
           </div>) : <div className="empty-small">暂无已归档项目。</div>}
         </div><div className="form-grid">
           <label className="span-2">数据保存目录<div className="input-action"><input value={draft.dataDir} onChange={(e) => setDraft({ ...draft, dataDir: e.target.value })} /><button onClick={chooseDataDir}>选择目录</button></div></label>
-        </div><div className="settings-note">默认数据目录为 ~/.lancode。API Key 会明文保存在 settings.json，请勿提交或分享该文件。</div></>}
+        </div></>}
         {settingsSection === "agent" && <><div className="settings-section-title"><h3>Agent 与权限</h3><p>控制自动执行范围和单次任务的最大迭代深度。</p></div><div className="form-grid">
-          <label>权限模式<select value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as Mode })}>{APPROVAL_MODES.map((mode) => <option key={mode.id} value={mode.id}>{mode.label}</option>)}</select></label>
+          <label>权限模式<SelectMenu value={draft.approvalMode} ariaLabel="选择权限模式" options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} onChange={(approvalMode) => setDraft({ ...draft, approvalMode })} /></label>
           <label>单任务最大执行轮次<input type="number" min="4" max="256" value={draft.maxProviderRounds} onChange={(e) => setDraft({ ...draft, maxProviderRounds: Number(e.target.value) })} /></label>
         </div></>}
         {settingsSection === "updates" && <><div className="settings-section-title"><h3>软件更新</h3><p>仅从 Lan Code 官方 GitHub Release 检查并下载安装包。</p></div><div className="update-card">
@@ -2022,10 +2095,10 @@ function App() {
           </div>
         </div><div className="update-details">
           <span>当前版本<strong>v{updateInfo?.currentVersion || CURRENT_VERSION}</strong></span>
-          <span>最新版本<strong>{updateInfo?.latestVersion ? `v${updateInfo.latestVersion}` : "自动检查中"}</strong></span>
+          <span>最新版本<strong>{updateInfo?.latestVersion ? `v${updateInfo.latestVersion}` : "自动检查中"}{updateInfo.available && <i className="update-version-dot" />}</strong></span>
           <span>更新时间<strong>{updatePublishedAt}</strong></span>
           <span>下载文件<strong>{downloadedUpdate || updateInfo?.installerName || "暂无"}</strong></span>
-          {updateInfo?.releaseUrl && <a href={updateInfo.releaseUrl} target="_blank" rel="noreferrer"><ExternalLink size={13} /> 查看 Release</a>}
+          {updateInfo?.releaseUrl && <button className="update-release-link" onClick={() => void openExternalUrl(updateInfo.releaseUrl)}><ExternalLink size={13} /> 查看 Release</button>}
         </div></>}
         {settingsStatus && <div className={settingsStatus.includes("失败") ? "settings-status failed" : "settings-status"}>{settingsStatus}</div>}
         </div></main>

@@ -2,11 +2,13 @@ import React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { renderAsync } from "docx-preview";
 import ExcelJS from "exceljs";
+import JSZip from "jszip";
 import { createUniver, LocaleType } from "@univerjs/presets";
 import { UniverSheetsCorePreset } from "@univerjs/preset-sheets-core";
 import sheetsZhCN from "@univerjs/preset-sheets-core/locales/zh-CN";
 import { PPTXViewer } from "pptxviewjs";
-import { ArrowLeft, ArrowRight, Bold, Check, Italic, Save, Underline } from "lucide-react";
+import { ArrowLeft, ArrowRight, Bold, Check, Italic, Maximize2, Minus, Plus, Save, Underline } from "lucide-react";
+import SelectMenu from "../components/SelectMenu";
 import "@univerjs/preset-sheets-core/lib/index.css";
 
 type OfficeDocument = {
@@ -44,6 +46,69 @@ function encodeBase64(value: ArrayBuffer | Uint8Array) {
   return btoa(binary);
 }
 
+async function normalizeDocxForPreview(bytes: Uint8Array) {
+  const zip = await JSZip.loadAsync(bytes);
+  const entry = zip.file("word/document.xml");
+  if (!entry) return bytes;
+  let xml = await entry.async("string");
+  if (!xml.includes("<w:pgSz")) {
+    const page = '<w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="708" w:footer="708" w:gutter="0"/>';
+    xml = xml.includes("<w:sectPr/>")
+      ? xml.replace("<w:sectPr/>", `<w:sectPr>${page}</w:sectPr>`)
+      : xml.replace("<w:sectPr>", `<w:sectPr>${page}`);
+    if (xml.includes("Lan Code 新文档") && !xml.includes("<w:rPr>")) {
+      xml = xml
+        .replace(
+          "<w:p><w:r><w:t>Lan Code 新文档</w:t></w:r></w:p>",
+          '<w:p><w:pPr><w:spacing w:after="240"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Microsoft YaHei" w:eastAsia="Microsoft YaHei"/><w:b/><w:color w:val="1E4F91"/><w:sz w:val="36"/></w:rPr><w:t>Lan Code 新文档</w:t></w:r></w:p>',
+        )
+        .replace(
+          "<w:p><w:r><w:t>从 Lan Code Office Mode 开始编辑。</w:t></w:r></w:p>",
+          '<w:p><w:pPr><w:spacing w:after="160"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii="Microsoft YaHei" w:eastAsia="Microsoft YaHei"/><w:color w:val="5F6B7A"/><w:sz w:val="22"/></w:rPr><w:t>从 Lan Code Office Mode 开始编辑。</w:t></w:r></w:p>',
+        );
+    }
+    zip.file("word/document.xml", xml);
+    return new Uint8Array(await zip.generateAsync({ type: "arraybuffer" }));
+  }
+  return bytes;
+}
+
+async function normalizePptxForPreview(bytes: Uint8Array) {
+  const zip = await JSZip.loadAsync(bytes);
+  const slideEntries = Object.keys(zip.files).filter((name) => /^ppt\/slides\/slide\d+\.xml$/.test(name));
+  let changed = false;
+  for (const name of slideEntries) {
+    const entry = zip.file(name);
+    if (!entry) continue;
+    let xml = await entry.async("string");
+    if (!xml.includes("<a:xfrm") && xml.includes("<p:txBody>")) {
+      xml = xml
+        .replace(
+          "<p:cSld><p:spTree>",
+          '<p:cSld><p:bg><p:bgPr><a:solidFill><a:srgbClr val="F7F9FC"/></a:solidFill><a:effectLst/></p:bgPr></p:bg><p:spTree>',
+        )
+        .replace(
+          "<p:nvGrpSpPr/><p:grpSpPr/>",
+          '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/><a:chOff x="0" y="0"/><a:chExt cx="0" cy="0"/></a:xfrm></p:grpSpPr>',
+        )
+        .replace(
+          "<p:nvSpPr/><p:spPr/>",
+          '<p:nvSpPr><p:cNvPr id="2" name="Lan Code Content"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1371600" y="1371600"/><a:ext cx="9144000" cy="3657600"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/></p:spPr>',
+        )
+        .replace("<a:bodyPr/>", '<a:bodyPr wrap="square" anchor="t"><a:spAutoFit/></a:bodyPr>')
+        .replace(/<a:r><a:t>([^<]+)<\/a:t><\/a:r>/, '<a:r><a:rPr lang="zh-CN" sz="3200" b="1"/><a:t>$1</a:t></a:r>')
+        .replace(/<a:p><a:r><a:t>(从 Lan Code[^<]+)<\/a:t><\/a:r><\/a:p>/, '<a:p><a:r><a:rPr lang="zh-CN" sz="1800"/><a:t>$1</a:t></a:r></a:p>');
+      xml = xml.replace(
+        "<p:sp><p:nvSpPr>",
+        '<p:sp><p:nvSpPr><p:cNvPr id="3" name="Accent"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr><p:spPr><a:xfrm><a:off x="1371600" y="1097280"/><a:ext cx="1219200" cy="91440"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:solidFill><a:srgbClr val="2F80ED"/></a:solidFill><a:ln><a:noFill/></a:ln></p:spPr></p:sp><p:sp><p:nvSpPr>',
+      );
+      zip.file(name, xml);
+      changed = true;
+    }
+  }
+  return changed ? new Uint8Array(await zip.generateAsync({ type: "arraybuffer" })) : bytes;
+}
+
 type TextStyle = { fontFamily?: string; fontSizePt?: number; bold?: boolean; italic?: boolean; underline?: boolean };
 
 function RichTextToolbar({ target, onPersist }: { target: React.RefObject<HTMLDivElement | null>; onPersist: (text: string, style: TextStyle) => Promise<void> }) {
@@ -59,12 +124,8 @@ function RichTextToolbar({ target, onPersist }: { target: React.RefObject<HTMLDi
     document.execCommand(command, false, value);
   }, [target]);
   return <div className="office-format-toolbar">
-    <select aria-label="字体" value={font} onPointerDown={capture} onChange={(event) => { setFont(event.target.value); apply("fontName", event.target.value); void onPersist(selectedText.current, { fontFamily: event.target.value }); }}>
-      <option>PingFang SC</option><option>Microsoft YaHei</option><option>SimSun</option><option>Arial</option><option>Georgia</option>
-    </select>
-    <select aria-label="字号" value={size} onPointerDown={capture} onChange={(event) => { setSize(event.target.value); apply("fontSize", event.target.value === "12" ? "2" : event.target.value === "14" ? "3" : event.target.value === "18" ? "4" : "5"); void onPersist(selectedText.current, { fontSizePt: Number(event.target.value) }); }}>
-      <option>12</option><option>14</option><option>18</option><option>24</option><option>32</option>
-    </select>
+    <SelectMenu compact ariaLabel="字体" value={font} options={["PingFang SC", "Microsoft YaHei", "SimSun", "Arial", "Georgia"].map((item) => ({ id: item, label: item }))} onChange={(value) => { capture(); setFont(value); apply("fontName", value); void onPersist(selectedText.current, { fontFamily: value }); }} />
+    <SelectMenu compact ariaLabel="字号" value={size} options={["12", "14", "18", "24", "32"].map((item) => ({ id: item, label: item }))} onChange={(value) => { capture(); setSize(value); apply("fontSize", value === "12" ? "2" : value === "14" ? "3" : value === "18" ? "4" : "5"); void onPersist(selectedText.current, { fontSizePt: Number(value) }); }} />
     <button title="加粗" onPointerDown={capture} onClick={() => { apply("bold"); void onPersist(selectedText.current, { bold: true }); }}><Bold size={14} /></button>
     <button title="斜体" onPointerDown={capture} onClick={() => { apply("italic"); void onPersist(selectedText.current, { italic: true }); }}><Italic size={14} /></button>
     <button title="下划线" onPointerDown={capture} onClick={() => { apply("underline"); void onPersist(selectedText.current, { underline: true }); }}><Underline size={14} /></button>
@@ -76,20 +137,42 @@ function DocxEditor({ binary, onStyle }: { binary: OfficeBinary; onStyle: (text:
   const host = React.useRef<HTMLDivElement>(null);
   const styles = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
-    if (!host.current) return;
-    host.current.replaceChildren();
-    void renderAsync(decodeBase64(binary.base64), host.current, styles.current || undefined, {
-      className: "lancode-docx",
-      inWrapper: true,
-      breakPages: true,
-      ignoreLastRenderedPageBreak: false,
-      renderHeaders: true,
-      renderFooters: true,
-      renderFootnotes: true,
-      renderEndnotes: true,
-      renderComments: true,
-      useBase64URL: true,
-    });
+    const target = host.current;
+    if (!target) return;
+    let disposed = false;
+    let observer: ResizeObserver | undefined;
+    target.replaceChildren();
+    void (async () => {
+      const bytes = await normalizeDocxForPreview(decodeBase64(binary.base64));
+      await renderAsync(bytes, target, styles.current || undefined, {
+        className: "lancode-docx",
+        inWrapper: true,
+        breakPages: true,
+        ignoreLastRenderedPageBreak: false,
+        renderHeaders: true,
+        renderFooters: true,
+        renderFootnotes: true,
+        renderEndnotes: true,
+        renderComments: true,
+        useBase64URL: true,
+      });
+      if (disposed) return;
+      const fitPages = () => {
+        const wrapper = target.querySelector<HTMLElement>(".lancode-docx-wrapper");
+        const page = target.querySelector<HTMLElement>("section.lancode-docx");
+        if (!wrapper || !page) return;
+        const naturalWidth = page.offsetWidth || 794;
+        const scale = Math.min(1, Math.max(0.58, (target.clientWidth - 36) / naturalWidth));
+        wrapper.style.setProperty("--docx-fit-scale", scale.toFixed(4));
+      };
+      fitPages();
+      observer = new ResizeObserver(fitPages);
+      observer.observe(target);
+    })();
+    return () => {
+      disposed = true;
+      observer?.disconnect();
+    };
   }, [binary.base64]);
   return <div className="office-native-editor office-docx-editor">
     <RichTextToolbar target={host} onPersist={onStyle} />
@@ -138,7 +221,7 @@ function excelToUniver(workbook: ExcelJS.Workbook) {
   return {
     id: `lancode-${crypto.randomUUID()}`,
     name: "Lan Code Workbook",
-    appVersion: "0.2.8",
+    appVersion: "0.2.9",
     locale: LocaleType.ZH_CN,
     styles: {},
     sheetOrder: order,
@@ -205,42 +288,91 @@ function SheetEditor({ binary, onSave }: { binary: OfficeBinary; onSave: (base64
 
 function PptxEditor({ binary }: { binary: OfficeBinary }) {
   const canvas = React.useRef<HTMLCanvasElement>(null);
+  const stage = React.useRef<HTMLDivElement>(null);
   const viewer = React.useRef<PPTXViewer | null>(null);
   const [slide, setSlide] = React.useState(0);
   const [count, setCount] = React.useState(0);
   const [ready, setReady] = React.useState(false);
+  const [zoom, setZoom] = React.useState(1);
+  const zoomRef = React.useRef(1);
+  const renderSequence = React.useRef(0);
+
+  const renderSlide = React.useCallback(async (slideIndex: number, zoomLevel = zoomRef.current) => {
+    const instance = viewer.current;
+    const target = canvas.current;
+    const container = stage.current;
+    if (!instance || !target || !container) return;
+    const sequence = ++renderSequence.current;
+    const availableWidth = Math.max(320, container.clientWidth - 56);
+    const availableHeight = Math.max(220, container.clientHeight - 56);
+    const width = Math.floor(Math.min(availableWidth, availableHeight * (16 / 9)) * zoomLevel);
+    const height = Math.floor(width * (9 / 16));
+    target.style.width = `${width}px`;
+    target.style.height = `${height}px`;
+    target.width = Math.max(1, Math.floor(width * window.devicePixelRatio));
+    target.height = Math.max(1, Math.floor(height * window.devicePixelRatio));
+    await instance.render(target, { slideIndex, quality: "high" });
+    if (sequence === renderSequence.current) setSlide(slideIndex);
+  }, []);
+
   React.useEffect(() => {
     let disposed = false;
+    let observer: ResizeObserver | undefined;
     void (async () => {
-      if (!canvas.current) return;
-      const instance = new PPTXViewer({ canvas: canvas.current, slideSizeMode: "fit", backgroundColor: "#ffffff" });
+      if (!canvas.current || !stage.current) return;
+      const instance = new PPTXViewer({
+        canvas: canvas.current,
+        slideSizeMode: "fit",
+        backgroundColor: "#ffffff",
+        autoChartRerenderDelayMs: 0,
+      });
       viewer.current = instance;
-      await instance.loadFile(decodeBase64(binary.base64));
+      const bytes = await normalizePptxForPreview(decodeBase64(binary.base64));
+      await instance.loadFile(bytes);
       if (disposed) return;
       setCount(instance.getSlideCount());
-      await instance.render(canvas.current, { quality: "high" });
+      await renderSlide(0, 1);
       setReady(true);
+      let resizeTimer = 0;
+      observer = new ResizeObserver(() => {
+        window.clearTimeout(resizeTimer);
+        resizeTimer = window.setTimeout(() => void renderSlide(instance.getCurrentSlideIndex()), 120);
+      });
+      observer.observe(stage.current);
     })();
     return () => {
       disposed = true;
+      observer?.disconnect();
       viewer.current?.destroy();
       viewer.current = null;
     };
-  }, [binary.base64]);
+  }, [binary.base64, renderSlide]);
+
   const move = async (next: number) => {
-    if (!viewer.current || !canvas.current) return;
     const target = Math.max(0, Math.min(count - 1, next));
-    await viewer.current.goToSlide(target, canvas.current);
-    setSlide(target);
+    await renderSlide(target);
   };
+
+  const changeZoom = (next: number) => {
+    const value = Math.max(0.5, Math.min(2, next));
+    zoomRef.current = value;
+    setZoom(value);
+    void renderSlide(slide, value);
+  };
+
   return <div className="office-native-editor office-pptx-editor">
     <div className="office-slide-controls">
       <button disabled={slide === 0} onClick={() => void move(slide - 1)}><ArrowLeft size={14} /></button>
       <span>{ready ? `第 ${slide + 1} / ${count} 页` : "正在解析演示文稿..."}</span>
       <button disabled={!ready || slide >= count - 1} onClick={() => void move(slide + 1)}><ArrowRight size={14} /></button>
+      <div className="office-slide-zoom">
+        <button title="缩小" disabled={zoom <= 0.5} onClick={() => changeZoom(zoom - 0.1)}><Minus size={13} /></button>
+        <button title="适合窗口" onClick={() => changeZoom(1)}><Maximize2 size={13} /><span>{Math.round(zoom * 100)}%</span></button>
+        <button title="放大" disabled={zoom >= 2} onClick={() => changeZoom(zoom + 0.1)}><Plus size={13} /></button>
+      </div>
       {ready && <i><Check size={13} /> 真实幻灯片画布</i>}
     </div>
-    <div className="office-pptx-stage"><canvas ref={canvas} /></div>
+    <div ref={stage} className="office-pptx-stage"><canvas ref={canvas} /></div>
   </div>;
 }
 

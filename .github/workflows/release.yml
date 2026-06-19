@@ -26,11 +26,14 @@ jobs:
       - run: cargo test --workspace
       - run: npm run tauri build
         working-directory: apps/desktop
+      - name: Build branded installer
+        shell: pwsh
+        run: .\scripts\build-branded-installer.ps1 -SkipDesktopBuild
       - run: .\scripts\package-windows.ps1
       - name: Generate SHA-256 checksums
         shell: pwsh
         run: |
-          Get-ChildItem dist/lan-code-*-windows-x64.zip,target/release/bundle/msi/*.msi,target/release/bundle/nsis/*.exe | ForEach-Object {
+          Get-ChildItem dist/lan-code-*-windows-x64.zip,dist/Lan*setup.exe,target/release/bundle/msi/*.msi | ForEach-Object {
             $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
             "$hash  $($_.Name)" | Set-Content -Encoding ascii -LiteralPath "$($_.FullName).sha256"
           }
@@ -40,7 +43,7 @@ jobs:
           files: |
             dist/lan-code-*-windows-x64.zip
             dist/lan-code-*-windows-x64.zip.sha256
+            dist/Lan*setup.exe
+            dist/Lan*setup.exe.sha256
             target/release/bundle/msi/*.msi
             target/release/bundle/msi/*.msi.sha256
-            target/release/bundle/nsis/*.exe
-            target/release/bundle/nsis/*.exe.sha256
