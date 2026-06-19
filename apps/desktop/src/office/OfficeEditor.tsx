@@ -221,7 +221,7 @@ function excelToUniver(workbook: ExcelJS.Workbook) {
   return {
     id: `lancode-${crypto.randomUUID()}`,
     name: "Lan Code Workbook",
-    appVersion: "0.2.9",
+    appVersion: "0.2.10",
     locale: LocaleType.ZH_CN,
     styles: {},
     sheetOrder: order,
@@ -402,13 +402,15 @@ export default function OfficeEditor({ document, onSaved, onStatus }: Props) {
     try {
       onStatus("正在写入 DOCX 格式并创建备份...");
       const saved = await invoke<OfficeDocument>("office_style_text", {
-        path: document.path,
-        text,
-        fontFamily: style.fontFamily,
-        fontSizePt: style.fontSizePt,
-        bold: Boolean(style.bold),
-        italic: Boolean(style.italic),
-        underline: Boolean(style.underline),
+        request: {
+          path: document.path,
+          text,
+          fontFamily: style.fontFamily,
+          fontSizePt: style.fontSizePt,
+          bold: Boolean(style.bold),
+          italic: Boolean(style.italic),
+          underline: Boolean(style.underline),
+        },
       });
       onSaved(saved);
       setBinary(await invoke<OfficeBinary>("office_read_binary", { path: document.path }));

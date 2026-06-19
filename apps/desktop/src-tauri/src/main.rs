@@ -276,6 +276,26 @@ struct OfficeBinary {
     base64: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfficeTextStyleRequest {
+    path: String,
+    text: String,
+    font_family: Option<String>,
+    font_size_pt: Option<f64>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+struct DocxTextStyle<'a> {
+    font_family: Option<&'a str>,
+    font_size_pt: Option<f64>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OfficeAction {
@@ -904,11 +924,7 @@ fn style_docx_text(
     source: &Path,
     target: &Path,
     selected_text: &str,
-    font_family: Option<&str>,
-    font_size_pt: Option<f64>,
-    bold: bool,
-    italic: bool,
-    underline: bool,
+    style: DocxTextStyle<'_>,
 ) -> Result<usize, String> {
     let bytes = fs::read(source).map_err(|error| error.to_string())?;
     let mut archive = ZipArchive::new(Cursor::new(bytes)).map_err(|error| error.to_string())?;
@@ -927,50 +943,49 @@ fn style_docx_text(
             let mut xml = String::new();
             file.read_to_string(&mut xml)
                 .map_err(|error| error.to_string())?;
-            if let Some(text_pos) = xml.find(&needle) {
-                if let Some(run_start) = xml[..text_pos].rfind("<w:r") {
-                    if let Some(run_end_offset) = xml[text_pos..].find("</w:r>") {
-                        let run_end = text_pos + run_end_offset + "</w:r>".len();
-                        let run = &xml[run_start..run_end];
-                        let mut properties = String::new();
-                        if let Some(family) = font_family {
-                            let family = xml_escape(family);
-                            properties.push_str(&format!(
-                                r#"<w:rFonts w:ascii="{family}" w:hAnsi="{family}" w:eastAsia="{family}"/>"#
-                            ));
-                        }
-                        if let Some(size) = font_size_pt {
-                            let half_points = (size * 2.0).round().clamp(2.0, 400.0) as u32;
-                            properties.push_str(&format!(
-                                r#"<w:sz w:val="{half_points}"/><w:szCs w:val="{half_points}"/>"#
-                            ));
-                        }
-                        if bold {
-                            properties.push_str("<w:b/>");
-                        }
-                        if italic {
-                            properties.push_str("<w:i/>");
-                        }
-                        if underline {
-                            properties.push_str(r#"<w:u w:val="single"/>"#);
-                        }
-                        let styled = if let Some(close) = run.find("</w:rPr>") {
-                            let insert = close;
-                            format!("{}{}{}", &run[..insert], properties, &run[insert..])
-                        } else if let Some(open_end) = run.find('>') {
-                            format!(
-                                "{}<w:rPr>{}</w:rPr>{}",
-                                &run[..=open_end],
-                                properties,
-                                &run[open_end + 1..]
-                            )
-                        } else {
-                            run.to_string()
-                        };
-                        xml.replace_range(run_start..run_end, &styled);
-                        applied = 1;
-                    }
+            if let Some(text_pos) = xml.find(&needle)
+                && let Some(run_start) = xml[..text_pos].rfind("<w:r")
+                && let Some(run_end_offset) = xml[text_pos..].find("</w:r>")
+            {
+                let run_end = text_pos + run_end_offset + "</w:r>".len();
+                let run = &xml[run_start..run_end];
+                let mut properties = String::new();
+                if let Some(family) = style.font_family {
+                    let family = xml_escape(family);
+                    properties.push_str(&format!(
+                        r#"<w:rFonts w:ascii="{family}" w:hAnsi="{family}" w:eastAsia="{family}"/>"#
+                    ));
                 }
+                if let Some(size) = style.font_size_pt {
+                    let half_points = (size * 2.0).round().clamp(2.0, 400.0) as u32;
+                    properties.push_str(&format!(
+                        r#"<w:sz w:val="{half_points}"/><w:szCs w:val="{half_points}"/>"#
+                    ));
+                }
+                if style.bold {
+                    properties.push_str("<w:b/>");
+                }
+                if style.italic {
+                    properties.push_str("<w:i/>");
+                }
+                if style.underline {
+                    properties.push_str(r#"<w:u w:val="single"/>"#);
+                }
+                let styled = if let Some(close) = run.find("</w:rPr>") {
+                    let insert = close;
+                    format!("{}{}{}", &run[..insert], properties, &run[insert..])
+                } else if let Some(open_end) = run.find('>') {
+                    format!(
+                        "{}<w:rPr>{}</w:rPr>{}",
+                        &run[..=open_end],
+                        properties,
+                        &run[open_end + 1..]
+                    )
+                } else {
+                    run.to_string()
+                };
+                xml.replace_range(run_start..run_end, &styled);
+                applied = 1;
             }
             writer
                 .write_all(xml.as_bytes())
@@ -1727,20 +1742,14 @@ async fn office_write_binary(
 
 #[tauri::command]
 async fn office_style_text(
-    path: String,
-    text: String,
-    font_family: Option<String>,
-    font_size_pt: Option<f64>,
-    bold: bool,
-    italic: bool,
-    underline: bool,
+    request: OfficeTextStyleRequest,
     state: State<'_, AppState>,
 ) -> Result<OfficeDocument, String> {
-    if text.trim().is_empty() {
+    if request.text.trim().is_empty() {
         return Err("请先在文档中选中要调整格式的文字".into());
     }
     let settings = state.settings.read().await;
-    let resolved = mutable_workspace_path(&settings, &path)?;
+    let resolved = mutable_workspace_path(&settings, &request.path)?;
     let kind = office_kind(&resolved).ok_or("不是 Office Mode 支持的文件类型")?;
     if kind != "docx" {
         return Err("当前格式工具仅对 DOCX 原文件写回；表格请使用内嵌编辑器".into());
@@ -1751,12 +1760,14 @@ async fn office_style_text(
     let applied = style_docx_text(
         &resolved,
         &temp,
-        &text,
-        font_family.as_deref(),
-        font_size_pt,
-        bold,
-        italic,
-        underline,
+        &request.text,
+        DocxTextStyle {
+            font_family: request.font_family.as_deref(),
+            font_size_pt: request.font_size_pt,
+            bold: request.bold,
+            italic: request.italic,
+            underline: request.underline,
+        },
     )?;
     if applied == 0 {
         let _ = fs::remove_file(&temp);
@@ -1764,7 +1775,7 @@ async fn office_style_text(
     }
     fs::copy(&temp, &resolved).map_err(|error| format!("写回 DOCX 样式失败：{error}"))?;
     let _ = fs::remove_file(temp);
-    read_ooxml_document(&resolved, &path, kind)
+    read_ooxml_document(&resolved, &request.path, kind)
 }
 
 #[tauri::command]
@@ -2891,9 +2902,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopSettings, build_core, create_minimal_docx, create_minimal_pptx, create_minimal_xlsx,
-        infer_model_capabilities, plain_text_from_xml, read_ooxml_document, style_docx_text,
-        zip_text_entries,
+        DesktopSettings, DocxTextStyle, build_core, create_minimal_docx, create_minimal_pptx,
+        create_minimal_xlsx, infer_model_capabilities, plain_text_from_xml, read_ooxml_document,
+        style_docx_text, zip_text_entries,
     };
 
     #[test]
@@ -2961,11 +2972,13 @@ mod tests {
             &source,
             &styled,
             "格式测试",
-            Some("Microsoft YaHei"),
-            Some(18.0),
-            true,
-            false,
-            true,
+            DocxTextStyle {
+                font_family: Some("Microsoft YaHei"),
+                font_size_pt: Some(18.0),
+                bold: true,
+                italic: false,
+                underline: true,
+            },
         )
         .unwrap();
         assert_eq!(applied, 1);

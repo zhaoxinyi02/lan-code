@@ -23,6 +23,8 @@ jobs:
           cache-dependency-path: apps/desktop/package-lock.json
       - run: npm ci
         working-directory: apps/desktop
+      - run: npm run build
+        working-directory: apps/desktop
       - run: cargo test --workspace
       - run: npm run tauri build
         working-directory: apps/desktop
