@@ -60,6 +60,7 @@ type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: numb
 type CoreEvent = {
   type: string; eventId?: string; turnId?: string; toolCallId?: string; toolName?: string; error?: string; text?: string;
   arguments?: unknown; output?: unknown; usage?: TokenUsage; model?: string;
+  usedTokens?: number; contextWindow?: number; beforeTokens?: number; afterTokens?: number; compactedMessages?: number;
   sessionId?: string; session_id?: string; session?: Session;
   event_id?: string; turn_id?: string; tool_call_id?: string; tool_name?: string;
 };
@@ -72,6 +73,11 @@ type ChatMessage = { role: "user" | "assistant"; text: string; reasoning?: strin
 type UpdateInfo = {
   currentVersion: string; latestVersion: string; available: boolean; releaseUrl: string;
   installerUrl?: string; installerName?: string; publishedAt?: string; notes?: string;
+};
+type PlanStep = { title: string; status: "pending" | "inProgress" | "completed" };
+type BackgroundProcess = {
+  id: string; name: string; command: string; pid?: number; cwd: string; startedAt: number;
+  running: boolean; exitCode?: number;
 };
 type StartupTarget = { workspace: string; file?: string };
 type FileContextMenu = { x: number; y: number; path: string; isDir: boolean };
@@ -110,7 +116,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.10";
+const CURRENT_VERSION = "0.2.11";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -315,7 +321,7 @@ function ModelSwitcher<T extends string>({ value, options, onChange }: {
   const updatePosition = React.useCallback(() => {
     if (!host.current) return;
     const rect = host.current.getBoundingClientRect();
-    const width = Math.min(Math.max(310, rect.width), window.innerWidth - 16);
+    const width = Math.min(Math.max(220, rect.width), window.innerWidth - 16);
     setMenuStyle({
       top: undefined,
       right: undefined,
@@ -349,11 +355,11 @@ function ModelSwitcher<T extends string>({ value, options, onChange }: {
   };
   return <div className="dropdown model-switcher" ref={host}>
     <button className={`dropdown-trigger ${open ? "open" : ""}`} title="切换模型" onClick={toggle}>
-      <TerminalSquare size={15} /><span>{selected?.provider || selected?.label || "选择模型"}</span><ChevronDown size={13} />
+      <TerminalSquare size={15} /><span>{selected?.label || "选择模型"}</span><ChevronDown size={13} />
     </button>
     {open && createPortal(<div ref={menu} className="model-menu dropdown-portal" style={menuStyle} onPointerDown={(event) => event.stopPropagation()}>
       {options.map((option) => <button key={option.id} className={option.id === value ? "active" : ""} onPointerDown={(event) => { event.preventDefault(); onChange(option.id); setOpen(false); }}>
-        {option.id === "__manage" ? <><Settings size={15} /><span><strong>{option.label}</strong><small>添加、测试或获取模型 ID</small></span></> : <><TerminalSquare size={15} /><span><strong>{option.provider || option.label}</strong><small>{option.model || option.label}{option.meta ? ` · ${option.meta}` : ""}</small></span>{option.id === value && <Check size={14} />}</>}
+        {option.id === "__manage" ? <><Settings size={15} /><span><strong>{option.label}</strong></span></> : <><TerminalSquare size={15} /><span><strong>{option.label}</strong></span>{option.id === value && <Check size={14} />}</>}
       </button>)}
     </div>, document.body)}
   </div>;
@@ -363,6 +369,7 @@ const TOOL_LABELS: Record<string, string> = {
   list_files: "浏览文件", read_file: "读取文件", search_text: "搜索代码", replace_text: "修改文件",
   apply_edits: "应用修改", create_file: "创建文件", run_command: "运行命令", git_status: "检查 Git 状态",
   git_diff: "查看 Git 改动", analyze_image: "分析图片", generate_image: "生成图片", echo: "处理信息",
+  update_plan: "更新任务计划", start_background_command: "启动后台命令", stop_background_command: "停止后台命令",
 };
 
 function summarizeValue(value: unknown, limit = 150) {
@@ -407,6 +414,28 @@ function ToolStepCard({ step }: { step: ToolStep }) {
     </summary>
     <pre>{summarizeValue(step.status === "completed" ? step.output : step.status === "failed" ? step.error : step.arguments, 1000)}</pre>
   </details>;
+}
+
+function TurnActivity({ events, tools }: { events: CoreEvent[]; tools: ToolStep[] }) {
+  const compacting = events.some((event) => event.type === "contextCompactionStarted")
+    && !events.some((event) => event.type === "contextCompactionCompleted");
+  const compacted = [...events].reverse().find((event) => event.type === "contextCompactionCompleted");
+  const visibleTools = tools.filter((step) => step.toolName !== "update_plan");
+  if (!compacting && !compacted && visibleTools.length === 0) return null;
+  const edited = visibleTools.filter((step) => ["replace_text", "apply_edits", "create_file"].includes(step.toolName)).length;
+  const commands = visibleTools.filter((step) => ["run_command", "start_background_command", "stop_background_command"].includes(step.toolName)).length;
+  return <div className="turn-activity">
+    {compacting && <div className="context-event active"><RefreshCw size={13} />上下文压缩中</div>}
+    {!compacting && compacted && <div className="context-event"><CheckCircle2 size={13} />上下文已压缩</div>}
+    {(edited > 0 || commands > 0) && <div className="activity-summary">
+      {edited > 0 && <span><Pencil size={12} />编辑了 {edited} 个文件操作</span>}
+      {commands > 0 && <span><TerminalSquare size={12} />运行了 {commands} 个命令</span>}
+    </div>}
+    {visibleTools.length > 0 && <details className="activity-details">
+      <summary>查看执行过程 <ChevronRight size={12} /></summary>
+      <div>{visibleTools.slice(-10).reverse().map((step) => <ToolStepCard key={step.id} step={step} />)}</div>
+    </details>}
+  </div>;
 }
 
 function Markdown({ children, workspaceFiles }: { children: string; workspaceFiles?: WorkspaceEntry[] }) {
@@ -587,6 +616,7 @@ function App() {
   const [activeId, setActiveId] = React.useState<string>();
   const [messages, setMessages] = React.useState<ChatMessage[]>([]);
   const [events, setEvents] = React.useState<CoreEvent[]>([]);
+  const [backgroundProcesses, setBackgroundProcesses] = React.useState<BackgroundProcess[]>([]);
   const [approvals, setApprovals] = React.useState<Approval[]>([]);
   const [prompt, setPrompt] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -920,6 +950,7 @@ function App() {
     const timer = window.setInterval(() => {
       if (activeId) invoke<CoreEvent[]>("session_events", { sessionId: activeId }).then((rows) => setEvents(rows.map(normalizeCoreEvent))).catch(() => {});
       invoke<Approval[]>("pending_approvals").then(setApprovals).catch(() => {});
+      invoke<BackgroundProcess[]>("background_processes").then(setBackgroundProcesses).catch(() => {});
     }, busy ? 1400 : 3500);
     return () => window.clearInterval(timer);
   }, [activeId, busy]);
@@ -1088,8 +1119,8 @@ function App() {
   async function switchModelProfile(profileId: string) {
     const profile = settings.providerProfiles.find((item) => item.id === profileId);
     if (!profile) return;
-    const currentUsage = currentTokenUsage();
-    if (currentUsage.totalTokens > profile.contextWindow * CONTEXT_WARN_RATIO) setCodeStatus(`已切换到较小上下文模型；下一次发送时会自动压缩旧上下文。`);
+    const currentContext = [...events].reverse().find((event) => event.type === "contextUsageUpdated")?.usedTokens || 0;
+    if (currentContext > profile.contextWindow * CONTEXT_WARN_RATIO) setCodeStatus("已切换到较小上下文模型；下一次发送前会自动压缩旧上下文。");
     const next = {
       ...settings, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model,
       apiKey: profile.apiKey, inputPricePerMillion: profile.inputPricePerMillion,
@@ -1120,18 +1151,10 @@ function App() {
   }
 
   function contextAwarePrompt(text: string) {
-    const currentUsage = currentTokenUsage();
-    const contextWindow = activeContextWindowFromSettings(settings);
-    const ratio = currentUsage.totalTokens / Math.max(1, contextWindow);
     const githubRepos = githubReposInText(text);
     const hints = [];
     if (githubRepos.length) {
       hints.push(`【Lan Code GitHub 识别】用户提到了 GitHub 仓库：${githubRepos.join(", ")}。把它当作可研究的代码仓库资源；如需要本地源码，请先说明需要克隆或检查已有 research/repos。`);
-    }
-    if (ratio >= CONTEXT_WARN_RATIO) {
-      hints.push(
-      `【Lan Code 上下文守门】当前对话约 ${currentUsage.totalTokens.toLocaleString()} / ${contextWindow.toLocaleString()} Token。请先在内部压缩旧上下文，只保留用户目标、关键文件、已执行操作、未完成事项和风险，再处理下面的新请求。不要把压缩过程冗长展示给用户，最终回答保持清楚。`,
-      );
     }
     if (workbench === "office" && activeOfficeDoc) {
       hints.push([
@@ -1367,6 +1390,11 @@ function App() {
       let sessionId = activeId;
       if (!sessionId) sessionId = await newSession(text.slice(0, 32));
       if (!sessionId) return;
+      const activeSession = sessions.find((session) => session.id === sessionId);
+      if (!activeSession?.title || activeSession.title === "新对话") {
+        const title = text.replace(/\s+/g, " ").trim().slice(0, 32) || "新对话";
+        await invoke("rename_session", { sessionId, title }).catch(() => {});
+      }
       setMessages((items) => [...items, { role: "user", text }]);
       setPrompt("");
       setBusy(true);
@@ -1562,6 +1590,11 @@ function App() {
     if (activeId) await invoke("interrupt_turn", { sessionId: activeId });
   }
 
+  async function stopBackgroundProcess(id: string) {
+    await invoke("stop_background_process_command", { id }).catch((error) => setFatal(String(error)));
+    setBackgroundProcesses(await invoke<BackgroundProcess[]>("background_processes").catch(() => []));
+  }
+
   async function decide(requestId: string, decision: "allowOnce" | "deny") {
     await invoke("resolve_approval", { requestId, decision });
     setApprovals((rows) => rows.filter((row) => row.id !== requestId));
@@ -1620,6 +1653,11 @@ function App() {
     }
     return groups;
   }, [] as ToolStep[]);
+  const latestPlanEvent = [...events].reverse().find((event) =>
+    event.toolName === "update_plan" && ["toolStarted", "toolCompleted"].includes(event.type));
+  const planValue = (latestPlanEvent?.output || latestPlanEvent?.arguments) as { steps?: PlanStep[] } | undefined;
+  const taskPlan = Array.isArray(planValue?.steps) ? planValue.steps.filter((step) =>
+    step && typeof step.title === "string" && ["pending", "inProgress", "completed"].includes(step.status)) : [];
   const usage = events.filter((event) => event.type === "usageRecorded" && event.usage)
     .reduce((total, event) => ({
       inputTokens: total.inputTokens + event.usage!.inputTokens,
@@ -1632,13 +1670,15 @@ function App() {
   const enabledProfiles = settings.providerProfiles.filter((profile) => profile.enabled !== false);
   const activeProfileId = enabledProfiles.find((profile) => profile.provider === settings.provider && profile.baseUrl === settings.baseUrl && profile.model === settings.model)?.id || "__current";
   const activeProfile = enabledProfiles.find((profile) => profile.id === activeProfileId);
-  const currentContextWindow = activeProfile?.contextWindow || DEFAULT_CONTEXT_WINDOW;
+  const latestContextEvent = [...events].reverse().find((event) => event.type === "contextUsageUpdated");
+  const currentContextWindow = latestContextEvent?.contextWindow || activeProfile?.contextWindow || DEFAULT_CONTEXT_WINDOW;
+  const currentContextTokens = latestContextEvent?.usedTokens || 0;
   const currentProject = settings.projects.find((project) => project.path === settings.workspace)
     || (settings.workspace ? { name: settings.workspace.split(/[\\/]/).filter(Boolean).at(-1) || "当前项目", path: settings.workspace } : undefined);
   const currentProjectSessions = sessions.filter((session) => currentProject && normalizePath(session.cwd) === normalizePath(currentProject.path));
   const modelOptions = [
-    ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型", provider: settings.provider, model: settings.model, meta: `当前配置 · ${formatTokenCount(currentContextWindow)} 上下文` }] : []),
-    ...enabledProfiles.map((profile) => ({ id: profile.id, label: `${profile.name} · ${profile.model || "未选择模型"}`, provider: profile.name, model: profile.model || "未选择模型", meta: `${formatTokenCount(profile.contextWindow || DEFAULT_CONTEXT_WINDOW)} 上下文 · ${profile.baseUrl.replace(/^https?:\/\//, "")}` })),
+    ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型" }] : []),
+    ...enabledProfiles.map((profile) => ({ id: profile.id, label: profile.name || profile.model || "未命名配置" })),
     { id: "__manage", label: "管理模型配置...", provider: "设置", model: "管理模型配置" },
   ];
   const visibleWorkspaceFiles = workspaceFiles.filter((entry) => {
@@ -1811,10 +1851,6 @@ function App() {
           <div className="title-row">
             <div><h1>{sessions.find((item) => item.id === activeId)?.title || "开始新的编码任务"}</h1><span className="subtle">{settings.workspace || "尚未选择工作区"}</span></div>
           </div>
-          <div className="header-actions">
-            <Dropdown value={settings.workspace} title="切换当前项目" icon={<GitBranch size={15} />} options={settings.projects.map((project) => ({ id: project.path, label: project.name }))} onChange={(path) => { const project = settings.projects.find((item) => item.path === path); if (project) void selectProject(project); }} />
-            <Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={15} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} onChange={(mode) => void changeApprovalMode(mode)} />
-          </div>
         </header>
         {fatal && <div className="error-banner"><XCircle size={16} />{fatal}<button onClick={() => setFatal("")}>关闭</button></div>}
         <section className="conversation" ref={conversationRef} onScroll={(event) => {
@@ -1834,8 +1870,8 @@ function App() {
               <button onClick={() => void createImage()}><Sparkles size={18} /> 生成图片</button>
             </div>
           </div> : <div className="messages">
-            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} workspaceFiles={workspaceFiles} /> : <UserMessageText text={message.text} />}</article>)}
-            {busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={16} /> 正在分析项目并准备下一步...</div>}</article>}
+            {messages.map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <><MessageBody message={message} changes={gitChanges} overview={gitOverview} latest={index === messages.length - 1} workspaceFiles={workspaceFiles} />{index === messages.length - 1 && !busy && <TurnActivity events={activeTurnEvents} tools={toolSteps} />}</> : <UserMessageText text={message.text} />}</article>)}
+            {busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div><TurnActivity events={activeTurnEvents} tools={toolSteps} />{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={16} /> 正在分析项目并准备下一步...</div>}</article>}
           </div>}
         </section>
         {showScrollBottom && <button className="scroll-bottom" title="回到最新消息" onClick={() => conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight, behavior: "smooth" })}><ChevronDown size={15} /> 最新消息</button>}
@@ -1843,8 +1879,8 @@ function App() {
           <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }} placeholder={providerReady ? "描述你想完成的编码任务" : "请先在设置中配置 API"} />
           <div className="composer-footer"><div>
             <button title="添加项目" className="mini" onClick={() => void addProject()}><Plus size={15} /></button>
-            <ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} />
-          </div><div className="send-area"><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact />{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!providerReady} onClick={send}><Send size={17} /></button>}</div></div>
+            <Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} />
+          </div><div className="send-area"><ContextMeter used={currentContextTokens} limit={currentContextWindow} compact /><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} />{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!providerReady} onClick={send}><Send size={17} /></button>}</div></div>
         </div></div>
       </main> : workbench === "office" ? <main className="office-main mode-panel mode-office">
         <header>
@@ -1946,10 +1982,11 @@ function App() {
         <div className="info-row"><KeyRound size={16} /><span>模型</span><strong>{providerReady ? settings.model : "未配置"}</strong></div>
         <div className="info-row"><ShieldCheck size={16} /><span>权限</span><strong>{APPROVAL_MODES.find((item) => item.id === settings.approvalMode)?.label}</strong></div>
         <div className="divider" /><h3>当前对话用量</h3>
-        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><strong><ContextMeter used={usage.totalTokens} limit={currentContextWindow} compact /><b>{usage.totalTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</b></strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
+        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><strong><ContextMeter used={currentContextTokens} limit={currentContextWindow} compact /><b>{currentContextTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</b></strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
         <div className="divider" /><h3>任务步骤</h3>
-        {toolSteps.length > 0 && <div className="tool-stats"><span>{toolSteps.length} 步</span><b>{toolStepStats.completed} 完成</b>{toolStepStats.running > 0 && <i>{toolStepStats.running} 执行中</i>}{toolStepStats.failed + toolStepStats.stale > 0 && <em>{toolStepStats.failed + toolStepStats.stale} 异常</em>}</div>}
-        {groupedToolSteps.length === 0 ? <div className="empty-small">发送任务后在这里查看文件读取、搜索、修改和命令执行过程。</div> : <div className="tool-step-list">{groupedToolSteps.slice(0, 6).map((step) => <ToolStepCard key={step.id} step={step} />)}{groupedToolSteps.length > 6 && <div className="tool-more">另有 {groupedToolSteps.length - 6} 组较早步骤已收起</div>}</div>}
+        {taskPlan.length === 0 ? <div className="empty-small">Agent 开始任务后会在这里列出计划。</div> : <div className="task-plan">{taskPlan.map((step, index) => <div key={`${index}:${step.title}`} className={step.status}>{step.status === "completed" ? <CheckCircle2 size={14} /> : step.status === "inProgress" ? <RefreshCw size={14} /> : <span className="plan-circle" />}<span>{step.title}</span></div>)}</div>}
+        <div className="divider" /><div className="git-heading"><h3>后台运行</h3><button title="刷新后台进程" onClick={() => void invoke<BackgroundProcess[]>("background_processes").then(setBackgroundProcesses)}><RefreshCw size={12} /></button></div>
+        {backgroundProcesses.length === 0 ? <div className="empty-small">暂无后台命令。</div> : <div className="background-process-list">{backgroundProcesses.map((process) => <div key={process.id} className={process.running ? "running" : "stopped"}><span><strong>{process.name}</strong><small>{process.command}</small></span><i>{process.running ? `PID ${process.pid || "-"}` : `已退出 ${process.exitCode ?? ""}`}</i>{process.running && <button onClick={() => void stopBackgroundProcess(process.id)}><CircleStop size={13} />结束</button>}</div>)}</div>}
         <div className="divider" /><div className="git-heading"><h3>Git 仓库</h3><button title="刷新 Git 信息" onClick={() => void refreshGitChanges()}><RefreshCw size={12} /></button></div>
         {!gitOverview?.isRepository ? <div className="empty-small">当前项目不是 Git 仓库。</div> : <div className="git-overview">
           <div className="git-repo-card">

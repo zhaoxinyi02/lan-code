@@ -28,9 +28,10 @@ pub use model::{
 pub use policy::PermissionPolicy;
 pub use store::SqliteStore;
 pub use tools::{
-    ApplyEditsTool, CreateFileTool, EchoTool, GitDiffTool, GitStatusTool, ImageGenerationTool,
-    ListFilesTool, ReadFileTool, ReplaceTextTool, RunCommandTool, SearchTextTool, Tool,
-    ToolContext, ToolRegistry, VisionTool,
+    ApplyEditsTool, BackgroundProcessInfo, CreateFileTool, EchoTool, GitDiffTool, GitStatusTool,
+    ImageGenerationTool, ListFilesTool, ReadFileTool, ReplaceTextTool, RunCommandTool,
+    SearchTextTool, StartBackgroundCommandTool, StopBackgroundCommandTool, Tool, ToolContext,
+    ToolRegistry, UpdatePlanTool, VisionTool, list_background_processes, stop_background_process,
 };
 
 const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
@@ -77,6 +78,9 @@ impl AgentCore {
         tools.register(Arc::new(SearchTextTool));
         tools.register(Arc::new(ReplaceTextTool));
         tools.register(Arc::new(RunCommandTool));
+        tools.register(Arc::new(StartBackgroundCommandTool));
+        tools.register(Arc::new(StopBackgroundCommandTool));
+        tools.register(Arc::new(UpdatePlanTool));
         tools.register(Arc::new(CreateFileTool));
         tools.register(Arc::new(GitStatusTool));
         tools.register(Arc::new(GitDiffTool));
@@ -160,7 +164,7 @@ impl AgentCore {
                 session: session.clone(),
                 messages: vec![ModelMessage::text(
                     ModelRole::System,
-                    "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering. Never invent file contents. Prefer small, reviewable edits. When a model has limited context, summarize older conversation state before continuing. Keep the final answer concise and list changed files when relevant.",
+                    "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering and never invent file contents. For a multi-step task, call update_plan first, keep at most one step inProgress, and update the plan as work advances. Use start_background_command for servers or other long-running processes instead of blocking run_command. Prefer small, reviewable edits. Continue working after automatic context compaction. Keep the final answer concise and list changed files when relevant.",
                 )],
             });
         self.persist_session(session.id).await;
@@ -535,15 +539,9 @@ impl AgentCore {
         let mut repeated_calls = HashMap::<String, usize>::new();
         let mut usage = TokenUsage::default();
         for round in 1..=self.max_provider_rounds {
-            let messages = self.prepare_messages_for_provider(
-                self.sessions
-                    .read()
-                    .await
-                    .get(&session_id)
-                    .context("session not found")?
-                    .messages
-                    .clone(),
-            );
+            let messages = self
+                .prepare_messages_for_provider(session_id, turn_id)
+                .await?;
             let response = self
                 .complete_model_request(
                     provider.clone(),
@@ -653,15 +651,9 @@ impl AgentCore {
                 ));
         }
         self.persist_session(session_id).await;
-        let messages = self.prepare_messages_for_provider(
-            self.sessions
-                .read()
-                .await
-                .get(&session_id)
-                .context("session not found")?
-                .messages
-                .clone(),
-        );
+        let messages = self
+            .prepare_messages_for_provider(session_id, turn_id)
+            .await?;
         let response = self
             .complete_model_request(
                 provider.clone(),
@@ -718,8 +710,77 @@ impl AgentCore {
         })
     }
 
-    fn prepare_messages_for_provider(&self, messages: Vec<ModelMessage>) -> Vec<ModelMessage> {
-        compact_messages_for_context(messages, self.model_context_tokens)
+    async fn prepare_messages_for_provider(
+        &self,
+        session_id: SessionId,
+        turn_id: Uuid,
+    ) -> Result<Vec<ModelMessage>> {
+        let messages = self
+            .sessions
+            .read()
+            .await
+            .get(&session_id)
+            .context("session not found")?
+            .messages
+            .clone();
+        let before_tokens = estimate_messages_tokens(&messages);
+        self.emit(
+            session_id,
+            CoreEvent::ContextUsageUpdated {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                used_tokens: before_tokens as u64,
+                context_window: self.model_context_tokens as u64,
+            },
+        );
+        let budget = ((self.model_context_tokens as f64) * CONTEXT_COMPACT_RATIO) as usize;
+        if before_tokens <= budget {
+            return Ok(messages);
+        }
+
+        self.emit(
+            session_id,
+            CoreEvent::ContextCompactionStarted {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                before_tokens: before_tokens as u64,
+                context_window: self.model_context_tokens as u64,
+            },
+        );
+        let compacted = compact_messages_for_context(messages, self.model_context_tokens);
+        let after_tokens = estimate_messages_tokens(&compacted);
+        let compacted_messages = {
+            let mut sessions = self.sessions.write().await;
+            let state = sessions.get_mut(&session_id).context("session not found")?;
+            let removed = state.messages.len().saturating_sub(compacted.len());
+            state.messages = compacted.clone();
+            removed
+        };
+        self.persist_session(session_id).await;
+        self.emit(
+            session_id,
+            CoreEvent::ContextCompactionCompleted {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                before_tokens: before_tokens as u64,
+                after_tokens: after_tokens as u64,
+                compacted_messages,
+            },
+        );
+        self.emit(
+            session_id,
+            CoreEvent::ContextUsageUpdated {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                used_tokens: after_tokens as u64,
+                context_window: self.model_context_tokens as u64,
+            },
+        );
+        Ok(compacted)
     }
 
     async fn complete_model_request(
@@ -766,9 +827,7 @@ fn compact_messages_for_context(
     model_context_tokens: usize,
 ) -> Vec<ModelMessage> {
     let budget = ((model_context_tokens as f64) * CONTEXT_COMPACT_RATIO) as usize;
-    if estimate_messages_tokens(&messages) <= budget
-        || messages.len() <= CONTEXT_KEEP_RECENT_MESSAGES + 2
-    {
+    if estimate_messages_tokens(&messages) <= budget {
         return messages;
     }
 
@@ -795,10 +854,13 @@ fn compact_messages_for_context(
         compacted.push(ModelMessage::text(
             ModelRole::System,
             format!(
-                "Lan Code compacted {} older messages (~{} tokens estimated) because the active model context window is {} tokens. Preserve the user's current goal, rely on recent messages and tools, and ask for missing details only when necessary.",
+                "Lan Code automatically compacted {} older messages (~{} tokens estimated) for a {} token context window.\n\
+Preserved working memory:\n{}\n\
+Continue the current goal from this memory and the recent messages. Do not repeat completed work. Verify uncertain details with tools.",
                 omitted.len(),
                 omitted_tokens,
-                model_context_tokens
+                model_context_tokens,
+                build_compaction_memory(omitted),
             ),
         ));
     }
@@ -807,6 +869,51 @@ fn compact_messages_for_context(
         compacted.remove(2);
     }
     compacted
+}
+
+fn build_compaction_memory(messages: &[ModelMessage]) -> String {
+    const MAX_MEMORY_CHARS: usize = 12_000;
+    let mut memory = String::new();
+    for message in messages {
+        let role = match message.role {
+            ModelRole::System => "System",
+            ModelRole::User => "User goal",
+            ModelRole::Assistant => "Agent",
+            ModelRole::Tool => "Tool result",
+        };
+        let mut content = message
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if content.is_empty()
+            && let Some(calls) = &message.tool_calls
+        {
+            content = calls
+                .iter()
+                .map(|call| format!("{}({})", call.function.name, call.function.arguments))
+                .collect::<Vec<_>>()
+                .join("; ");
+        }
+        if content.is_empty() {
+            continue;
+        }
+        if content.chars().count() > 1_200 {
+            content = format!("{}…", content.chars().take(1_200).collect::<String>());
+        }
+        let entry = format!("- {role}: {}\n", content.replace('\0', ""));
+        if memory.len() + entry.len() > MAX_MEMORY_CHARS {
+            break;
+        }
+        memory.push_str(&entry);
+    }
+    if memory.is_empty() {
+        "- No durable details were available; rely on recent messages and inspect the workspace.\n"
+            .into()
+    } else {
+        memory
+    }
 }
 
 fn estimate_messages_tokens(messages: &[ModelMessage]) -> usize {
@@ -1101,13 +1208,14 @@ mod tests {
         let compacted = super::compact_messages_for_context(messages, 8_000);
 
         assert!(compacted.len() < 20);
+        assert!(super::estimate_messages_tokens(&compacted) <= 6_400);
         assert_eq!(compacted.first().unwrap().role, ModelRole::System);
         assert!(compacted.iter().any(|message| {
             message
                 .content
                 .as_deref()
                 .unwrap_or_default()
-                .contains("compacted")
+                .contains("Preserved working memory")
         }));
         assert!(
             compacted

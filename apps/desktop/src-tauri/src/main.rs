@@ -12,8 +12,9 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lan_core::{
-    AgentCore, AnthropicProvider, ImageGenerationTool, ModelMessage, ModelProvider, ModelRequest,
-    OpenAiCompatibleProvider, SqliteStore, VisionTool,
+    AgentCore, AnthropicProvider, BackgroundProcessInfo, ImageGenerationTool, ModelMessage,
+    ModelProvider, ModelRequest, OpenAiCompatibleProvider, SqliteStore, VisionTool,
+    list_background_processes, stop_background_process,
 };
 use lan_protocol::{
     ApprovalDecision, ApprovalMode, ApprovalRequest, CoreEvent, RiskLevel, Session, SessionId,
@@ -2819,6 +2820,16 @@ async fn interrupt_turn(session_id: SessionId, state: State<'_, AppState>) -> Re
     Ok(core(&state).await.interrupt_turn(session_id).await)
 }
 
+#[tauri::command]
+fn background_processes() -> Vec<BackgroundProcessInfo> {
+    list_background_processes()
+}
+
+#[tauri::command]
+fn stop_background_process_command(id: String) -> Result<BackgroundProcessInfo, String> {
+    stop_background_process(&id).map_err(|error| error.to_string())
+}
+
 fn main() {
     let data_dir = configured_data_dir();
     migrate_legacy_data_dir(&data_dir);
@@ -2893,7 +2904,9 @@ fn main() {
             pending_approvals,
             resolve_approval,
             start_turn,
-            interrupt_turn
+            interrupt_turn,
+            background_processes,
+            stop_background_process_command
         ])
         .run(tauri::generate_context!())
         .expect("run Lan Code desktop");

@@ -61,7 +61,7 @@ finally {
 
 New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 $source = Join-Path $targetDir "release\lan-code-installer.exe"
-$destination = Join-Path $outputDir "Lan Code_0.2.10_x64-setup.exe"
+$destination = Join-Path $outputDir "Lan Code_0.2.11_x64-setup.exe"
 Copy-Item -LiteralPath $source -Destination $destination -Force
 
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()

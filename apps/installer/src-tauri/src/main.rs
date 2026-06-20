@@ -12,7 +12,7 @@ use tauri::{Emitter, Manager};
 use winreg::{RegKey, enums::HKEY_CURRENT_USER};
 
 const APP_NAME: &str = "Lan Code";
-const VERSION: &str = "0.2.10";
+const VERSION: &str = "0.2.11";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const PAYLOAD: &[u8] = include_bytes!("../../../../target/release/lan-desktop.exe");
 

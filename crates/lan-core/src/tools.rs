@@ -2,7 +2,9 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, RwLock},
+    process::Stdio,
+    sync::{Arc, LazyLock, Mutex, RwLock},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -10,9 +12,12 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use lan_protocol::{RiskLevel, SessionId, ToolDescriptor};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{process::Command, time::Duration};
+use tokio::{
+    process::{Child, Command},
+    time::Duration,
+};
 use walkdir::WalkDir;
 
 fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -757,6 +762,248 @@ impl Tool for RunCommandTool {
     }
 }
 
+pub struct UpdatePlanTool;
+
+#[async_trait]
+impl Tool for UpdatePlanTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "update_plan".into(),
+            description: "Publish or update the task plan shown to the user. Use pending, inProgress, and completed states; keep at most one step in progress.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "inProgress", "completed"]}
+                            },
+                            "required": ["title", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+            risk: RiskLevel::ReadOnly,
+        }
+    }
+
+    async fn execute(&self, _context: ToolContext, arguments: Value) -> Result<Value> {
+        let steps = arguments
+            .get("steps")
+            .and_then(Value::as_array)
+            .context("steps must be an array")?;
+        if steps.is_empty() {
+            bail!("plan must contain at least one step");
+        }
+        let active = steps
+            .iter()
+            .filter(|step| step.get("status").and_then(Value::as_str) == Some("inProgress"))
+            .count();
+        if active > 1 {
+            bail!("plan may contain at most one inProgress step");
+        }
+        for step in steps {
+            let title = step
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let status = step
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if title.trim().is_empty() || !matches!(status, "pending" | "inProgress" | "completed")
+            {
+                bail!("each plan step requires a title and valid status");
+            }
+        }
+        Ok(arguments)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundProcessInfo {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub pid: Option<u32>,
+    pub cwd: String,
+    pub started_at: u64,
+    pub running: bool,
+    pub exit_code: Option<i32>,
+}
+
+struct BackgroundProcess {
+    info: BackgroundProcessInfo,
+    child: Child,
+}
+
+static BACKGROUND_PROCESSES: LazyLock<Mutex<HashMap<String, BackgroundProcess>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn refresh_background_process(process: &mut BackgroundProcess) {
+    if !process.info.running {
+        return;
+    }
+    if let Ok(Some(status)) = process.child.try_wait() {
+        process.info.running = false;
+        process.info.exit_code = status.code();
+    }
+}
+
+pub fn list_background_processes() -> Vec<BackgroundProcessInfo> {
+    let mut processes = BACKGROUND_PROCESSES
+        .lock()
+        .expect("background process lock poisoned");
+    for process in processes.values_mut() {
+        refresh_background_process(process);
+    }
+    let mut values = processes
+        .values()
+        .map(|process| process.info.clone())
+        .collect::<Vec<_>>();
+    values.sort_by_key(|process| std::cmp::Reverse(process.started_at));
+    values
+}
+
+pub fn stop_background_process(id: &str) -> Result<BackgroundProcessInfo> {
+    let mut processes = BACKGROUND_PROCESSES
+        .lock()
+        .expect("background process lock poisoned");
+    let process = processes
+        .get_mut(id)
+        .context("background process not found")?;
+    refresh_background_process(process);
+    if process.info.running {
+        process
+            .child
+            .start_kill()
+            .context("failed to stop process")?;
+        process.info.running = false;
+    }
+    Ok(process.info.clone())
+}
+
+pub struct StartBackgroundCommandTool;
+
+#[async_trait]
+impl Tool for StartBackgroundCommandTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "start_background_command".into(),
+            description: "Start a long-running executable in the workspace without opening a console window. The user can inspect and stop it from Lan Code.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "program": {"type": "string"},
+                    "args": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["program", "args"]
+            }),
+            risk: RiskLevel::FullAccess,
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, arguments: Value) -> Result<Value> {
+        if !context.allow_unsandboxed_commands {
+            bail!("background commands require full-access permission");
+        }
+        let program = string_arg(&arguments, "program")?;
+        let args = arguments
+            .get("args")
+            .and_then(Value::as_array)
+            .context("args must be an array")?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .context("each arg must be a string")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let name = arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(program)
+            .to_string();
+        let cwd = Path::new(&context.cwd).canonicalize()?;
+        let mut command = hidden_command(program);
+        command
+            .args(&args)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        let child = command
+            .spawn()
+            .context("failed to start background command")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let command_text = std::iter::once(program.to_string())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let info = BackgroundProcessInfo {
+            id: id.clone(),
+            name,
+            command: command_text,
+            pid: child.id(),
+            cwd: cwd.display().to_string(),
+            started_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            running: true,
+            exit_code: None,
+        };
+        BACKGROUND_PROCESSES
+            .lock()
+            .expect("background process lock poisoned")
+            .insert(
+                id,
+                BackgroundProcess {
+                    info: info.clone(),
+                    child,
+                },
+            );
+        Ok(serde_json::to_value(info)?)
+    }
+}
+
+pub struct StopBackgroundCommandTool;
+
+#[async_trait]
+impl Tool for StopBackgroundCommandTool {
+    fn descriptor(&self) -> ToolDescriptor {
+        ToolDescriptor {
+            name: "stop_background_command".into(),
+            description: "Stop a background command previously started by Lan Code.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }),
+            risk: RiskLevel::FullAccess,
+        }
+    }
+
+    async fn execute(&self, context: ToolContext, arguments: Value) -> Result<Value> {
+        if !context.allow_unsandboxed_commands {
+            bail!("stopping background commands requires full-access permission");
+        }
+        Ok(serde_json::to_value(stop_background_process(string_arg(
+            &arguments, "id",
+        )?)?)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -767,7 +1014,7 @@ mod tests {
 
     use super::{
         ApplyEditsTool, ImageGenerationTool, ReplaceTextTool, RunCommandTool, Tool, ToolContext,
-        VisionTool, workspace_path,
+        UpdatePlanTool, VisionTool, workspace_path,
     };
 
     #[test]
@@ -946,5 +1193,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output["success"], true);
+    }
+
+    #[tokio::test]
+    async fn update_plan_rejects_multiple_active_steps() {
+        let error = UpdatePlanTool
+            .execute(
+                ToolContext {
+                    session_id: SessionId::new_v4(),
+                    cwd: std::env::current_dir().unwrap().display().to_string(),
+                    allow_unsandboxed_commands: false,
+                },
+                json!({
+                    "steps": [
+                        {"title": "first", "status": "inProgress"},
+                        {"title": "second", "status": "inProgress"}
+                    ]
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("at most one"));
     }
 }

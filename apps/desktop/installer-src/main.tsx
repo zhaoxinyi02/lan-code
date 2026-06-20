@@ -118,7 +118,7 @@ function App() {
       <div className="visual-halo" />
       <img className="hero-logo" src={logoUrl} alt="Lan Code" />
       <div className="hero-copy">
-        <span className="eyebrow">LAN CODE 0.2.10</span>
+        <span className="eyebrow">LAN CODE 0.2.11</span>
         <h1>让想法自然<br />成为作品</h1>
         <p>Agent、Code 与 Office，在一个安静而强大的工作台里协同。</p>
       </div>

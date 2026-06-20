@@ -122,6 +122,28 @@ pub enum CoreEvent {
         model: String,
         usage: TokenUsage,
     },
+    ContextUsageUpdated {
+        event_id: EventId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        used_tokens: u64,
+        context_window: u64,
+    },
+    ContextCompactionStarted {
+        event_id: EventId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        before_tokens: u64,
+        context_window: u64,
+    },
+    ContextCompactionCompleted {
+        event_id: EventId,
+        session_id: SessionId,
+        turn_id: TurnId,
+        before_tokens: u64,
+        after_tokens: u64,
+        compacted_messages: usize,
+    },
     ApprovalRequested {
         event_id: EventId,
         session_id: SessionId,
