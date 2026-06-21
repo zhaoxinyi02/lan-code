@@ -536,10 +536,10 @@ fn load_settings(data_dir: &Path) -> DesktopSettings {
     }
     settings.data_dir = data_dir.display().to_string();
     let default_chat_workspace = ensure_default_chat_workspace().ok();
-    if settings.workspace.trim().is_empty() || !Path::new(&settings.workspace).is_dir() {
-        if let Some(path) = &default_chat_workspace {
-            settings.workspace = path.display().to_string();
-        }
+    if (settings.workspace.trim().is_empty() || !Path::new(&settings.workspace).is_dir())
+        && let Some(path) = &default_chat_workspace
+    {
+        settings.workspace = path.display().to_string();
     }
     if settings.projects.is_empty() && Path::new(&settings.workspace).is_dir() {
         let path = PathBuf::from(&settings.workspace);
