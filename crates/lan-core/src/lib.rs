@@ -38,6 +38,7 @@ const DEFAULT_MAX_PROVIDER_ROUNDS: usize = 48;
 const DEFAULT_MODEL_CONTEXT_TOKENS: usize = 128_000;
 const CONTEXT_COMPACT_RATIO: f64 = 0.80;
 const CONTEXT_KEEP_RECENT_MESSAGES: usize = 10;
+const SYSTEM_PROMPT: &str = "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering and never invent file contents. For a multi-step task, call update_plan first, keep at most one step inProgress, and update the plan as work advances. Use start_background_command for servers or other long-running processes instead of blocking run_command. Prefer small, reviewable edits. Continue working after automatic context compaction without exposing internal compaction memory or tool protocol markup. Do not use emoji in user-facing output. Keep the final answer concise and list changed files when relevant.";
 
 fn unix_timestamp() -> u64 {
     SystemTime::now()
@@ -120,12 +121,22 @@ impl AgentCore {
             store
                 .load_sessions()?
                 .into_iter()
-                .map(|(mut session, messages)| {
+                .map(|(mut session, mut messages)| {
                     if matches!(
                         session.status,
                         SessionStatus::Running | SessionStatus::WaitingForApproval
                     ) {
                         session.status = SessionStatus::Interrupted;
+                        let _ = store.save_session(&session, &messages);
+                    }
+                    let mut prompt_updated = false;
+                    if let Some(system) = messages.first_mut()
+                        && system.role == ModelRole::System
+                    {
+                        prompt_updated = system.content.as_deref() != Some(SYSTEM_PROMPT);
+                        system.content = Some(SYSTEM_PROMPT.into());
+                    }
+                    if prompt_updated {
                         let _ = store.save_session(&session, &messages);
                     }
                     (session.id, SessionState { session, messages })
@@ -157,16 +168,13 @@ impl AgentCore {
             status: SessionStatus::Idle,
             updated_at: unix_timestamp(),
         };
-        self.sessions
-            .write()
-            .await
-            .insert(session.id, SessionState {
+        self.sessions.write().await.insert(
+            session.id,
+            SessionState {
                 session: session.clone(),
-                messages: vec![ModelMessage::text(
-                    ModelRole::System,
-                    "You are Lan Code, a careful coding agent. Inspect the workspace with tools before answering and never invent file contents. For a multi-step task, call update_plan first, keep at most one step inProgress, and update the plan as work advances. Use start_background_command for servers or other long-running processes instead of blocking run_command. Prefer small, reviewable edits. Continue working after automatic context compaction. Keep the final answer concise and list changed files when relevant.",
-                )],
-            });
+                messages: vec![ModelMessage::text(ModelRole::System, SYSTEM_PROMPT)],
+            },
+        );
         self.persist_session(session.id).await;
         self.emit(
             session.id,
@@ -566,6 +574,7 @@ impl AgentCore {
             self.persist_session(session_id).await;
             if response.tool_calls.is_empty() {
                 let text = response.text;
+                self.emit_current_context_usage(session_id, turn_id).await?;
                 self.emit(
                     session_id,
                     CoreEvent::UsageRecorded {
@@ -683,6 +692,7 @@ impl AgentCore {
             .messages
             .push(response.message);
         self.persist_session(session_id).await;
+        self.emit_current_context_usage(session_id, turn_id).await?;
         self.emit(
             session_id,
             CoreEvent::UsageRecorded {
@@ -783,6 +793,25 @@ impl AgentCore {
         Ok(compacted)
     }
 
+    async fn emit_current_context_usage(&self, session_id: SessionId, turn_id: Uuid) -> Result<()> {
+        let used_tokens = {
+            let sessions = self.sessions.read().await;
+            let state = sessions.get(&session_id).context("session not found")?;
+            estimate_messages_tokens(&state.messages) as u64
+        };
+        self.emit(
+            session_id,
+            CoreEvent::ContextUsageUpdated {
+                event_id: Uuid::new_v4(),
+                session_id,
+                turn_id,
+                used_tokens,
+                context_window: self.model_context_tokens as u64,
+            },
+        );
+        Ok(())
+    }
+
     async fn complete_model_request(
         &self,
         provider: Arc<dyn ModelProvider>,
@@ -876,10 +905,10 @@ fn build_compaction_memory(messages: &[ModelMessage]) -> String {
     let mut memory = String::new();
     for message in messages {
         let role = match message.role {
-            ModelRole::System => "System",
+            ModelRole::System => continue,
             ModelRole::User => "User goal",
             ModelRole::Assistant => "Agent",
-            ModelRole::Tool => "Tool result",
+            ModelRole::Tool => continue,
         };
         let mut content = message
             .content
@@ -887,15 +916,7 @@ fn build_compaction_memory(messages: &[ModelMessage]) -> String {
             .unwrap_or_default()
             .trim()
             .to_string();
-        if content.is_empty()
-            && let Some(calls) = &message.tool_calls
-        {
-            content = calls
-                .iter()
-                .map(|call| format!("{}({})", call.function.name, call.function.arguments))
-                .collect::<Vec<_>>()
-                .join("; ");
-        }
+        content = strip_tool_protocol_markup(&content);
         if content.is_empty() {
             continue;
         }
@@ -914,6 +935,27 @@ fn build_compaction_memory(messages: &[ModelMessage]) -> String {
     } else {
         memory
     }
+}
+
+fn strip_tool_protocol_markup(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<tool_call") {
+        result.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find("</tool_call>") else {
+            rest = "";
+            break;
+        };
+        rest = &rest[start + end + "</tool_call>".len()..];
+    }
+    result.push_str(rest);
+    result
+        .replace("<function=", "")
+        .replace("</function>", "")
+        .replace("<parameter=", "")
+        .replace("</parameter>", "")
+        .trim()
+        .to_string()
 }
 
 fn estimate_messages_tokens(messages: &[ModelMessage]) -> usize {
@@ -1226,6 +1268,25 @@ mod tests {
                 .unwrap()
                 .contains("current request")
         );
+    }
+
+    #[test]
+    fn compaction_memory_does_not_replay_tool_protocol_markup() {
+        let messages = vec![
+            ModelMessage::text(ModelRole::User, "修改 src/main.rs"),
+            ModelMessage::text(
+                ModelRole::Assistant,
+                "<tool_call><function=replace_text><parameter=path>src/main.rs</parameter></function></tool_call>",
+            ),
+            ModelMessage::text(ModelRole::Assistant, "已经完成修改并通过测试。"),
+        ];
+
+        let memory = super::build_compaction_memory(&messages);
+
+        assert!(memory.contains("修改 src/main.rs"));
+        assert!(memory.contains("已经完成修改并通过测试"));
+        assert!(!memory.contains("<tool_call"));
+        assert!(!memory.contains("<function="));
     }
 
     #[tokio::test]

@@ -55,6 +55,8 @@ struct DesktopProject {
 struct ProviderProfile {
     id: String,
     name: String,
+    #[serde(default)]
+    logo: String,
     #[serde(default = "default_true")]
     enabled: bool,
     provider: String,
@@ -62,6 +64,8 @@ struct ProviderProfile {
     model: String,
     api_key: String,
     input_price_per_million: f64,
+    #[serde(default)]
+    cached_input_price_per_million: f64,
     output_price_per_million: f64,
     #[serde(default = "default_context_window")]
     context_window: u64,
@@ -127,6 +131,7 @@ struct DesktopSettings {
     approval_mode: ApprovalMode,
     max_provider_rounds: usize,
     input_price_per_million: f64,
+    cached_input_price_per_million: f64,
     output_price_per_million: f64,
     projects: Vec<DesktopProject>,
     provider_profiles: Vec<ProviderProfile>,
@@ -152,6 +157,7 @@ impl Default for DesktopSettings {
             approval_mode: ApprovalMode::ReadOnly,
             max_provider_rounds: 48,
             input_price_per_million: 0.0,
+            cached_input_price_per_million: 0.0,
             output_price_per_million: 0.0,
             projects: Vec::new(),
             provider_profiles: Vec::new(),
@@ -459,6 +465,30 @@ fn default_data_dir() -> PathBuf {
     user_home().join(".lancode")
 }
 
+fn default_chat_workspace_path() -> PathBuf {
+    let home = user_home();
+    let documents = std::env::var_os("OneDrive")
+        .map(PathBuf::from)
+        .map(|path| path.join("Documents"))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| home.join("Documents"));
+    documents.join("Lan Code")
+}
+
+fn ensure_default_chat_workspace() -> Result<PathBuf, String> {
+    let path = default_chat_workspace_path();
+    fs::create_dir_all(&path).map_err(|error| format!("创建默认对话目录失败：{error}"))?;
+    if !path.join(".git").is_dir() {
+        let mut command = hidden_command("git");
+        let _ = command
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(&path)
+            .status();
+    }
+    Ok(path)
+}
+
 fn location_file() -> PathBuf {
     user_home().join(".lancode-location")
 }
@@ -505,6 +535,12 @@ fn load_settings(data_dir: &Path) -> DesktopSettings {
             .unwrap_or_default();
     }
     settings.data_dir = data_dir.display().to_string();
+    let default_chat_workspace = ensure_default_chat_workspace().ok();
+    if settings.workspace.trim().is_empty() || !Path::new(&settings.workspace).is_dir() {
+        if let Some(path) = &default_chat_workspace {
+            settings.workspace = path.display().to_string();
+        }
+    }
     if settings.projects.is_empty() && Path::new(&settings.workspace).is_dir() {
         let path = PathBuf::from(&settings.workspace);
         let name = path
@@ -518,6 +554,11 @@ fn load_settings(data_dir: &Path) -> DesktopSettings {
         });
     }
     settings
+}
+
+#[tauri::command]
+fn default_chat_workspace() -> Result<String, String> {
+    ensure_default_chat_workspace().map(|path| path.display().to_string())
 }
 
 fn persist_bootstrap_settings(data_dir: &Path, settings: &DesktopSettings) {
@@ -2610,11 +2651,89 @@ async fn install_downloaded_update(
     {
         return Err("拒绝运行数据目录之外的安装包".into());
     }
-    Command::new(update)
+    let mut command = Command::new(&update);
+    if let Some(parent) = update.parent() {
+        command.current_dir(parent);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+    command
         .spawn()
         .map_err(|error| format!("启动安装程序失败：{error}"))?;
+    tokio::time::sleep(std::time::Duration::from_millis(650)).await;
     app.exit(0);
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptAttachment {
+    name: String,
+    path: String,
+    kind: String,
+}
+
+#[tauri::command]
+async fn save_prompt_attachment(
+    filename: String,
+    bytes: Vec<u8>,
+    state: State<'_, AppState>,
+) -> Result<PromptAttachment, String> {
+    if bytes.is_empty() {
+        return Err("附件内容为空".into());
+    }
+    if bytes.len() > 25 * 1024 * 1024 {
+        return Err("单个附件不能超过 25 MiB".into());
+    }
+    let settings = state.settings.read().await.clone();
+    let workspace = PathBuf::from(&settings.workspace);
+    if !workspace.is_dir() {
+        return Err("请先选择有效项目".into());
+    }
+    let safe_name: String = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_name = safe_name.trim_matches(['.', ' ']);
+    let safe_name = if safe_name.is_empty() {
+        "attachment.bin"
+    } else {
+        safe_name
+    };
+    let relative = PathBuf::from(".lancode")
+        .join("attachments")
+        .join(format!("{}-{safe_name}", Uuid::new_v4()));
+    let destination = workspace.join(&relative);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建附件目录失败：{error}"))?;
+    }
+    fs::write(&destination, bytes).map_err(|error| format!("保存附件失败：{error}"))?;
+    let kind = match destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" | "jpg" | "jpeg" | "webp" | "gif" => "image",
+        _ => "file",
+    };
+    Ok(PromptAttachment {
+        name: filename,
+        path: relative.to_string_lossy().replace('\\', "/"),
+        kind: kind.into(),
+    })
 }
 
 #[tauri::command]
@@ -2854,6 +2973,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            default_chat_workspace,
             save_settings,
             test_provider,
             list_provider_models,
@@ -2891,6 +3011,7 @@ fn main() {
             open_external_url,
             download_update,
             install_downloaded_update,
+            save_prompt_attachment,
             pick_workspace,
             pick_data_dir,
             analyze_image,

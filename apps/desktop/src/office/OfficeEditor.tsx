@@ -221,7 +221,7 @@ function excelToUniver(workbook: ExcelJS.Workbook) {
   return {
     id: `lancode-${crypto.randomUUID()}`,
     name: "Lan Code Workbook",
-    appVersion: "0.2.11",
+    appVersion: "0.2.12",
     locale: LocaleType.ZH_CN,
     styles: {},
     sheetOrder: order,

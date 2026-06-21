@@ -13,12 +13,16 @@ import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import materialTheme from "./assets/material-icons.json";
 import SelectMenu from "./components/SelectMenu";
+import { FiFile, FiFolder } from "react-icons/fi";
+import { TbFile, TbFolder, TbFolderOpen } from "react-icons/tb";
+import { PiFile, PiFolder, PiFolderOpen } from "react-icons/pi";
+import { RiFile3Line, RiFolder3Line, RiFolderOpenLine } from "react-icons/ri";
 import {
-  Bot, BookOpen, CheckCircle2, ChevronDown, ChevronRight, CircleStop, ClipboardCheck, Code2, File, FileDiff, FilePlus, FileText, Folder, FolderGit2, Image,
-  FolderOpen, FolderPlus, GitBranch, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
+  Bot, BookOpen, BrainCircuit, CheckCircle2, ChevronDown, ChevronRight, CircleStop, ClipboardCheck, Code2, File, FileDiff, FilePlus, FileText, FolderGit2, Image,
+  FolderPlus, GitBranch, KeyRound, PanelLeftClose, PanelLeftOpen, Pencil, Plus,
   Download, MessageSquare, RefreshCw, RotateCcw, Save, Search, Send, Settings, ShieldCheck, Sparkles, TerminalSquare, Trash2,
   XCircle, Zap, Sun, Moon, Monitor, Check, Menu, GitCommitHorizontal, Eye, ExternalLink, Github, History,
-  ArrowLeft, ArrowRight, Minus, Square, X,
+  ArrowLeft, ArrowRight, Minus, Square, X, Ellipsis, Pin, PinOff,
 } from "lucide-react";
 import "./styles.css";
 
@@ -28,8 +32,8 @@ type Mode = "readOnly" | "ask" | "workspace" | "fullAccess";
 type Session = { id: string; cwd: string; title?: string; status: string; updatedAt: number };
 type Project = { name: string; path: string };
 type ProviderProfile = {
-  id: string; name: string; enabled: boolean; provider: string; baseUrl: string; model: string; apiKey: string;
-  inputPricePerMillion: number; outputPricePerMillion: number; contextWindow: number; maxOutputTokens: number;
+  id: string; name: string; logo: string; enabled: boolean; provider: string; baseUrl: string; model: string; apiKey: string;
+  inputPricePerMillion: number; cachedInputPricePerMillion: number; outputPricePerMillion: number; contextWindow: number; maxOutputTokens: number;
 };
 type ModelCapabilities = {
   imageInput: boolean; imageOutput: boolean; audioInput: boolean; audioOutput: boolean; toolCalling: boolean;
@@ -40,7 +44,7 @@ type CapabilityRoute = {
 type SettingsData = {
   provider: string; baseUrl: string; model: string; apiKey: string; workspace: string;
   dataDir: string; approvalMode: Mode; maxProviderRounds: number; projects: Project[];
-  inputPricePerMillion: number; outputPricePerMillion: number;
+  inputPricePerMillion: number; cachedInputPricePerMillion: number; outputPricePerMillion: number;
   providerProfiles: ProviderProfile[];
   modelCapabilities: ModelCapabilities; visionRoute: CapabilityRoute; imageGenerationRoute: CapabilityRoute;
   speechToTextRoute: CapabilityRoute; textToSpeechRoute: CapabilityRoute;
@@ -55,6 +59,7 @@ type GitOverview = {
 type OpenFile = { path: string; content: string; savedContent: string; pinned: boolean };
 type SettingsSection = "appearance" | "model" | "capabilities" | "workspace" | "agent" | "updates";
 type ThemeMode = "system" | "light" | "dark";
+type IconTheme = "material" | "lucide" | "tabler" | "phosphor" | "remix";
 type ModelMessage = { role: "system" | "user" | "assistant" | "tool"; content?: string; reasoning_content?: string };
 type TokenUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number };
 type CoreEvent = {
@@ -63,6 +68,7 @@ type CoreEvent = {
   usedTokens?: number; contextWindow?: number; beforeTokens?: number; afterTokens?: number; compactedMessages?: number;
   sessionId?: string; session_id?: string; session?: Session;
   event_id?: string; turn_id?: string; tool_call_id?: string; tool_name?: string;
+  used_tokens?: number; context_window?: number; before_tokens?: number; after_tokens?: number; compacted_messages?: number;
 };
 type ToolStep = {
   id: string; toolName: string; status: "running" | "completed" | "failed" | "stale";
@@ -79,8 +85,10 @@ type BackgroundProcess = {
   id: string; name: string; command: string; pid?: number; cwd: string; startedAt: number;
   running: boolean; exitCode?: number;
 };
+type PromptAttachment = { id: string; name: string; path: string; kind: "image" | "file"; previewUrl?: string };
 type StartupTarget = { workspace: string; file?: string };
 type FileContextMenu = { x: number; y: number; path: string; isDir: boolean };
+type SessionContextMenu = { x: number; y: number; session: Session };
 type AppDialog = { kind: "confirm" | "input"; title: string; message: string; value?: string; danger?: boolean };
 type TerminalKind = "powershell" | "cmd" | "wsl";
 type TerminalTab = { id: string; title: string; shell: TerminalKind };
@@ -106,6 +114,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   approvalMode: "readOnly",
   maxProviderRounds: 48,
   inputPricePerMillion: 0,
+  cachedInputPricePerMillion: 0,
   outputPricePerMillion: 0,
   projects: [],
   providerProfiles: [],
@@ -116,7 +125,7 @@ const DEFAULT_SETTINGS: SettingsData = {
   textToSpeechRoute: { enabled: false, inheritMainModel: true, provider: "custom", baseUrl: "", model: "", apiKey: "" },
 };
 
-const CURRENT_VERSION = "0.2.11";
+const CURRENT_VERSION = "0.2.12";
 const DEFAULT_UPDATE_INFO: UpdateInfo = {
   currentVersion: CURRENT_VERSION,
   latestVersion: "",
@@ -128,36 +137,43 @@ const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 8_192;
 const CONTEXT_WARN_RATIO = 0.80;
 
-const PROVIDERS = [
-  { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", inputPrice: 0.27, outputPrice: 1.10 },
-  { id: "openai", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1" },
-  { id: "anthropic", name: "Anthropic Claude", baseUrl: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5" },
-  { id: "gemini", name: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-3.5-flash" },
-  { id: "mistral", name: "Mistral AI", baseUrl: "https://api.mistral.ai/v1", model: "devstral-medium-latest" },
-  { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", model: "anthropic/claude-sonnet-4" },
-  { id: "qwen", name: "阿里云百炼 / 通义千问", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen3-coder-next" },
-  { id: "dashscope-deepseek", name: "阿里云百炼 / DeepSeek", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "deepseek-v4-pro" },
-  { id: "volcengine", name: "火山引擎方舟", baseUrl: "https://ark.cn-beijing.volces.com/api/v3", model: "" },
-  { id: "volcengine-coding", name: "火山引擎方舟 / Coding Plan", baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3", model: "ark-code-latest" },
-  { id: "baidu", name: "百度千帆", baseUrl: "https://qianfan.baidubce.com/v2", model: "" },
-  { id: "hunyuan", name: "腾讯混元", baseUrl: "https://api.hunyuan.cloud.tencent.com/v1", model: "" },
-  { id: "moonshot", name: "Moonshot / Kimi", baseUrl: "https://api.moonshot.cn/v1", model: "kimi-k2-0711-preview" },
-  { id: "minimax", name: "MiniMax", baseUrl: "https://api.minimax.io/v1", model: "" },
-  { id: "stepfun", name: "阶跃星辰 StepFun", baseUrl: "https://api.stepfun.com/v1", model: "" },
-  { id: "lingyi", name: "零一万物 Yi", baseUrl: "https://api.lingyiwanwu.com/v1", model: "" },
-  { id: "modelscope", name: "魔搭 ModelScope", baseUrl: "https://api-inference.modelscope.cn/v1", model: "" },
-  { id: "siliconflow", name: "硅基流动", baseUrl: "https://api.siliconflow.cn/v1", model: "Pro/zai-org/GLM-4.7" },
-  { id: "zhipu", name: "智谱 GLM", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.5" },
-  { id: "together", name: "Together AI", baseUrl: "https://api.together.xyz/v1", model: "" },
-  { id: "fireworks", name: "Fireworks AI", baseUrl: "https://api.fireworks.ai/inference/v1", model: "" },
-  { id: "cerebras", name: "Cerebras", baseUrl: "https://api.cerebras.ai/v1", model: "" },
-  { id: "perplexity", name: "Perplexity", baseUrl: "https://api.perplexity.ai", model: "" },
-  { id: "github-models", name: "GitHub Models", baseUrl: "https://models.inference.ai.azure.com", model: "" },
-  { id: "groq", name: "Groq", baseUrl: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-120b" },
-  { id: "xai", name: "xAI", baseUrl: "https://api.x.ai/v1", model: "grok-4-0709" },
-  { id: "ollama", name: "Ollama 本地模型", baseUrl: "http://localhost:11434/v1", model: "qwen2.5-coder:7b" },
-  { id: "lmstudio", name: "LM Studio 本地模型", baseUrl: "http://localhost:1234/v1", model: "local-model" },
-  { id: "custom", name: "自定义 OpenAI-compatible", baseUrl: "", model: "" },
+type ProviderPreset = {
+  id: string; name: string; logo: string; baseUrl: string; model: string;
+  inputPrice?: number; cachedInputPrice?: number; outputPrice?: number; contextWindow?: number; maxOutputTokens?: number;
+};
+
+const PROVIDERS: ProviderPreset[] = [
+  { id: "deepseek", name: "DeepSeek", logo: "deepseek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat", inputPrice: 0.27, cachedInputPrice: 0.07, outputPrice: 1.10 },
+  { id: "mimo", name: "小米 MiMo / API 按量", logo: "mimo", baseUrl: "https://api.xiaomimimo.com/v1", model: "mimo-v2.5-pro", inputPrice: 1, cachedInputPrice: 0.2, outputPrice: 3, contextWindow: 1_000_000 },
+  { id: "mimo-token-plan", name: "小米 MiMo / Token Plan", logo: "mimo", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", model: "mimo-v2.5-pro", contextWindow: 1_000_000 },
+  { id: "openai", name: "OpenAI", logo: "openai", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1" },
+  { id: "anthropic", name: "Anthropic Claude", logo: "claude", baseUrl: "https://api.anthropic.com/v1", model: "claude-sonnet-4-5" },
+  { id: "gemini", name: "Google Gemini", logo: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-3.5-flash" },
+  { id: "mistral", name: "Mistral AI", logo: "mistral", baseUrl: "https://api.mistral.ai/v1", model: "devstral-medium-latest" },
+  { id: "openrouter", name: "OpenRouter", logo: "openrouter", baseUrl: "https://openrouter.ai/api/v1", model: "anthropic/claude-sonnet-4" },
+  { id: "qwen", name: "阿里云百炼 / 通义千问", logo: "qwen", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen3-coder-next" },
+  { id: "dashscope-deepseek", name: "阿里云百炼 / DeepSeek", logo: "deepseek", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "deepseek-v4-pro" },
+  { id: "volcengine", name: "火山引擎方舟", logo: "volcengine", baseUrl: "https://ark.cn-beijing.volces.com/api/v3", model: "" },
+  { id: "volcengine-coding", name: "火山引擎方舟 / Coding Plan", logo: "volcengine", baseUrl: "https://ark.cn-beijing.volces.com/api/coding/v3", model: "ark-code-latest" },
+  { id: "baidu", name: "百度千帆", logo: "baidu", baseUrl: "https://qianfan.baidubce.com/v2", model: "" },
+  { id: "hunyuan", name: "腾讯混元", logo: "hunyuan", baseUrl: "https://api.hunyuan.cloud.tencent.com/v1", model: "" },
+  { id: "moonshot", name: "Moonshot / Kimi", logo: "moonshot", baseUrl: "https://api.moonshot.cn/v1", model: "kimi-k2-0711-preview" },
+  { id: "minimax", name: "MiniMax", logo: "minimax", baseUrl: "https://api.minimax.io/v1", model: "" },
+  { id: "stepfun", name: "阶跃星辰 StepFun", logo: "stepfun", baseUrl: "https://api.stepfun.com/v1", model: "" },
+  { id: "lingyi", name: "零一万物 Yi", logo: "generic", baseUrl: "https://api.lingyiwanwu.com/v1", model: "" },
+  { id: "modelscope", name: "魔搭 ModelScope", logo: "modelscope", baseUrl: "https://api-inference.modelscope.cn/v1", model: "" },
+  { id: "siliconflow", name: "硅基流动", logo: "siliconcloud", baseUrl: "https://api.siliconflow.cn/v1", model: "Pro/zai-org/GLM-4.7" },
+  { id: "zhipu", name: "智谱 GLM", logo: "zhipu", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.5" },
+  { id: "together", name: "Together AI", logo: "together", baseUrl: "https://api.together.xyz/v1", model: "" },
+  { id: "fireworks", name: "Fireworks AI", logo: "fireworks", baseUrl: "https://api.fireworks.ai/inference/v1", model: "" },
+  { id: "cerebras", name: "Cerebras", logo: "cerebras", baseUrl: "https://api.cerebras.ai/v1", model: "" },
+  { id: "perplexity", name: "Perplexity", logo: "perplexity", baseUrl: "https://api.perplexity.ai", model: "" },
+  { id: "github-models", name: "GitHub Models", logo: "github", baseUrl: "https://models.inference.ai.azure.com", model: "" },
+  { id: "groq", name: "Groq", logo: "groq", baseUrl: "https://api.groq.com/openai/v1", model: "openai/gpt-oss-120b" },
+  { id: "xai", name: "xAI", logo: "xai", baseUrl: "https://api.x.ai/v1", model: "grok-4-0709" },
+  { id: "ollama", name: "Ollama 本地模型", logo: "ollama", baseUrl: "http://localhost:11434/v1", model: "qwen2.5-coder:7b" },
+  { id: "lmstudio", name: "LM Studio 本地模型", logo: "generic", baseUrl: "http://localhost:1234/v1", model: "local-model" },
+  { id: "custom", name: "自定义 OpenAI-compatible", logo: "generic", baseUrl: "", model: "" },
 ];
 
 const APPROVAL_MODES: { id: Mode; label: string }[] = [
@@ -190,6 +206,35 @@ const EXTENSION_LANGUAGE_IDS: Record<string, string> = {
   hs: "haskell", kt: "kotlin", kts: "kotlin", ml: "ocaml", mli: "ocaml", res: "rescript", styl: "stylus", tf: "terraform", vue: "vue",
 };
 
+const ICON_THEMES: { id: IconTheme; label: string; description: string }[] = [
+  { id: "material", label: "Material 彩色", description: "文件类型辨识度最高" },
+  { id: "lucide", label: "Lucide 极简", description: "轻盈克制的线性风格" },
+  { id: "tabler", label: "Tabler 清晰", description: "轮廓稳定，适合代码工作区" },
+  { id: "phosphor", label: "Phosphor 柔和", description: "圆润友好，视觉更放松" },
+  { id: "remix", label: "Remix 现代", description: "略粗的现代产品风格" },
+];
+
+let activeIconTheme: IconTheme = "material";
+
+function fileAccent(path: string) {
+  const extension = path.split(".").at(-1)?.toLowerCase() || "";
+  if (["js", "jsx", "mjs", "cjs"].includes(extension)) return "#d7a800";
+  if (["ts", "tsx", "mts", "cts"].includes(extension)) return "#3478c6";
+  if (["html", "htm", "vue"].includes(extension)) return "#e5532d";
+  if (["css", "scss", "sass", "less"].includes(extension)) return "#7957d5";
+  if (extension === "rs") return "#c65a2e";
+  if (["py", "pyw"].includes(extension)) return "#3776ab";
+  if (extension === "go") return "#00a7c7";
+  if (["java", "kt", "kts"].includes(extension)) return "#d65c45";
+  if (["c", "h", "cc", "cpp", "cxx", "hpp"].includes(extension)) return "#4385d0";
+  if (["json", "jsonc", "yaml", "yml", "toml"].includes(extension)) return "#b99b00";
+  if (["md", "mdx", "txt"].includes(extension)) return "#5f7488";
+  if (extension === "docx") return "#2b579a";
+  if (extension === "xlsx") return "#217346";
+  if (extension === "pptx") return "#d24726";
+  return "var(--icon-muted)";
+}
+
 function resolveMaterialIcon(path: string, light: boolean): string {
   const name = path.split(/[\\/]/).at(-1)?.toLowerCase() || "";
   const associations = light ? MATERIAL_THEME.light || MATERIAL_THEME : MATERIAL_THEME;
@@ -211,8 +256,79 @@ function resolveMaterialIcon(path: string, light: boolean): string {
   return `/material-icons/${filename}`;
 }
 
-function FileTypeIcon({ path, size = 16, light = false }: { path: string; size?: number; light?: boolean }) {
-  return <img className="material-file-icon" src={resolveMaterialIcon(path, light)} width={size} height={size} alt="" />;
+function FileTypeIcon({ path, size = 16, light = false, theme }: { path: string; size?: number; light?: boolean; theme?: IconTheme }) {
+  const selectedTheme = theme || activeIconTheme;
+  if (selectedTheme === "material") {
+    return <img className="material-file-icon" src={resolveMaterialIcon(path, light)} width={size} height={size} alt="" />;
+  }
+  const props = { className: "themed-file-icon", size, style: { color: fileAccent(path) } };
+  if (selectedTheme === "tabler") return <TbFile {...props} />;
+  if (selectedTheme === "phosphor") return <PiFile {...props} />;
+  if (selectedTheme === "remix") return <RiFile3Line {...props} />;
+  return <FiFile {...props} />;
+}
+
+function FolderTypeIcon({ open = false, size = 16, theme }: { open?: boolean; size?: number; theme?: IconTheme }) {
+  const selectedTheme = theme || activeIconTheme;
+  if (selectedTheme !== "material") {
+    const props = { className: "themed-folder-icon", size };
+    if (selectedTheme === "tabler") return open ? <TbFolderOpen {...props} /> : <TbFolder {...props} />;
+    if (selectedTheme === "phosphor") return open ? <PiFolderOpen {...props} /> : <PiFolder {...props} />;
+    if (selectedTheme === "remix") return open ? <RiFolderOpenLine {...props} /> : <RiFolder3Line {...props} />;
+    return <FiFolder {...props} />;
+  }
+  const definition = MATERIAL_THEME.iconDefinitions[open ? MATERIAL_THEME.folderExpanded || "folder-open" : MATERIAL_THEME.folder || "folder"];
+  const filename = definition?.iconPath?.split("/").at(-1) || (open ? "folder-open.svg" : "folder.svg");
+  return <img className="material-file-icon" src={`/material-icons/${filename}`} width={size} height={size} alt="" />;
+}
+
+function IconThemePreview({ theme }: { theme: IconTheme }) {
+  return <span className="icon-theme-preview"><FolderTypeIcon open size={23} theme={theme} /><FileTypeIcon path="main.tsx" size={21} theme={theme} /><FileTypeIcon path="README.md" size={21} theme={theme} /></span>;
+}
+
+const PROVIDER_ICON_SLUGS: Record<string, string> = {
+  deepseek: "deepseek", "dashscope-deepseek": "deepseek", openai: "openai", anthropic: "claude",
+  gemini: "gemini", mistral: "mistral", openrouter: "openrouter", qwen: "qwen",
+  volcengine: "volcengine", "volcengine-coding": "volcengine", baidu: "baidu", hunyuan: "hunyuan",
+  moonshot: "moonshot", minimax: "minimax", stepfun: "stepfun", modelscope: "modelscope",
+  siliconflow: "siliconcloud", zhipu: "zhipu", together: "together", fireworks: "fireworks",
+  cerebras: "cerebras", perplexity: "perplexity", "github-models": "github", groq: "groq",
+  xai: "xai", ollama: "ollama", alibaba: "alibabacloud",
+  mimo: "mimo", "mimo-token-plan": "mimo", custom: "generic", lmstudio: "generic",
+};
+
+const PROVIDER_LOGO_OPTIONS = [
+  "generic", "deepseek", "mimo", "openai", "claude", "gemini", "qwen", "minimax",
+  "moonshot", "zhipu", "volcengine", "openrouter", "mistral", "ollama", "github",
+  "hunyuan", "baidu", "stepfun", "modelscope", "siliconcloud", "together", "groq", "xai",
+];
+
+function ProviderLogo({ provider, logo, size = 16 }: { provider?: string; logo?: string; size?: number }) {
+  const slug = logo || (provider ? PROVIDER_ICON_SLUGS[provider] : undefined);
+  if (slug) return <img className="provider-logo" src={`/provider-icons/${slug}.svg`} width={size} height={size} alt="" />;
+  const providerName = PROVIDERS.find((item) => item.id === provider)?.name || provider || "AI";
+  const initials = providerName.replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, "").slice(0, 2).toUpperCase() || "AI";
+  return <span className="provider-logo-fallback" style={{ width: size, height: size, fontSize: Math.max(7, size * .46) }}>{initials}</span>;
+}
+
+function LogoPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [open, setOpen] = React.useState(false);
+  const host = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    const close = (event: PointerEvent) => {
+      if (!host.current?.contains(event.target as Node)) setOpen(false);
+    };
+    window.addEventListener("pointerdown", close);
+    return () => window.removeEventListener("pointerdown", close);
+  }, []);
+  return <div className="logo-picker" ref={host}>
+    <button type="button" title="选择配置 Logo" onClick={() => setOpen((current) => !current)}>
+      <ProviderLogo logo={value || "generic"} size={20} /><span>更换 Logo</span><ChevronDown size={12} />
+    </button>
+    {open && <div className="logo-picker-menu">{PROVIDER_LOGO_OPTIONS.map((logo) => <button type="button" key={logo} className={logo === value ? "active" : ""} title={logo} onClick={() => { onChange(logo); setOpen(false); }}>
+      <ProviderLogo logo={logo} size={20} />{logo === value && <Check size={12} />}
+    </button>)}</div>}
+  </div>;
 }
 
 function OfficeKindIcon({ kind, path, size = 16 }: { kind: string; path?: string; size?: number }) {
@@ -312,7 +428,7 @@ function Dropdown<T extends string>({ value, options, icon, title, onChange, upw
 }
 
 function ModelSwitcher<T extends string>({ value, options, onChange }: {
-  value: T; options: { id: T; label: string; provider?: string; model?: string; meta?: string }[]; onChange: (value: T) => void;
+  value: T; options: { id: T; label: string; provider?: string; logo?: string; model?: string; meta?: string }[]; onChange: (value: T) => void;
 }) {
   const [open, setOpen] = React.useState(false);
   const [menuStyle, setMenuStyle] = React.useState<React.CSSProperties>({});
@@ -321,7 +437,7 @@ function ModelSwitcher<T extends string>({ value, options, onChange }: {
   const updatePosition = React.useCallback(() => {
     if (!host.current) return;
     const rect = host.current.getBoundingClientRect();
-    const width = Math.min(Math.max(220, rect.width), window.innerWidth - 16);
+    const width = Math.min(Math.max(310, rect.width), window.innerWidth - 16);
     setMenuStyle({
       top: undefined,
       right: undefined,
@@ -355,11 +471,11 @@ function ModelSwitcher<T extends string>({ value, options, onChange }: {
   };
   return <div className="dropdown model-switcher" ref={host}>
     <button className={`dropdown-trigger ${open ? "open" : ""}`} title="切换模型" onClick={toggle}>
-      <TerminalSquare size={15} /><span>{selected?.label || "选择模型"}</span><ChevronDown size={13} />
+      <ProviderLogo provider={selected?.provider} logo={selected?.logo} size={15} /><span>{selected?.label || "选择模型"}</span><ChevronDown size={13} />
     </button>
     {open && createPortal(<div ref={menu} className="model-menu dropdown-portal" style={menuStyle} onPointerDown={(event) => event.stopPropagation()}>
       {options.map((option) => <button key={option.id} className={option.id === value ? "active" : ""} onPointerDown={(event) => { event.preventDefault(); onChange(option.id); setOpen(false); }}>
-        {option.id === "__manage" ? <><Settings size={15} /><span><strong>{option.label}</strong></span></> : <><TerminalSquare size={15} /><span><strong>{option.label}</strong></span>{option.id === value && <Check size={14} />}</>}
+        {option.id === "__manage" ? <><Settings size={15} /><span><strong>{option.label}</strong></span></> : <><ProviderLogo provider={option.provider} logo={option.logo} size={15} /><span><strong>{option.label}</strong></span>{option.id === value && <Check size={14} />}</>}
       </button>)}
     </div>, document.body)}
   </div>;
@@ -500,6 +616,11 @@ const normalizeCoreEvent = (event: CoreEvent): CoreEvent => ({
   turnId: event.turnId || event.turn_id,
   toolCallId: event.toolCallId || event.tool_call_id,
   toolName: event.toolName || event.tool_name,
+  usedTokens: event.usedTokens ?? event.used_tokens,
+  contextWindow: event.contextWindow ?? event.context_window,
+  beforeTokens: event.beforeTokens ?? event.before_tokens,
+  afterTokens: event.afterTokens ?? event.after_tokens,
+  compactedMessages: event.compactedMessages ?? event.compacted_messages,
 });
 const mergeCoreEvent = (items: CoreEvent[], event: CoreEvent) => {
   if (event.eventId && items.some((item) => item.eventId === event.eventId)) return items;
@@ -609,16 +730,23 @@ function IntegratedTerminal({ workspace, visible, dark, onClose }: { workspace: 
 function App() {
   const appWindow = React.useMemo(() => getCurrentWindow(), []);
   const [themeMode, setThemeMode] = React.useState<ThemeMode>(() => (localStorage.getItem("lan-code-theme") as ThemeMode) || "system");
+  const [iconTheme, setIconTheme] = React.useState<IconTheme>(() => (localStorage.getItem("lan-code-icon-theme") as IconTheme) || "material");
   const [systemDark, setSystemDark] = React.useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
   const [settings, setSettings] = React.useState(DEFAULT_SETTINGS);
   const [draft, setDraft] = React.useState(DEFAULT_SETTINGS);
   const [sessions, setSessions] = React.useState<Session[]>([]);
   const [activeId, setActiveId] = React.useState<string>();
+  const [defaultChatWorkspace, setDefaultChatWorkspace] = React.useState("");
+  const [pinnedSessionIds, setPinnedSessionIds] = React.useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("lan-code-pinned-sessions") || "[]"); } catch { return []; }
+  });
   const [messages, setMessages] = React.useState<ChatMessage[]>([]);
   const [events, setEvents] = React.useState<CoreEvent[]>([]);
   const [backgroundProcesses, setBackgroundProcesses] = React.useState<BackgroundProcess[]>([]);
   const [approvals, setApprovals] = React.useState<Approval[]>([]);
   const [prompt, setPrompt] = React.useState("");
+  const [promptAttachments, setPromptAttachments] = React.useState<PromptAttachment[]>([]);
+  const [attachmentBusy, setAttachmentBusy] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [settingsSection, setSettingsSection] = React.useState<SettingsSection>("appearance");
@@ -626,6 +754,7 @@ function App() {
   const [profileModels, setProfileModels] = React.useState<Record<string, string[]>>({});
   const [profileBusy, setProfileBusy] = React.useState<Record<string, string>>({});
   const [expandedProfiles, setExpandedProfiles] = React.useState<Set<string>>(new Set());
+  const profileNameInputs = React.useRef<Record<string, HTMLInputElement | null>>({});
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
@@ -650,7 +779,7 @@ function App() {
   const [completionEnabled, setCompletionEnabled] = React.useState(() => localStorage.getItem("lan-code-completion-enabled") !== "false");
   const [inspectorOpen, setInspectorOpen] = React.useState(true);
   const [sidebarWidth, setSidebarWidth] = React.useState(() => storedSize("lan-code-sidebar-width", 238));
-  const [inspectorWidth, setInspectorWidth] = React.useState(() => storedSize("lan-code-inspector-width", 252));
+  const [inspectorWidth, setInspectorWidth] = React.useState(() => storedSize("lan-code-inspector-width-v3", 268, 250, 420));
   const [activityHeight, setActivityHeight] = React.useState(() => storedSize("lan-code-activity-height", 190, 120, 320));
   const [codePanelsHeight, setCodePanelsHeight] = React.useState(() => storedSize("lan-code-panels-height", 320, 310, 460));
   const [officeFiles, setOfficeFiles] = React.useState<OfficeFile[]>([]);
@@ -664,6 +793,7 @@ function App() {
   const [officeStatus, setOfficeStatus] = React.useState("");
   const [showScrollBottom, setShowScrollBottom] = React.useState(false);
   const [fileContextMenu, setFileContextMenu] = React.useState<FileContextMenu>();
+  const [sessionContextMenu, setSessionContextMenu] = React.useState<SessionContextMenu>();
   const [appDialog, setAppDialog] = React.useState<AppDialog>();
   const [dialogValue, setDialogValue] = React.useState("");
   const [paletteOpen, setPaletteOpen] = React.useState(false);
@@ -682,6 +812,7 @@ function App() {
     || settings.providerProfiles.some((profile) => profile.enabled !== false && (Boolean(profile.apiKey) || ["ollama", "lmstudio"].includes(profile.provider)));
   const darkTheme = themeMode === "dark" || (themeMode === "system" && systemDark);
   const workingTreeDirty = Boolean(gitOverview?.isRepository && gitOverview.changedFiles > 0);
+  activeIconTheme = iconTheme;
 
   function resolveDialog(value: string | boolean | undefined) {
     dialogResolver.current?.(value);
@@ -730,7 +861,7 @@ function App() {
       const delta = pointer.clientX - startX;
       const width = panel === "sidebar" ? startSize + delta : startSize - delta;
       if (panel === "sidebar") setSidebarWidth(Math.min(360, Math.max(190, width)));
-      else setInspectorWidth(Math.min(440, Math.max(220, width)));
+      else setInspectorWidth(Math.min(440, Math.max(250, width)));
     };
     const move = (pointer: PointerEvent) => {
       latestPointer = pointer;
@@ -775,8 +906,13 @@ function App() {
   }, [themeMode, darkTheme]);
 
   React.useEffect(() => {
+    localStorage.setItem("lan-code-icon-theme", iconTheme);
+    document.documentElement.dataset.iconTheme = iconTheme;
+  }, [iconTheme]);
+
+  React.useEffect(() => {
     localStorage.setItem("lan-code-sidebar-width", String(sidebarWidth));
-    localStorage.setItem("lan-code-inspector-width", String(inspectorWidth));
+    localStorage.setItem("lan-code-inspector-width-v3", String(inspectorWidth));
     localStorage.setItem("lan-code-activity-height", String(activityHeight));
     localStorage.setItem("lan-code-panels-height", String(codePanelsHeight));
   }, [sidebarWidth, inspectorWidth, activityHeight, codePanelsHeight]);
@@ -785,6 +921,10 @@ function App() {
     localStorage.setItem("lan-code-completion-enabled", String(completionEnabled));
     completionEnabledRef.current = completionEnabled;
   }, [completionEnabled]);
+
+  React.useEffect(() => {
+    localStorage.setItem("lan-code-pinned-sessions", JSON.stringify(pinnedSessionIds));
+  }, [pinnedSessionIds]);
 
   React.useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -802,9 +942,11 @@ function App() {
     const disableWebviewMenu = (event: MouseEvent) => {
       event.preventDefault();
       if (!(event.target as HTMLElement).closest(".file-tree")) setFileContextMenu(undefined);
+      if (!(event.target as HTMLElement).closest(".session-row")) setSessionContextMenu(undefined);
     };
     const closeMenu = (event?: Event) => {
       setFileContextMenu(undefined);
+      setSessionContextMenu(undefined);
       if (event && !(event.target as HTMLElement).closest(".app-menu-host")) setAppMenu(undefined);
     };
     window.addEventListener("contextmenu", disableWebviewMenu);
@@ -818,16 +960,20 @@ function App() {
   }, []);
 
   React.useEffect(() => {
-    Promise.all([invoke<SettingsData>("get_settings"), invoke<Session[]>("list_sessions"), invoke<StartupTarget | null>("startup_target")])
-      .then(([loaded, rows, startup]) => {
+    Promise.all([invoke<SettingsData>("get_settings"), invoke<Session[]>("list_sessions"), invoke<StartupTarget | null>("startup_target"), invoke<string>("default_chat_workspace")])
+      .then(([loaded, rows, startup, chatWorkspace]) => {
         const currentProfile = {
           id: crypto.randomUUID(), name: PROVIDERS.find((item) => item.id === loaded.provider)?.name || loaded.provider,
+          logo: PROVIDERS.find((item) => item.id === loaded.provider)?.logo || "generic",
           enabled: true, provider: loaded.provider, baseUrl: loaded.baseUrl, model: loaded.model, apiKey: loaded.apiKey,
-          inputPricePerMillion: loaded.inputPricePerMillion, outputPricePerMillion: loaded.outputPricePerMillion,
+          inputPricePerMillion: loaded.inputPricePerMillion, cachedInputPricePerMillion: loaded.cachedInputPricePerMillion || 0,
+          outputPricePerMillion: loaded.outputPricePerMillion,
           contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
         };
         const hydratedProfiles = loaded.providerProfiles.map((profile) => ({
           ...profile,
+          logo: profile.logo || PROVIDERS.find((item) => item.id === profile.provider)?.logo || "generic",
+          cachedInputPricePerMillion: profile.cachedInputPricePerMillion || 0,
           contextWindow: profile.contextWindow || DEFAULT_CONTEXT_WINDOW,
           maxOutputTokens: profile.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
         }));
@@ -848,6 +994,7 @@ function App() {
         setSettings(normalized);
         setDraft(normalized);
         setSessions(rows);
+        setDefaultChatWorkspace(chatWorkspace);
         if (startup?.file) {
           setStartupFile(startup.file);
           setWorkbench("code");
@@ -1051,6 +1198,7 @@ function App() {
   async function removeSession(sessionId: string) {
     if (!await askConfirm("删除对话", "确定删除这个对话及其历史记录吗？此操作不可撤销。", true)) return;
     await invoke("delete_session", { sessionId });
+    setPinnedSessionIds((items) => items.filter((id) => id !== sessionId));
     if (activeId === sessionId) {
       setActiveId(undefined);
       setMessages([]);
@@ -1066,14 +1214,27 @@ function App() {
     await refreshSessions();
   }
 
+  function togglePinnedSession(sessionId: string) {
+    setPinnedSessionIds((items) => items.includes(sessionId)
+      ? items.filter((id) => id !== sessionId)
+      : [sessionId, ...items]);
+  }
+
   function addProviderProfile() {
-    const preset = PROVIDERS[0];
+    const id = crypto.randomUUID();
     const profile: ProviderProfile = {
-      id: crypto.randomUUID(), name: preset.name, enabled: true, provider: preset.id, baseUrl: preset.baseUrl, model: preset.model,
-      apiKey: "", inputPricePerMillion: preset.inputPrice || 0, outputPricePerMillion: preset.outputPrice || 0,
+      id, name: "", logo: "generic", enabled: true, provider: "custom", baseUrl: "", model: "",
+      apiKey: "", inputPricePerMillion: 0, cachedInputPricePerMillion: 0, outputPricePerMillion: 0,
       contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
     };
-    setDraft({ ...draft, providerProfiles: [...draft.providerProfiles, profile] });
+    setDraft((value) => ({ ...value, providerProfiles: [...value.providerProfiles, profile] }));
+    setExpandedProfiles((items) => new Set(items).add(id));
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const input = profileNameInputs.current[id];
+      input?.scrollIntoView({ behavior: "smooth", block: "center" });
+      input?.focus();
+      input?.select();
+    }));
   }
 
   function updateProviderProfile(id: string, patch: Partial<ProviderProfile>) {
@@ -1089,6 +1250,7 @@ function App() {
           model: updated.model,
           apiKey: updated.apiKey,
           inputPricePerMillion: updated.inputPricePerMillion,
+          cachedInputPricePerMillion: updated.cachedInputPricePerMillion,
           outputPricePerMillion: updated.outputPricePerMillion,
         } : {}),
         providerProfiles: value.providerProfiles.map((item) => item.id === id && updated ? updated : item),
@@ -1099,7 +1261,8 @@ function App() {
   function makeProviderProfileCurrent(profile: ProviderProfile) {
     setDraft((value) => ({
       ...value, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model, apiKey: profile.apiKey,
-      inputPricePerMillion: profile.inputPricePerMillion, outputPricePerMillion: profile.outputPricePerMillion,
+      inputPricePerMillion: profile.inputPricePerMillion, cachedInputPricePerMillion: profile.cachedInputPricePerMillion,
+      outputPricePerMillion: profile.outputPricePerMillion,
     }));
     setSettingsStatus(`正在切换到“${profile.name} · ${profile.model}”...`);
   }
@@ -1107,8 +1270,12 @@ function App() {
   function selectProfileProvider(profile: ProviderProfile, providerId: string) {
     const preset = PROVIDERS.find((item) => item.id === providerId)!;
     updateProviderProfile(profile.id, {
-      provider: providerId, name: preset.name, baseUrl: preset.baseUrl || profile.baseUrl, model: preset.model || "",
-      inputPricePerMillion: preset.inputPrice || 0, outputPricePerMillion: preset.outputPrice || 0,
+      provider: providerId, name: profile.name, baseUrl: preset.baseUrl || profile.baseUrl, model: preset.model || "",
+      logo: preset.logo,
+      inputPricePerMillion: preset.inputPrice || 0, cachedInputPricePerMillion: preset.cachedInputPrice || 0,
+      outputPricePerMillion: preset.outputPrice || 0,
+      contextWindow: preset.contextWindow || profile.contextWindow || DEFAULT_CONTEXT_WINDOW,
+      maxOutputTokens: preset.maxOutputTokens || profile.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS,
     });
   }
 
@@ -1119,11 +1286,12 @@ function App() {
   async function switchModelProfile(profileId: string) {
     const profile = settings.providerProfiles.find((item) => item.id === profileId);
     if (!profile) return;
-    const currentContext = [...events].reverse().find((event) => event.type === "contextUsageUpdated")?.usedTokens || 0;
+    const currentContext = currentContextEstimate();
     if (currentContext > profile.contextWindow * CONTEXT_WARN_RATIO) setCodeStatus("已切换到较小上下文模型；下一次发送前会自动压缩旧上下文。");
     const next = {
       ...settings, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model,
       apiKey: profile.apiKey, inputPricePerMillion: profile.inputPricePerMillion,
+      cachedInputPricePerMillion: profile.cachedInputPricePerMillion,
       outputPricePerMillion: profile.outputPricePerMillion,
     };
     await invoke("save_settings", { settings: next });
@@ -1148,6 +1316,12 @@ function App() {
         totalTokens: total.totalTokens + event.usage!.totalTokens,
         cachedInputTokens: total.cachedInputTokens + event.usage!.cachedInputTokens,
       }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 });
+  }
+
+  function currentContextEstimate() {
+    return [...events].reverse().find((event) => event.type === "contextUsageUpdated")?.usedTokens
+      || [...events].reverse().find((event) => event.type === "usageRecorded" && event.usage)?.usage?.inputTokens
+      || 0;
   }
 
   function contextAwarePrompt(text: string) {
@@ -1178,7 +1352,8 @@ function App() {
     try {
       const candidate = {
         ...draft, provider: profile.provider, baseUrl: profile.baseUrl, model: profile.model, apiKey: profile.apiKey,
-        inputPricePerMillion: profile.inputPricePerMillion, outputPricePerMillion: profile.outputPricePerMillion,
+        inputPricePerMillion: profile.inputPricePerMillion, cachedInputPricePerMillion: profile.cachedInputPricePerMillion,
+        outputPricePerMillion: profile.outputPricePerMillion,
       };
       const result = await invoke<{ latencyMs: number; toolCallSupported: boolean }>("test_provider", { settings: candidate });
       setProfileBusy((value) => ({ ...value, [profile.id]: `连接成功 · ${result.latencyMs}ms · 工具调用${result.toolCallSupported ? "可用" : "未通过"}` }));
@@ -1386,9 +1561,22 @@ function App() {
 
   async function sendWithText(text: string) {
     if (!text.trim() || busy) return;
+    const attachments = promptAttachments;
+    const attachmentContext = attachments.length
+      ? [
+          "",
+          "用户随消息附带了以下工作区附件：",
+          ...attachments.map((attachment) => `- ${attachment.kind === "image" ? "图片" : "文件"}：${attachment.path}`),
+          "请按任务需要读取文件；图片请使用 analyze_image 工具理解。",
+        ].join("\n")
+      : "";
+    const agentText = `${text}${attachmentContext}`;
     try {
       let sessionId = activeId;
-      if (!sessionId) sessionId = await newSession(text.slice(0, 32));
+      if (!sessionId) sessionId = await newSession(
+        text.slice(0, 32),
+        workbench === "agent" ? (defaultChatWorkspace || settings.workspace) : settings.workspace,
+      );
       if (!sessionId) return;
       const activeSession = sessions.find((session) => session.id === sessionId);
       if (!activeSession?.title || activeSession.title === "新对话") {
@@ -1397,9 +1585,13 @@ function App() {
       }
       setMessages((items) => [...items, { role: "user", text }]);
       setPrompt("");
+      attachments.forEach((attachment) => {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      });
+      setPromptAttachments([]);
       setBusy(true);
       const result = await invoke<{ text: string }>("start_turn", {
-        sessionId, prompt: contextAwarePrompt(text), mode: settings.approvalMode,
+        sessionId, prompt: contextAwarePrompt(agentText), mode: settings.approvalMode,
       });
       setMessages((items) => [...items, { role: "assistant", text: result.text }]);
     } catch (error) {
@@ -1541,7 +1733,12 @@ function App() {
 
   async function installUpdate() {
     if (!downloadedUpdate || !await askConfirm("安装更新", "Lan Code 将退出并启动安装程序，是否继续？")) return;
-    await invoke("install_downloaded_update", { path: downloadedUpdate });
+    setUpdateStatus("正在启动更新安装程序...");
+    try {
+      await invoke("install_downloaded_update", { path: downloadedUpdate });
+    } catch (error) {
+      setUpdateStatus(`启动更新失败：${String(error)}`);
+    }
   }
 
   async function understandImage() {
@@ -1572,8 +1769,8 @@ function App() {
     }
   }
 
-  async function newSession(title = "新对话") {
-    const session = await invoke<Session>("create_session", { cwd: settings.workspace, title });
+  async function newSession(title = "新对话", cwd = settings.workspace) {
+    const session = await invoke<Session>("create_session", { cwd, title });
     await refreshSessions();
     setActiveId(session.id);
     setMessages([]);
@@ -1582,8 +1779,41 @@ function App() {
   }
 
   async function send() {
-    const text = prompt.trim();
+    const text = prompt.trim() || (promptAttachments.length ? "请查看并处理这些附件。" : "");
     await sendWithText(text);
+  }
+
+  async function addPromptFiles(files: FileList | File[]) {
+    const rows = Array.from(files);
+    if (!rows.length || attachmentBusy) return;
+    setAttachmentBusy(true);
+    try {
+      const saved = await Promise.all(rows.map(async (file) => {
+        const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+        const result = await invoke<Omit<PromptAttachment, "id" | "previewUrl">>("save_prompt_attachment", {
+          filename: file.name,
+          bytes,
+        });
+        return {
+          ...result,
+          id: crypto.randomUUID(),
+          previewUrl: file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined,
+        } satisfies PromptAttachment;
+      }));
+      setPromptAttachments((items) => [...items, ...saved]);
+    } catch (error) {
+      setFatal(`添加附件失败：${String(error)}`);
+    } finally {
+      setAttachmentBusy(false);
+    }
+  }
+
+  function removePromptAttachment(id: string) {
+    setPromptAttachments((items) => {
+      const target = items.find((item) => item.id === id);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+      return items.filter((item) => item.id !== id);
+    });
   }
 
   async function interrupt() {
@@ -1665,37 +1895,53 @@ function App() {
       totalTokens: total.totalTokens + event.usage!.totalTokens,
       cachedInputTokens: total.cachedInputTokens + event.usage!.cachedInputTokens,
     }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0 });
-  const estimatedCost = usage.inputTokens / 1_000_000 * settings.inputPricePerMillion
+  const uncachedInputTokens = Math.max(0, usage.inputTokens - usage.cachedInputTokens);
+  const estimatedCost = uncachedInputTokens / 1_000_000 * settings.inputPricePerMillion
+    + usage.cachedInputTokens / 1_000_000 * settings.cachedInputPricePerMillion
     + usage.outputTokens / 1_000_000 * settings.outputPricePerMillion;
   const enabledProfiles = settings.providerProfiles.filter((profile) => profile.enabled !== false);
   const activeProfileId = enabledProfiles.find((profile) => profile.provider === settings.provider && profile.baseUrl === settings.baseUrl && profile.model === settings.model)?.id || "__current";
   const activeProfile = enabledProfiles.find((profile) => profile.id === activeProfileId);
   const latestContextEvent = [...events].reverse().find((event) => event.type === "contextUsageUpdated");
   const currentContextWindow = latestContextEvent?.contextWindow || activeProfile?.contextWindow || DEFAULT_CONTEXT_WINDOW;
-  const currentContextTokens = latestContextEvent?.usedTokens || 0;
+  const latestUsageInputTokens = [...events].reverse().find((event) => event.type === "usageRecorded" && event.usage)?.usage?.inputTokens || 0;
+  const currentContextTokens = latestContextEvent?.usedTokens || latestUsageInputTokens;
   const currentProject = settings.projects.find((project) => project.path === settings.workspace)
     || (settings.workspace ? { name: settings.workspace.split(/[\\/]/).filter(Boolean).at(-1) || "当前项目", path: settings.workspace } : undefined);
   const currentProjectSessions = sessions.filter((session) => currentProject && normalizePath(session.cwd) === normalizePath(currentProject.path));
   const modelOptions = [
-    ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型" }] : []),
-    ...enabledProfiles.map((profile) => ({ id: profile.id, label: profile.name || profile.model || "未命名配置" })),
+    ...(activeProfileId === "__current" ? [{ id: "__current", label: settings.model || "当前模型", provider: settings.provider, logo: PROVIDERS.find((item) => item.id === settings.provider)?.logo }] : []),
+    ...enabledProfiles.map((profile) => ({ id: profile.id, label: profile.name || profile.model || "未命名配置", provider: profile.provider, logo: profile.logo })),
     { id: "__manage", label: "管理模型配置...", provider: "设置", model: "管理模型配置" },
   ];
   const visibleWorkspaceFiles = workspaceFiles.filter((entry) => {
     const normalized = entry.path.replaceAll("\\", "/");
     return !Array.from(collapsedDirs).some((dir) => normalized.startsWith(`${dir.replaceAll("\\", "/")}/`));
   });
-  const projectSessions = (project: Project) => filtered.filter((session) => normalizePath(session.cwd) === normalizePath(project.path));
-  const orphanSessions = filtered.filter((session) => !settings.projects.some((project) => normalizePath(session.cwd) === normalizePath(project.path)));
+  const pinnedSessions = pinnedSessionIds.map((id) => filtered.find((session) => session.id === id)).filter(Boolean) as Session[];
+  const regularFiltered = filtered.filter((session) => !pinnedSessionIds.includes(session.id));
+  const chatSessions = regularFiltered.filter((session) => defaultChatWorkspace && normalizePath(session.cwd) === normalizePath(defaultChatWorkspace));
+  const visibleProjects = settings.projects.filter((project) => !defaultChatWorkspace || normalizePath(project.path) !== normalizePath(defaultChatWorkspace));
+  const projectSessions = (project: Project) => regularFiltered.filter((session) => normalizePath(session.cwd) === normalizePath(project.path));
+  const orphanSessions = regularFiltered.filter((session) =>
+    (!defaultChatWorkspace || normalizePath(session.cwd) !== normalizePath(defaultChatWorkspace))
+    && !visibleProjects.some((project) => normalizePath(session.cwd) === normalizePath(project.path)));
   const archivedProjects: Project[] = [];
   const updatePublishedAt = updateInfo?.publishedAt ? new Date(updateInfo.publishedAt).toLocaleString() : "自动检查中";
-  const renderSession = (session: Session) => (
-    <div className="session-row nested-session" key={session.id}>
+  const renderSession = (session: Session, nested = true) => (
+    <div className={`session-row ${nested ? "nested-session" : ""}`} key={session.id} onContextMenu={(event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setSessionContextMenu({ x: event.clientX, y: event.clientY, session });
+    }}>
       <button title="双击可重命名" className={session.id === activeId ? "active" : ""} onClick={() => setActiveId(session.id)} onDoubleClick={() => void renameSession(session)}>
         <MessageSquare className="session-icon" size={15} /><span>{session.title || "未命名对话"}</span>
         {session.status === "running" ? <i title="运行中" className="session-state running" /> : session.status === "failed" ? <span className="session-failed" title="执行失败"><XCircle className="session-state failed" size={14} /></span> : session.status === "waitingForApproval" ? <i title="等待批准" className="session-state waiting" /> : null}
       </button>
-      <button title="删除对话" className="row-action" onClick={() => void removeSession(session.id)}><Trash2 size={13} /></button>
+      <button title="更多操作" className="row-action" onClick={(event) => {
+        const rect = event.currentTarget.getBoundingClientRect();
+        setSessionContextMenu({ x: rect.right, y: rect.bottom, session });
+      }}><Ellipsis size={14} /></button>
     </div>
   );
 
@@ -1709,7 +1955,7 @@ function App() {
           {(["file", "edit", "view", "help"] as const).map((menu) => <div className="app-menu-host" key={menu}>
             <button className={appMenu === menu ? "active" : ""} onClick={() => setAppMenu(appMenu === menu ? undefined : menu)}>{menu === "file" ? "文件" : menu === "edit" ? "编辑" : menu === "view" ? "视图" : "帮助"}</button>
             {appMenu === menu && <div className="app-menu-popover">
-              {menu === "file" && <><button onClick={() => { setAppMenu(undefined); void newSession(); }}><MessageSquare size={14} />新建对话<kbd>Ctrl+N</kbd></button><button onClick={() => { setAppMenu(undefined); void addProject(); }}><FolderPlus size={14} />添加项目</button><i /><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={14} />设置</button></>}
+              {menu === "file" && <><button onClick={() => { setAppMenu(undefined); void newSession("新对话", defaultChatWorkspace || settings.workspace); }}><MessageSquare size={14} />新建对话<kbd>Ctrl+N</kbd></button><button onClick={() => { setAppMenu(undefined); void addProject(); }}><FolderPlus size={14} />添加项目</button><i /><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={14} />设置</button></>}
               {menu === "edit" && <><button onClick={() => { setAppMenu(undefined); setPaletteOpen(true); }}><Sparkles size={14} />快速任务<kbd>Ctrl+K</kbd></button><i /><button disabled={!activeFile} onClick={() => { setAppMenu(undefined); void saveWorkspaceFile(); }}><Save size={14} />保存文件<kbd>Ctrl+S</kbd></button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(false); }}><FilePlus size={14} />新建文件</button><button onClick={() => { setAppMenu(undefined); void createWorkspaceEntry(true); }}><FolderPlus size={14} />新建文件夹</button></>}
               {menu === "view" && <><button onClick={() => { setAppMenu(undefined); setWorkbench("agent"); }}><MessageSquare size={14} />Agent 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("code"); }}><Code2 size={14} />Code 工作台</button><button onClick={() => { setAppMenu(undefined); setWorkbench("office"); }}><FileText size={14} />Office 工作台</button><i /><button onClick={() => { setAppMenu(undefined); setSidebarOpen((value) => !value); }}><PanelLeftOpen size={14} />切换侧栏</button><button onClick={() => { setAppMenu(undefined); setInspectorOpen((value) => !value); }}><Eye size={14} />切换观察面板</button></>}
               {menu === "help" && <><button onClick={() => { setAppMenu(undefined); void openExternalUrl("https://github.com/zhaoxinyi02/lan-code"); }}><ExternalLink size={14} />GitHub 仓库</button><button onClick={() => { setAppMenu(undefined); setDraft(settings); setSettingsSection("updates"); setSettingsOpen(true); }}><Download size={14} />检查更新{updateInfo.available && <span className="notification-dot">1</span>}</button></>}
@@ -1806,7 +2052,7 @@ function App() {
               return next;
             });
             else void openWorkspaceFile(entry.path);
-          }} onDoubleClick={() => { if (!entry.isDir) void openWorkspaceFile(entry.path, undefined, true); }}>{entry.isDir ? collapsedDirs.has(entry.path) ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="tree-spacer" />} {entry.isDir ? collapsedDirs.has(entry.path) ? <Folder size={14} /> : <FolderOpen size={14} /> : <FileTypeIcon path={entry.path} />}<span>{entry.name}</span></button>)}</div>
+          }} onDoubleClick={() => { if (!entry.isDir) void openWorkspaceFile(entry.path, undefined, true); }}>{entry.isDir ? collapsedDirs.has(entry.path) ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="tree-spacer" />} {entry.isDir ? <FolderTypeIcon open={!collapsedDirs.has(entry.path)} size={15} /> : <FileTypeIcon path={entry.path} />}<span>{entry.name}</span></button>)}</div>
             </>}
           </div>}</div>
           <div className="horizontal-resizer inline stack-resizer" title="拖动调整文件树 / Agent 区域高度，双击恢复默认" onPointerDown={(event) => startResize("codePanels", event)} onDoubleClick={() => setCodePanelsHeight(320)} />
@@ -1823,14 +2069,15 @@ function App() {
           <button className="new-chat add-project-code" onClick={() => void addProject()}><FolderPlus size={14} /> 添加项目</button>
           <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置{updateInfo.available && <span className="notification-dot">1</span>}</button>
         </> : <>
-        <button className="new-chat" onClick={() => void newSession()}><Plus size={16} /> 新对话</button>
+        <button className="new-chat" onClick={() => void newSession("新对话", defaultChatWorkspace || settings.workspace)}><Plus size={16} /> 新对话</button>
         <nav>
           <button className={searchOpen ? "active" : ""} onClick={() => setSearchOpen(!searchOpen)}><Search size={16} /> 搜索</button>
           <button onClick={() => void addProject()}><FolderPlus size={16} /> 添加项目</button>
         </nav>
         {searchOpen && <input className="session-search" autoFocus placeholder="搜索会话或路径" value={query} onChange={(e) => setQuery(e.target.value)} />}
-        <div className="section-label">项目</div>
-        <div className="sessions project-conversations">{settings.projects.map((project) => (
+        <div className="sessions project-conversations">
+        {pinnedSessions.length > 0 && <section className="sidebar-session-section"><div className="section-label prominent">置顶</div>{pinnedSessions.map((session) => renderSession(session, false))}</section>}
+        <section className="sidebar-session-section"><div className="section-label prominent">项目</div>{visibleProjects.map((project) => (
           <div className="project-group" key={project.path}>
             <div className="session-row">
               <button className={project.path === settings.workspace ? "active project-heading" : "project-heading"} title={project.path} onClick={() => { if (project.path !== settings.workspace) void selectProject(project); toggleProject(project); }}>
@@ -1838,9 +2085,13 @@ function App() {
               </button>
               <button title="移除项目" className="row-action" onClick={() => void removeProject(project)}><Trash2 size={13} /></button>
             </div>
-            {!collapsedProjects.has(project.path) && (projectSessions(project).length ? projectSessions(project).map(renderSession) : <div className="empty-project">暂无对话</div>)}
+            {!collapsedProjects.has(project.path) && (projectSessions(project).length ? projectSessions(project).map((session) => renderSession(session)) : <div className="empty-project">暂无对话</div>)}
           </div>
-        ))}{orphanSessions.length > 0 && <div className="project-group"><div className="orphan-heading">未归档对话</div>{orphanSessions.map(renderSession)}</div>}</div>
+        ))}</section>
+        <section className="sidebar-session-section"><div className="section-label prominent">对话</div>
+          {chatSessions.length ? chatSessions.map((session) => renderSession(session, false)) : <div className="empty-project standalone">新对话会保存在“文档/Lan Code”中</div>}
+          {orphanSessions.length > 0 && <div className="project-group"><div className="orphan-heading">其他对话</div>{orphanSessions.map((session) => renderSession(session, false))}</div>}
+        </section></div>
         <button className="settings-button" onClick={() => { setDraft(settings); setSettingsSection("appearance"); setSettingsOpen(true); }}><Settings size={16} /> 设置{updateInfo.available && <span className="notification-dot">1</span>}</button>
         </>}
         <div className="panel-resizer sidebar-resizer" title="拖动调整侧栏宽度，双击恢复默认" onPointerDown={(event) => startResize("sidebar", event)} onDoubleClick={() => setSidebarWidth(238)} />
@@ -1876,9 +2127,25 @@ function App() {
         </section>
         {showScrollBottom && <button className="scroll-bottom" title="回到最新消息" onClick={() => conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight, behavior: "smooth" })}><ChevronDown size={15} /> 最新消息</button>}
         <div className="composer-wrap"><div className="composer">
-          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }} placeholder={providerReady ? "描述你想完成的编码任务" : "请先在设置中配置 API"} />
+          {promptAttachments.length > 0 && <div className="prompt-attachments">{promptAttachments.map((attachment) => <div key={attachment.id} className={attachment.kind}>
+            {attachment.previewUrl ? <img src={attachment.previewUrl} alt="" /> : <FileTypeIcon path={attachment.name} size={23} />}
+            <span title={attachment.name}>{attachment.name}</span>
+            <button title="移除附件" onClick={() => removePromptAttachment(attachment.id)}><X size={12} /></button>
+          </div>)}</div>}
+          <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} onPaste={(event) => {
+            if (event.clipboardData.files.length) {
+              event.preventDefault();
+              void addPromptFiles(event.clipboardData.files);
+            }
+          }} onDragOver={(event) => event.preventDefault()} onDrop={(event) => {
+            event.preventDefault();
+            void addPromptFiles(event.dataTransfer.files);
+          }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); } }} placeholder={providerReady ? "描述你想完成的编码任务" : "请先在设置中配置 API"} />
           <div className="composer-footer"><div>
-            <button title="添加项目" className="mini" onClick={() => void addProject()}><Plus size={15} /></button>
+            <label title="添加文件或图片" className={`attachment-button ${attachmentBusy ? "busy" : ""}`}><Plus size={15} /><input type="file" multiple onChange={(event) => {
+              if (event.target.files) void addPromptFiles(event.target.files);
+              event.target.value = "";
+            }} /></label>
             <Dropdown value={settings.approvalMode} title="切换 Agent 权限" icon={<ShieldCheck size={13} />} options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} upward onChange={(mode) => void changeApprovalMode(mode)} />
           </div><div className="send-area"><ContextMeter used={currentContextTokens} limit={currentContextWindow} compact /><ModelSwitcher value={activeProfileId} options={modelOptions} onChange={chooseModelProfile} />{busy ? <button className="send stop" onClick={interrupt}><CircleStop size={17} /></button> : <button className="send" disabled={!providerReady} onClick={send}><Send size={17} /></button>}</div></div>
         </div></div>
@@ -1967,7 +2234,7 @@ function App() {
       </main>}
 
       {inspectorOpen && <aside className={`inspector ${workbench === "code" || workbench === "office" ? "code-inspector" : workbench === "agent" ? "agent-inspector" : ""}`} style={{ width: inspectorWidth }}>
-        <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(252)} />
+        <div className="panel-resizer inspector-resizer" title="拖动调整助手宽度，双击恢复默认" onPointerDown={(event) => startResize("inspector", event)} onDoubleClick={() => setInspectorWidth(268)} />
         {workbench === "office" ? <>
           <div className="assistant-head"><div><h3>Lan Code</h3></div><div><button title="新建当前项目对话" className="icon-button subtle-icon" onClick={() => void newSession()}><Plus size={14} /></button><SelectMenu value={activeId || ""} placeholder="选择当前项目对话" ariaLabel="选择当前项目对话" options={currentProjectSessions.map((session) => ({ id: session.id, label: session.title || "未命名对话" }))} onChange={(id) => setActiveId(id || undefined)} /></div></div>
           <div className="code-chat">{messages.slice(-8).map((message, index) => <article key={index} className={message.role}><div className="message-label">{message.role === "user" ? "你" : "Lan Code"}</div>{message.role === "assistant" ? <Markdown workspaceFiles={workspaceFiles}>{message.text}</Markdown> : <UserMessageText text={message.text} />}</article>)}{busy && <article className="assistant streaming-answer"><div className="message-label">Lan Code</div>{streamingText ? <Markdown workspaceFiles={workspaceFiles}>{streamingText}</Markdown> : <div className="thinking"><Sparkles size={14} /> 正在工作...</div>}</article>}</div>
@@ -1982,7 +2249,7 @@ function App() {
         <div className="info-row"><KeyRound size={16} /><span>模型</span><strong>{providerReady ? settings.model : "未配置"}</strong></div>
         <div className="info-row"><ShieldCheck size={16} /><span>权限</span><strong>{APPROVAL_MODES.find((item) => item.id === settings.approvalMode)?.label}</strong></div>
         <div className="divider" /><h3>当前对话用量</h3>
-        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><strong><ContextMeter used={currentContextTokens} limit={currentContextWindow} compact /><b>{currentContextTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</b></strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
+        <div className="usage-grid"><span>输入 Token<strong>{usage.inputTokens.toLocaleString()}</strong></span><span>缓存命中<strong>{usage.cachedInputTokens.toLocaleString()}</strong></span><span>输出 Token<strong>{usage.outputTokens.toLocaleString()}</strong></span><span className="context-usage"><em>上下文</em><strong><ContextMeter used={currentContextTokens} limit={currentContextWindow} compact /><b>{currentContextTokens.toLocaleString()} / {currentContextWindow.toLocaleString()}</b></strong></span><span>预估费用<strong>${estimatedCost.toFixed(4)}</strong></span></div>
         <div className="divider" /><h3>任务步骤</h3>
         {taskPlan.length === 0 ? <div className="empty-small">Agent 开始任务后会在这里列出计划。</div> : <div className="task-plan">{taskPlan.map((step, index) => <div key={`${index}:${step.title}`} className={step.status}>{step.status === "completed" ? <CheckCircle2 size={14} /> : step.status === "inProgress" ? <RefreshCw size={14} /> : <span className="plan-circle" />}<span>{step.title}</span></div>)}</div>}
         <div className="divider" /><div className="git-heading"><h3>后台运行</h3><button title="刷新后台进程" onClick={() => void invoke<BackgroundProcess[]>("background_processes").then(setBackgroundProcesses)}><RefreshCw size={12} /></button></div>
@@ -2015,6 +2282,16 @@ function App() {
         <button className="danger" onClick={() => { void deleteWorkspaceEntry(); setFileContextMenu(undefined); }}>删除</button>
       </div>}
 
+      {sessionContextMenu && <div className="context-menu session-context-menu" style={{ left: sessionContextMenu.x, top: sessionContextMenu.y }} onPointerDown={(event) => event.stopPropagation()}>
+        <button onClick={() => { togglePinnedSession(sessionContextMenu.session.id); setSessionContextMenu(undefined); }}>
+          {pinnedSessionIds.includes(sessionContextMenu.session.id) ? <PinOff size={14} /> : <Pin size={14} />}
+          {pinnedSessionIds.includes(sessionContextMenu.session.id) ? "取消置顶" : "置顶对话"}
+        </button>
+        <button onClick={() => { void renameSession(sessionContextMenu.session); setSessionContextMenu(undefined); }}><Pencil size={14} />重命名</button>
+        <div />
+        <button className="danger" onClick={() => { void removeSession(sessionContextMenu.session.id); setSessionContextMenu(undefined); }}><Trash2 size={14} />删除</button>
+      </div>}
+
       {appDialog && <div className="modal-backdrop app-dialog-backdrop" onPointerDown={() => resolveDialog(appDialog.kind === "confirm" ? false : undefined)}>
         <div className="modal app-dialog" onPointerDown={(event) => event.stopPropagation()}>
           <div className="dialog-heading"><div className={appDialog.danger ? "dialog-icon danger" : "dialog-icon"}>{appDialog.danger ? <Trash2 size={18} /> : <MessageSquare size={18} />}</div><div><h2>{appDialog.title}</h2><p>{appDialog.message}</p></div></div>
@@ -2045,6 +2322,10 @@ function App() {
         <div className="settings-page-title"><div><h2>Lan Code 设置</h2><p>按类别管理模型、能力、项目、Agent 和更新。</p></div><button className="primary-inline" onClick={saveSettings}>保存并启用</button></div>
         {settingsSection === "appearance" && <><div className="settings-section-title"><h3>外观</h3><p>选择浅色、深色，或跟随 Windows 系统主题。</p></div><div className="theme-options">
           {([{ id: "system", label: "跟随系统", icon: <Monitor size={18} /> }, { id: "light", label: "浅色", icon: <Sun size={18} /> }, { id: "dark", label: "深色", icon: <Moon size={18} /> }] as { id: ThemeMode; label: string; icon: React.ReactNode }[]).map((theme) => <button key={theme.id} className={themeMode === theme.id ? "active" : ""} onClick={() => setThemeMode(theme.id)}>{theme.icon}<strong>{theme.label}</strong>{themeMode === theme.id && <Check size={14} />}</button>)}
+        </div><div className="settings-section-title icon-theme-title"><h3>图标主题</h3><p>文件、文件夹和界面图标会同步切换，选择会保存在本机。</p></div><div className="icon-theme-options">
+          {ICON_THEMES.map((theme) => <button key={theme.id} className={iconTheme === theme.id ? "active" : ""} onClick={() => setIconTheme(theme.id)}>
+            <IconThemePreview theme={theme.id} /><span><strong>{theme.label}</strong><small>{theme.description}</small></span>{iconTheme === theme.id && <Check size={14} />}
+          </button>)}
         </div></>}
         {settingsSection === "model" && <><div className="settings-section-title model-title"><div><h3>模型管理</h3><p>配置并同时启用多个模型，随后可从对话输入框直接切换。</p></div><button className="primary-inline" onClick={addProviderProfile}><Plus size={14} /> 添加模型配置</button></div>
           <div className="provider-list">
@@ -2055,6 +2336,7 @@ function App() {
               return <section className={`provider-card ${profile.enabled === false ? "disabled" : ""}`} key={profile.id}>
                 <div className="provider-card-header">
                   <label className="enable-check"><input type="checkbox" checked={profile.enabled !== false} onChange={() => toggleProviderProfile(profile)} /><span>启用</span></label>
+                  <ProviderLogo provider={profile.provider} logo={profile.logo} size={22} />
                   <button className="provider-summary" onClick={() => setExpandedProfiles((items) => {
                     const next = new Set(items);
                     if (next.has(profile.id)) next.delete(profile.id); else next.add(profile.id);
@@ -2067,7 +2349,8 @@ function App() {
                   <button title="删除配置" className="icon-button" onClick={() => removeProviderProfile(profile)}><Trash2 size={14} /></button>
                 </div>
                 {expanded && <><div className="provider-fields">
-                  <label>配置名称<input value={profile.name} onChange={(event) => updateProviderProfile(profile.id, { name: event.target.value })} /></label>
+                  <label>配置 Logo<LogoPicker value={profile.logo || PROVIDERS.find((item) => item.id === profile.provider)?.logo || "generic"} onChange={(logo) => updateProviderProfile(profile.id, { logo })} /></label>
+                  <label>配置名称<input ref={(element) => { profileNameInputs.current[profile.id] = element; }} placeholder="例如：DeepSeek V4 Pro" value={profile.name} onChange={(event) => updateProviderProfile(profile.id, { name: event.target.value })} /></label>
                   <label>供应商<SelectMenu value={profile.provider} ariaLabel="选择供应商" options={PROVIDERS.map((provider) => ({ id: provider.id, label: provider.name }))} onChange={(provider) => selectProfileProvider(profile, provider)} /></label>
                   <label className="span-2">模型 ID<div className="model-input"><input placeholder="可手动填写模型 ID" value={profile.model} onChange={(event) => updateProviderProfile(profile.id, { model: event.target.value })} /><SelectMenu value={models.includes(profile.model) ? profile.model : ""} placeholder="从已获取模型中选择..." ariaLabel="选择模型 ID" options={models.map((model) => ({ id: model, label: model }))} onChange={(model) => model && updateProviderProfile(profile.id, { model })} /><button onClick={() => void fetchProviderModels(profile)}><RefreshCw size={13} /> 获取模型</button></div></label>
                   <label className="span-2">API 地址<input value={profile.baseUrl} onChange={(event) => updateProviderProfile(profile.id, { baseUrl: event.target.value })} /></label>
@@ -2075,6 +2358,7 @@ function App() {
                   <label>输入上下文 / Token<input type="number" min="1024" step="1024" value={profile.contextWindow || DEFAULT_CONTEXT_WINDOW} onChange={(event) => updateProviderProfile(profile.id, { contextWindow: Number(event.target.value) })} /></label>
                   <label>最大输出 / Token<input type="number" min="256" step="256" value={profile.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS} onChange={(event) => updateProviderProfile(profile.id, { maxOutputTokens: Number(event.target.value) })} /></label>
                   <label>输入价格 / 百万 Token<input type="number" min="0" step="0.01" value={profile.inputPricePerMillion} onChange={(event) => updateProviderProfile(profile.id, { inputPricePerMillion: Number(event.target.value) })} /></label>
+                  <label>命中缓存价格 / 百万 Token<input type="number" min="0" step="0.01" value={profile.cachedInputPricePerMillion} onChange={(event) => updateProviderProfile(profile.id, { cachedInputPricePerMillion: Number(event.target.value) })} /></label>
                   <label>输出价格 / 百万 Token<input type="number" min="0" step="0.01" value={profile.outputPricePerMillion} onChange={(event) => updateProviderProfile(profile.id, { outputPricePerMillion: Number(event.target.value) })} /></label>
                 </div>
                 <div className="provider-card-footer"><span className={profileBusy[profile.id]?.includes("失败") ? "failed" : ""}>{profileBusy[profile.id] || `${models.length ? `${models.length} 个已获取模型` : "尚未获取模型列表"}`}</span><button onClick={() => void testProviderProfile(profile)}>测试 API</button><button onClick={() => makeProviderProfileCurrent(profile)}>设为当前</button></div></>}
@@ -2121,7 +2405,7 @@ function App() {
         </div></>}
         {settingsSection === "agent" && <><div className="settings-section-title"><h3>Agent 与权限</h3><p>控制自动执行范围和单次任务的最大迭代深度。</p></div><div className="form-grid">
           <label>权限模式<SelectMenu value={draft.approvalMode} ariaLabel="选择权限模式" options={APPROVAL_MODES.map((mode) => ({ id: mode.id, label: mode.label }))} onChange={(approvalMode) => setDraft({ ...draft, approvalMode })} /></label>
-          <label>单任务最大执行轮次<input type="number" min="4" max="256" value={draft.maxProviderRounds} onChange={(e) => setDraft({ ...draft, maxProviderRounds: Number(e.target.value) })} /></label>
+          <label>单任务最大执行轮次<input type="number" min="4" max="256" value={draft.maxProviderRounds} onChange={(e) => setDraft({ ...draft, maxProviderRounds: Number(e.target.value) })} /><small className="field-help">限制一次任务中模型继续思考、调用工具并读取结果的循环次数。数值越大越适合长任务，也会增加耗时与 Token 消耗。</small></label>
         </div></>}
         {settingsSection === "updates" && <><div className="settings-section-title"><h3>软件更新</h3><p>仅从 Lan Code 官方 GitHub Release 检查并下载安装包。</p></div><div className="update-card">
           <div><strong><Zap size={15} /> 软件更新</strong><span>{updateStatus || "仅从 Lan Code 官方 GitHub Release 检查和下载更新。"}</span></div>
